@@ -9,6 +9,7 @@ import sys
 import torch
 import itertools
 import pandas as pd
+import pickle
 from collision_backend import create_collision_backend
 from data_structures import PartData, MachinePartData, MachineData, ProblemData
 import os
@@ -69,6 +70,11 @@ class BRKGA():
         if self.eval_mode == "thread" and self.eval_workers > 1:
             max_workers = self.eval_workers if self.eval_workers > 0 else min(32, (os.cpu_count() or 4))
             self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        
+        # Fitness memoization cache (avoids re-evaluating duplicate chromosomes)
+        self._fitness_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
 
 
     def evaluate_solution(self, solution):
@@ -83,52 +89,100 @@ class BRKGA():
         )
         return decoder
 
+    def _hash_solution(self, solution):
+        """Create hashable key from solution (quantize to avoid floating point issues)."""
+        # Quantize to 4 decimal places for robust hashing
+        return tuple(np.round(solution, 4))
+    
     def cal_fitness(self, population):
+        # Check cache for each solution
+        results = [None] * len(population)
+        to_evaluate = []  # (index, solution) pairs that need evaluation
+        
+        for i, sol in enumerate(population):
+            key = self._hash_solution(sol)
+            if key in self._fitness_cache:
+                results[i] = self._fitness_cache[key]
+                self._cache_hits += 1
+            else:
+                to_evaluate.append((i, sol, key))
+                self._cache_misses += 1
+        
+        # If all cached, return early
+        if not to_evaluate:
+            return results
+        
+        # Evaluate only uncached solutions
+        solutions_to_eval = [sol for _, sol, _ in to_evaluate]
+        
         if self.eval_mode == "serial" or self.eval_workers <= 1:
-            return [self.evaluate_solution(sol) for sol in population]
-
-        if self.eval_mode == "thread":
-            # Use pre-created executor (avoids thread pool creation overhead per call)
-            return list(self._executor.map(self.evaluate_solution, population))
-
-        if self.eval_mode == "process":
-            # CUDA + process pools typically cause context duplication/oversubscription.
+            new_fitness = [self.evaluate_solution(sol) for sol in solutions_to_eval]
+        elif self.eval_mode == "thread":
+            new_fitness = list(self._executor.map(self.evaluate_solution, solutions_to_eval))
+        elif self.eval_mode == "process":
             if "cuda" in self.collision_backend.name:
                 raise ValueError("eval_mode=process is not supported with CUDA backends. Use thread or serial.")
             max_workers = self.eval_workers if self.eval_workers > 0 else min(32, (os.cpu_count() or 4))
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                return list(executor.map(self.evaluate_solution, population, chunksize=self.eval_chunksize))
-
-        raise ValueError(f"Unsupported eval_mode: {self.eval_mode}")
+                new_fitness = list(executor.map(self.evaluate_solution, solutions_to_eval, chunksize=self.eval_chunksize))
+        else:
+            raise ValueError(f"Unsupported eval_mode: {self.eval_mode}")
+        
+        # Store results and update cache
+        for (i, _, key), fitness in zip(to_evaluate, new_fitness):
+            results[i] = fitness
+            self._fitness_cache[key] = fitness
+        
+        return results
     
     def shutdown(self):
-        """Clean up executor resources."""
+        """Clean up executor resources and report cache stats."""
         if self._executor is not None:
             self._executor.shutdown(wait=False)
             self._executor = None
+        
+        # Report cache effectiveness
+        total = self._cache_hits + self._cache_misses
+        if total > 0:
+            hit_rate = 100.0 * self._cache_hits / total
+            print(f"Fitness cache: {self._cache_hits}/{total} hits ({hit_rate:.1f}%), {len(self._fitness_cache)} unique solutions")
 
     def partition(self, population, fitness_list):
-        sorted_indexs = np.argsort(fitness_list)
-        return population[sorted_indexs[:self.num_elites]], population[sorted_indexs[self.num_elites:]], np.array(fitness_list)[sorted_indexs[:self.num_elites]]
-    
-    def crossover(self, elite, non_elite):
-        # Generate random probabilities for each gene and create a boolean mask where True indicates the gene should come from elite
-        crossover_mask = np.random.uniform(low=0.0, high=1.0, size=self.num_gene) < self.eliteCProb
-        # Use the mask to choose genes from elite and non_elite
-        return np.where(crossover_mask, elite, non_elite).tolist()
+        fitness_arr = np.asarray(fitness_list)
+        # O(n) partial sort - only need top num_elites
+        partition_indices = np.argpartition(fitness_arr, self.num_elites)
+        elite_indices = partition_indices[:self.num_elites]
+        non_elite_indices = partition_indices[self.num_elites:]
+        # Sort only the elite subset (small array)
+        elite_indices = elite_indices[np.argsort(fitness_arr[elite_indices])]
+        return population[elite_indices], population[non_elite_indices], fitness_arr[elite_indices]
     
     def mating(self, elites, non_elites):
-        # biased selection of mating parents: 1 elite & 1 non_elite
+        # Vectorized mating: generate all offspring at once
         num_offspring = self.num_individuals - self.num_elites - self.num_mutants
-        return [self.crossover(random.choice(elites), random.choice(non_elites)) for i in range(num_offspring)]
+        
+        # Select parent indices in bulk
+        elite_indices = np.random.randint(0, len(elites), size=num_offspring)
+        non_elite_indices = np.random.randint(0, len(non_elites), size=num_offspring)
+        
+        # Get parent arrays
+        elite_parents = elites[elite_indices]  # (num_offspring, num_gene)
+        non_elite_parents = non_elites[non_elite_indices]  # (num_offspring, num_gene)
+        
+        # Generate crossover mask for all offspring at once
+        crossover_mask = np.random.uniform(0.0, 1.0, size=(num_offspring, self.num_gene)) < self.eliteCProb
+        
+        # Vectorized crossover
+        offspring = np.where(crossover_mask, elite_parents, non_elite_parents).astype(np.float32)
+        return offspring
     
     def mutants(self):
-        return np.random.uniform(low=0.0, high=1.0, size=(self.num_mutants, self.num_gene))
+        return np.random.uniform(low=0.0, high=1.0, size=(self.num_mutants, self.num_gene)).astype(np.float32)
         
     def fit(self, verbose = False):
         startfit = time.time()
         # Initial population & fitness
-        population = np.random.uniform(low=0.0, high=1.0, size=(self.num_individuals, self.num_gene))
+        population = np.random.uniform(low=0.0, high=1.0, size=(self.num_individuals, self.num_gene)).astype(np.float32)
         population[0] = self.initialSol
         fitness_list = self.cal_fitness(population)
         
@@ -152,7 +206,8 @@ class BRKGA():
             startTime = time.time()
             # Select elite group
             elites, non_elites, elite_fitness_list = self.partition(population, fitness_list)
-            print(np.average(elite_fitness_list))
+            if verbose:
+                print(f"Elite avg: {np.average(elite_fitness_list):.4f}")
             # Biased Mating & Crossover
             offsprings = self.mating(elites, non_elites)
             
@@ -166,21 +221,20 @@ class BRKGA():
             population = np.concatenate((elites, mutants, offsprings), axis = 0)
             fitness_list = list(elite_fitness_list) + offspring_fitness_list
 
-            # Update Best Fitness
-            for fitness in fitness_list:
-                if fitness < best_fitness:
-                    best_iter = g
-                    best_fitness = fitness
-                    best_solution = population[np.argmin(fitness_list)]
+            # Update Best Fitness (compute argmin once, not per iteration)
+            min_idx = np.argmin(fitness_list)
+            min_fitness = fitness_list[min_idx]
+            if min_fitness < best_fitness:
+                best_iter = g
+                best_fitness = min_fitness
+                best_solution = population[min_idx]
             
-            self.history['min'].append(np.min(fitness_list))
+            self.history['min'].append(min_fitness)
             self.history['mean'].append(np.mean(fitness_list))
             self.history['time'].append(time.time()-startfit)
             
             if verbose:
-                print("Generation :", g, ' \t(Best Fitness:', best_fitness,')')
-            
-            print(time.time()-startTime)
+                print(f"Generation {g}: Best={best_fitness:.4f}, Time={time.time()-startTime:.2f}s")
 
         self.used_bins = math.floor(best_fitness)
         self.best_fitness = best_fitness
@@ -213,18 +267,21 @@ if __name__ == "__main__":
     instancePartsUnique = np.unique(instanceParts)
     
     
-    # Job specifications
-    jobSpecAll = pd.read_excel(f'data/PartsMachines/part-machine-information.xlsx', sheet_name='part', header = 0, index_col = 0)
+    # Job specifications (with caching for faster startup)
+    cache_path = 'data/PartsMachines/cached_specs.pkl'
+    if os.path.exists(cache_path):
+        with open(cache_path, 'rb') as f:
+            jobSpecAll, machSpec, area, polRotations = pickle.load(f)
+    else:
+        jobSpecAll = pd.read_excel('data/PartsMachines/part-machine-information.xlsx', sheet_name='part', header=0, index_col=0)
+        machSpec = pd.read_excel('data/PartsMachines/part-machine-information.xlsx', sheet_name='machine', header=0, index_col=0)
+        area = pd.read_excel('data/PartsMachines/polygon_areas.xlsx', header=0)["Area"].tolist()
+        polRotations = pd.read_excel('data/PartsMachines/parts_rotations.xlsx', header=0)["rot"].tolist()
+        # Cache for future runs
+        with open(cache_path, 'wb') as f:
+            pickle.dump((jobSpecAll, machSpec, area, polRotations), f)
+    
     jobSpec = jobSpecAll.loc[instancePartsUnique]
-    #print(jobSpec)
-    # Machine specifications
-    machSpec = pd.read_excel(f'data/PartsMachines/part-machine-information.xlsx', sheet_name='machine', header = 0, index_col = 0)
-    
-    # Area of each job
-    area = pd.read_excel(f'data/PartsMachines/polygon_areas.xlsx', header = 0)["Area"].tolist()
-    
-    # Rotations of each job
-    polRotations = pd.read_excel(f'data/PartsMachines/parts_rotations.xlsx', header = 0)["rot"].tolist()
 
     data = {}
     # Load the binary matrices from .npy files
