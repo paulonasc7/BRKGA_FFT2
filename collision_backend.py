@@ -101,10 +101,17 @@ class TorchCollisionBackend(BaseCollisionBackend):
             part_tensor = torch.tensor(part_matrix, dtype=torch.float32, device=self.device)
         grid_state[y0:y1, x0:x1] += part_tensor
 
-    def find_bottom_left_zero(self, grid, part_fft, part_shape, grid_state=None):
+    def compute_grid_fft(self, grid_state):
+        """Compute and return the grid FFT for caching."""
         with torch.inference_mode():
-            grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
-            overlap = torch.fft.ifft2(torch.fft.fft2(grid_tensor) * part_fft).real
+            return torch.fft.fft2(grid_state)
+
+    def find_bottom_left_zero(self, grid, part_fft, part_shape, grid_state=None, grid_fft=None):
+        with torch.inference_mode():
+            if grid_fft is None:
+                grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
+                grid_fft = torch.fft.fft2(grid_tensor)
+            overlap = torch.fft.ifft2(grid_fft * part_fft).real
             cropped = torch.round(overlap[part_shape[0] - 1 : grid.shape[0], part_shape[1] - 1 : grid.shape[1]])
 
             rows_with_zeros = (cropped == 0).any(dim=1)
@@ -116,18 +123,20 @@ class TorchCollisionBackend(BaseCollisionBackend):
             largest_row_real = largest_row + part_shape[0] - 1
             return True, smallest_col, largest_row_real
 
-    def find_bottom_left_zero_batch(self, grid, part_ffts, part_shapes, grid_state=None):
+    def find_bottom_left_zero_batch(self, grid, part_ffts, part_shapes, grid_state=None, grid_fft=None):
         if not part_ffts:
             return []
         if not self.use_batch:
             return [
-                self.find_bottom_left_zero(grid, part_ffts[i], part_shapes[i], grid_state=grid_state)
+                self.find_bottom_left_zero(grid, part_ffts[i], part_shapes[i], grid_state=grid_state, grid_fft=grid_fft)
                 for i in range(len(part_ffts))
             ]
 
         with torch.inference_mode():
-            grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
-            grid_fft = torch.fft.fft2(grid_tensor)
+            # Use cached grid FFT if provided, otherwise compute
+            if grid_fft is None:
+                grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
+                grid_fft = torch.fft.fft2(grid_tensor)
             stacked_part_ffts = torch.stack(part_ffts, dim=0)
             overlap_batch = torch.fft.ifft2(grid_fft.unsqueeze(0) * stacked_part_ffts).real
             rounded_batch = torch.round(overlap_batch)

@@ -27,6 +27,9 @@ class BuildingPlate:
         self.collision_backend = collision_backend or create_collision_backend("torch_gpu")
         self.grid_state = self.collision_backend.create_grid_state(length, width)
         
+        # Cached grid FFT (invalidated on insert)
+        self._grid_fft_cache = None
+        
         # Pre-allocate reusable buffers for vacancy vector updates (avoid allocations per insert)
         self._padded_buffer = np.ones((length, width + 2), dtype=np.uint8)
         self._max_zeros_buffer = np.zeros(length, dtype=np.int32)
@@ -75,11 +78,16 @@ class BuildingPlate:
                 feasible_shapes.append(shape)
                 feasible_ffts.append(machPart_ffts[currRot])
 
+        # Use cached grid FFT if available, otherwise compute and cache
+        if self._grid_fft_cache is None:
+            self._grid_fft_cache = self.collision_backend.compute_grid_fft(self.grid_state)
+        
         batch_results = self.collision_backend.find_bottom_left_zero_batch(
             self.grid,
             feasible_ffts,
             feasible_shapes,
             grid_state=self.grid_state,
+            grid_fft=self._grid_fft_cache,
         )
         for i, currRot in enumerate(feasible_rotations):
             feasible, smallest_col_with_zero, largest_row_with_zero_real_value = batch_results[i]
@@ -124,6 +132,9 @@ class BuildingPlate:
         self.grid[y_start:y_end, x:x + shapes[1]] += partMatrix.astype(np.uint8)
         # Use pre-computed GPU tensor if available for faster grid state update
         self.collision_backend.update_grid_region(self.grid_state, x, y, partMatrix, shapes, part_tensor=gpu_tensor)
+        
+        # Invalidate grid FFT cache (grid has changed)
+        self._grid_fft_cache = None
         
         # Update enclosure box bounds incrementally - O(1)
         self.min_occupied_row = min(self.min_occupied_row, y_start)
