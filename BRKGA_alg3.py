@@ -1,0 +1,503 @@
+import math
+import random
+import numpy as np
+from placement import placementProcedure
+from binClassInitialSol import BuildingPlate
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import time 
+import sys
+import torch
+import itertools
+import pandas as pd
+from collision_backend import create_collision_backend
+from data_structures import PartData, MachinePartData, MachineData, ProblemData
+import os
+torch.set_num_threads(1)
+
+class BRKGA():
+    def __init__(self, problem_data, nbParts, nbMachines, thresholds, instanceParts, initialSol,
+                 collision_backend, eval_mode="thread", eval_workers=4, eval_chunksize=1,
+                 num_generations = 200, num_individuals=100, num_elites = 12, num_mutants = 18, eliteCProb = 0.7):
+
+        # Input
+        self.problem_data = problem_data  # ProblemData dataclass with parts and machines
+        self.nbMachines = nbMachines
+        self.thresholds = thresholds
+        self.N = nbParts
+        self.instanceParts = instanceParts
+        self.initialSol = initialSol
+        self.collision_backend = collision_backend
+        self.eval_mode = eval_mode
+        self.eval_workers = int(eval_workers) if eval_workers else 0
+        self.eval_chunksize = int(eval_chunksize) if eval_chunksize else 1
+        
+        # Configuration
+        self.num_generations = num_generations
+        self.num_individuals = int(num_individuals)
+        self.num_gene = 2*self.N
+        
+        self.num_elites = int(num_elites)
+        self.num_mutants = int(num_mutants)
+        self.eliteCProb = eliteCProb
+        
+        # Result
+        self.used_bins = -1
+        self.solution = None
+        self.best_fitness = -1
+        self.history = {
+            'mean': [],
+            'min': [],
+            'time': []
+        }
+        
+        # Create executor once at initialization (avoid recreating per generation)
+        self._executor = None
+        if self.eval_mode == "thread" and self.eval_workers > 1:
+            max_workers = self.eval_workers if self.eval_workers > 0 else min(32, (os.cpu_count() or 4))
+            self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+
+    def evaluate_solution(self, solution):
+        decoder = placementProcedure(
+            self.problem_data,
+            self.N,
+            self.nbMachines,
+            self.thresholds,
+            solution,
+            self.instanceParts,
+            self.collision_backend,
+        )
+        return decoder
+
+    def cal_fitness(self, population):
+        if self.eval_mode == "serial" or self.eval_workers <= 1:
+            return [self.evaluate_solution(sol) for sol in population]
+
+        if self.eval_mode == "thread":
+            # Use pre-created executor (avoids thread pool creation overhead per call)
+            return list(self._executor.map(self.evaluate_solution, population))
+
+        if self.eval_mode == "process":
+            # CUDA + process pools typically cause context duplication/oversubscription.
+            if "cuda" in self.collision_backend.name:
+                raise ValueError("eval_mode=process is not supported with CUDA backends. Use thread or serial.")
+            max_workers = self.eval_workers if self.eval_workers > 0 else min(32, (os.cpu_count() or 4))
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                return list(executor.map(self.evaluate_solution, population, chunksize=self.eval_chunksize))
+
+        raise ValueError(f"Unsupported eval_mode: {self.eval_mode}")
+    
+    def shutdown(self):
+        """Clean up executor resources."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+
+    def partition(self, population, fitness_list):
+        sorted_indexs = np.argsort(fitness_list)
+        return population[sorted_indexs[:self.num_elites]], population[sorted_indexs[self.num_elites:]], np.array(fitness_list)[sorted_indexs[:self.num_elites]]
+    
+    def crossover(self, elite, non_elite):
+        # Generate random probabilities for each gene and create a boolean mask where True indicates the gene should come from elite
+        crossover_mask = np.random.uniform(low=0.0, high=1.0, size=self.num_gene) < self.eliteCProb
+        # Use the mask to choose genes from elite and non_elite
+        return np.where(crossover_mask, elite, non_elite).tolist()
+    
+    def mating(self, elites, non_elites):
+        # biased selection of mating parents: 1 elite & 1 non_elite
+        num_offspring = self.num_individuals - self.num_elites - self.num_mutants
+        return [self.crossover(random.choice(elites), random.choice(non_elites)) for i in range(num_offspring)]
+    
+    def mutants(self):
+        return np.random.uniform(low=0.0, high=1.0, size=(self.num_mutants, self.num_gene))
+        
+    def fit(self, verbose = False):
+        startfit = time.time()
+        # Initial population & fitness
+        population = np.random.uniform(low=0.0, high=1.0, size=(self.num_individuals, self.num_gene))
+        population[0] = self.initialSol
+        fitness_list = self.cal_fitness(population)
+        
+        if verbose:
+            print('\nInitial Population:')
+            print('  ->  shape:',population.shape)
+            print('  ->  Best Fitness:',min(fitness_list))
+            
+        # best    
+        best_fitness = np.min(fitness_list)
+        best_solution = population[np.argmin(fitness_list)]
+        self.history['min'].append(np.min(fitness_list))
+        self.history['mean'].append(np.mean(fitness_list))
+        self.history['time'].append(time.time()-startfit)
+        
+        
+        # Repeat generations
+        best_iter = 0
+        
+        for g in range(self.num_generations):
+            startTime = time.time()
+            # Select elite group
+            elites, non_elites, elite_fitness_list = self.partition(population, fitness_list)
+            print(np.average(elite_fitness_list))
+            # Biased Mating & Crossover
+            offsprings = self.mating(elites, non_elites)
+            
+            # Generate mutants
+            mutants = self.mutants()
+
+            # New Population & fitness
+            offspring = np.concatenate((mutants,offsprings), axis=0)
+            offspring_fitness_list = self.cal_fitness(offspring)
+            
+            population = np.concatenate((elites, mutants, offsprings), axis = 0)
+            fitness_list = list(elite_fitness_list) + offspring_fitness_list
+
+            # Update Best Fitness
+            for fitness in fitness_list:
+                if fitness < best_fitness:
+                    best_iter = g
+                    best_fitness = fitness
+                    best_solution = population[np.argmin(fitness_list)]
+            
+            self.history['min'].append(np.min(fitness_list))
+            self.history['mean'].append(np.mean(fitness_list))
+            self.history['time'].append(time.time()-startfit)
+            
+            if verbose:
+                print("Generation :", g, ' \t(Best Fitness:', best_fitness,')')
+            
+            print(time.time()-startTime)
+
+        self.used_bins = math.floor(best_fitness)
+        self.best_fitness = best_fitness
+        self.solution = best_solution
+        
+        # Clean up executor after fit completes
+        self.shutdown()
+        return 'feasible'
+    
+if __name__ == "__main__":
+    '''INITIAL AND KNOWN DATA'''
+    nbParts = int(sys.argv[1])
+    #nbParts = 25
+    nbMachines = int(sys.argv[2])
+    #nbMachines = 2
+    instNumber = int(sys.argv[3])
+    #instNumber = 0
+    backend_name = sys.argv[4] if len(sys.argv) > 4 else "torch_gpu"
+    eval_mode = sys.argv[5] if len(sys.argv) > 5 else "thread"
+    eval_workers = int(sys.argv[6]) if len(sys.argv) > 6 else 2
+    eval_chunksize = int(sys.argv[7]) if len(sys.argv) > 7 else 1
+    collision_backend = create_collision_backend(backend_name)
+
+    '''DEFINE DATA'''
+    with open(f'data/Instances/P{nbParts}M{nbMachines}-{instNumber}.txt', 'r') as file:
+        data = file.read()
+    # read instance to know which parts are in it
+    instanceParts = np.array([int(x) for x in data.split()])
+    #instanceParts = np.array([38,38])
+    instancePartsUnique = np.unique(instanceParts)
+    
+    
+    # Job specifications
+    jobSpecAll = pd.read_excel(f'data/PartsMachines/part-machine-information.xlsx', sheet_name='part', header = 0, index_col = 0)
+    jobSpec = jobSpecAll.loc[instancePartsUnique]
+    #print(jobSpec)
+    # Machine specifications
+    machSpec = pd.read_excel(f'data/PartsMachines/part-machine-information.xlsx', sheet_name='machine', header = 0, index_col = 0)
+    
+    # Area of each job
+    area = pd.read_excel(f'data/PartsMachines/polygon_areas.xlsx', header = 0)["Area"].tolist()
+    
+    # Rotations of each job
+    polRotations = pd.read_excel(f'data/PartsMachines/parts_rotations.xlsx', header = 0)["rot"].tolist()
+
+    data = {}
+    # Load the binary matrices from .npy files
+    startLoad = time.time()
+    
+    # ========== Create ProblemData using dataclasses ==========
+    parts_dict: dict[int, PartData] = {}
+    machines_list: list[MachineData] = []
+    
+    # PHASE 1: Load parts ONCE (independent of machines)
+    for part in instancePartsUnique:
+        matrix = np.load(f'data/partsMatrices/matrix_{part}.npy')
+        matrix = matrix.astype(np.int32)
+        matrix = np.ascontiguousarray(matrix)
+        
+        if np.array_equal(matrix, np.rot90(matrix, 2)):
+            nrot = 2
+        else:
+            nrot = 4
+        
+        rotations = []
+        shapes = []
+        densities = []
+        
+        for rot in range(nrot):
+            rotated = np.ascontiguousarray(np.rot90(matrix, rot))
+            rotations.append(rotated)
+            shapes.append((rotated.shape[0], rotated.shape[1]))
+            
+            # Vectorized density calculation (max consecutive 1s per row)
+            padded = np.pad(rotated, ((0, 0), (1, 1)), constant_values=0)
+            diffs = np.diff(padded.astype(np.int8), axis=1)
+            start_indices = np.where(diffs == 1)
+            end_indices = np.where(diffs == -1)
+            run_lengths = end_indices[1] - start_indices[1]
+            max_runs = np.zeros(rotated.shape[0], dtype=np.int32)
+            if len(start_indices[0]) > 0:
+                np.maximum.at(max_runs, start_indices[0], run_lengths)
+            densities.append(max_runs)
+        
+        lengths = [s[0] for s in shapes]
+        best_rotation = int(np.argmin(lengths))
+        
+        parts_dict[part] = PartData(
+            id=part,
+            area=area[part],
+            nrot=nrot,
+            rotations=rotations,
+            shapes=shapes,
+            densities=densities,
+            best_rotation=best_rotation
+        )
+    
+    # PHASE 2: Compute machine-specific data (FFTs, processing times)
+    for m in range(nbMachines):
+        binLength = machSpec['L(mm)'].iloc[m]
+        binWidth = machSpec['W(mm)'].iloc[m]
+        binArea = binLength * binWidth
+        setupTime = machSpec['ST(s)'].iloc[m]
+        
+        machine_parts: dict[int, MachinePartData] = {}
+        
+        for part in instancePartsUnique:
+            part_data = parts_dict[part]
+            
+            # Compute machine-specific FFTs for each rotation
+            ffts = []
+            for rot in range(part_data.nrot):
+                fft = collision_backend.prepare_part_fft(
+                    part_data.rotations[rot],
+                    binLength,
+                    binWidth,
+                )
+                ffts.append(fft)
+            
+            # Machine-specific processing times
+            proc_time = (
+                jobSpec["volume(mm3)"].loc[part] * machSpec["VT(s/mm3)"].iloc[m] +
+                jobSpec["support(mm3)"].loc[part] * machSpec["SPT(s/mm3)"].iloc[m]
+            )
+            proc_time_height = (
+                jobSpec["height(mm)"].loc[part] * machSpec["HT(s/mm3)"].iloc[m]
+            )
+            
+            machine_parts[part] = MachinePartData(
+                ffts=ffts,
+                proc_time=proc_time,
+                proc_time_height=proc_time_height
+            )
+        
+        machines_list.append(MachineData(
+            bin_length=binLength,
+            bin_width=binWidth,
+            bin_area=binArea,
+            setup_time=setupTime,
+            parts=machine_parts
+        ))
+    
+    # Create the ProblemData container
+    problem_data = ProblemData(
+        parts=parts_dict,
+        machines=machines_list,
+        instance_parts=instanceParts,
+        instance_parts_unique=instancePartsUnique
+    )
+
+    #print(time.time()-startLoad)
+    thresholds = [t / nbMachines for t in range(1, nbMachines)] # define the the thresholds for the random keys of the BRKGA for machine assignment
+
+
+    ''' CREATE INITIAL SOLUTION '''
+    # Create dictionary that will hold info about which parts are assgined to which machines and their sequence
+    machines_dict = {f'machine_{i}': {'makespan': 0, 'parts':[], 'batches':[]} for i in range(nbMachines)}
+    
+    # Pre-compute sorted parts order (by decreasing height, then decreasing area)
+    # This is cached once and reused
+    partsInfo = jobSpec.loc[instanceParts]["height(mm)"]
+    partsAR = pd.read_excel(f'data/PartsMachines/polygon_areas.xlsx', header = 0, index_col = 0).loc[instanceParts]["Area"]
+    conc = pd.concat([partsInfo, partsAR], axis = 1)
+    sorted_df = conc.sort_values(by=['height(mm)', 'Area'], ascending=[False, False])
+    part_sortedSequence = sorted_df.index.to_list()
+    
+    # Cache current worst makespan across machines (avoid recomputing in inner loops)
+    current_worst_makespan = 0
+    # Pre-compute machine makespans list for faster access
+    machine_makespans = [0] * nbMachines
+
+    for part in part_sortedSequence:
+        # Variable to hold makespan of the system
+        best_makespan = float('inf')
+        bestBatch = []
+        
+        # Get part data from dataclass (fast attribute access)
+        part_data = problem_data.parts[part]
+        part_shapes0 = part_data.shapes[0]
+        
+        for mach in range(nbMachines):
+            mach_data = problem_data.machines[mach]
+            mach_part_data = mach_data.parts[part]
+            
+            placedInExist = False
+            if (
+                (part_shapes0[0] > mach_data.bin_length or part_shapes0[1] > mach_data.bin_width)
+                and 
+                (part_shapes0[1] > mach_data.bin_length or part_shapes0[0] > mach_data.bin_width)
+                ):
+                continue
+            
+            machineMakespan = machine_makespans[mach] + mach_data.setup_time + mach_part_data.proc_time + mach_part_data.proc_time_height
+            newMakespan = max(current_worst_makespan, machineMakespan)
+            #print("Place part ", part, " in a new batch in machine ", mach, "leads to makespan ", newMakespan)
+
+
+            if newMakespan <= best_makespan:
+                best_makespan = newMakespan
+                # Use pre-computed best rotation (minimum height)
+                best_rotation = part_data.best_rotation
+                bestBatch = ['new', mach, [0, mach_data.bin_length-1], best_rotation, machineMakespan]
+            
+            for x, batch in enumerate(machines_dict[f'machine_{mach}']['batches']):
+                res = batch.can_insert(part_data, mach_part_data)
+                if res[0]:
+                    if batch.processingTimeHeight < mach_part_data.proc_time_height:
+                        machineMakespan = machine_makespans[mach] - batch.processingTimeHeight + mach_part_data.proc_time_height + mach_part_data.proc_time
+                    else:
+                        machineMakespan = machine_makespans[mach] + mach_part_data.proc_time
+
+                    newMakespan = max(current_worst_makespan, machineMakespan)
+                    #print("Place part ", part, " in batch", x, "in machine ", mach, "leads to makespan ", newMakespan)
+                    if newMakespan <= best_makespan:
+                        if placedInExist and newMakespan == best_makespan:
+                            continue
+                        else:
+                            placedInExist = True
+                            best_makespan = newMakespan
+                            bestBatch = ['exist', mach, res[1], res[2], machineMakespan, batch]
+
+        if bestBatch[0] == 'new':
+            #print("Placed part ",part," in a new batch in machine ", bestBatch[1]," and current makespan is ", bestBatch[4])
+            mach_idx = bestBatch[1]
+            mach_data = problem_data.machines[mach_idx]
+            machines_dict[f'machine_{mach_idx}']['parts'].append(part)
+            machine_makespans[mach_idx] = bestBatch[4]
+            machines_dict[f'machine_{mach_idx}']['makespan'] = bestBatch[4]
+            newBin = BuildingPlate(mach_data.bin_width, mach_data.bin_length, collision_backend)
+            machines_dict[f'machine_{mach_idx}']['batches'].append(newBin)
+            
+            # Insert the part in the bottomest-leftest position
+            newBin.insert(0, mach_data.bin_length-1, part_data.rotations[bestBatch[3]], part_data.shapes[bestBatch[3]], part_data.area)
+            
+            # Update batch current state
+            newBin.calculate_enclosure_box_length()  # Update box length
+            #newBin.calculate_enclosure_box_width()  # Update box width
+            
+            mach_part_data = mach_data.parts[part]
+            newBin.processingTime += mach_part_data.proc_time
+            newBin.processingTimeHeight = max(newBin.processingTimeHeight, mach_part_data.proc_time_height)
+            newBin.partsAssigned.append(part_data.id)
+            
+            # Update cached worst makespan
+            current_worst_makespan = max(current_worst_makespan, bestBatch[4])
+            
+        elif bestBatch[0] == 'exist':
+            #print("Placed part ",part," in an existing batch in machine ", bestBatch[1]," and current makespan is ", bestBatch[4])
+            mach_idx = bestBatch[1]
+            mach_data = problem_data.machines[mach_idx]
+            machines_dict[f'machine_{mach_idx}']['parts'].append(part)
+            machine_makespans[mach_idx] = bestBatch[4]
+            machines_dict[f'machine_{mach_idx}']['makespan'] = bestBatch[4]
+            newBin = bestBatch[5]
+            
+            # Use pre-computed best rotation (minimum height)
+            best_rotation = part_data.best_rotation
+            
+            # Insert the part in the bottomest-leftest position
+            newBin.insert(bestBatch[2][0], bestBatch[2][1], part_data.rotations[bestBatch[3]], part_data.shapes[bestBatch[3]], part_data.area)
+            
+            # Update batch current state
+            newBin.calculate_enclosure_box_length()  # Update box length
+            #newBin.calculate_enclosure_box_width()  # Update box width
+            
+            mach_part_data = mach_data.parts[part]
+            newBin.processingTime += mach_part_data.proc_time
+            newBin.processingTimeHeight = max(newBin.processingTimeHeight, mach_part_data.proc_time_height)
+            newBin.partsAssigned.append(part_data.id)
+            
+            # Update cached worst makespan
+            current_worst_makespan = max(current_worst_makespan, bestBatch[4])
+    
+    array = np.zeros(2*nbParts)
+
+    used_indices = set()
+    for m in range(nbMachines):
+        positions = []
+        
+        partsMachine = np.concatenate([batch.partsAssigned for batch in machines_dict[f'machine_{m}']['batches']])
+        for value in partsMachine:
+            for idx, val in enumerate(instanceParts):
+                if val == value and idx not in used_indices:
+                    positions.append(idx)
+                    used_indices.add(idx)
+                    break
+        
+        positions_array = np.array(positions)
+
+        if m == 0: ## Might have to reorganize these "if" statements because if I have more than 3 machines, it is more likely to fall under the "else"
+            array[positions_array+nbParts] = random.uniform(0,thresholds[m])    
+            #mask = MV <= thresholds[i]
+        elif m == nbMachines - 1:
+            array[positions_array+nbParts] = random.uniform(thresholds[m-1]+0.0001,1-0.0001)    
+            #mask = MV > thresholds[i-1]
+        else:
+            array[positions_array+nbParts] = random.uniform(thresholds[m-1]+0.0001,thresholds[m]-0.0001)
+            #mask = (MV > thresholds[i-1]) & (MV <= thresholds[i])
+
+        # Generate strictly increasing values between 0 and 1
+        values = np.linspace(0, 1, len(positions_array), endpoint=False)  # Equally spaced values
+
+        # Assign these values to the specified positions in arrayZeros
+        for i, pos in enumerate(positions_array):
+            array[pos] = values[i]
+    
+    print("Makespan of initial solution: ",best_makespan)
+
+    ''' CALL BRKGA'''
+    # Possible values for p
+    #prob = [10,15,20,30]
+    prob = [10]
+    
+    for mult in prob:
+        # Initialize the Excel writer object
+        name = f'P{nbParts}M{nbMachines}-{instNumber}'
+        writer = pd.ExcelWriter(f'OriginalInitialSol_{name}_prob_{mult}.xlsx', engine='openpyxl')
+        for i in range(1):
+            model = BRKGA(problem_data, nbParts, nbMachines, thresholds, instanceParts, array,
+                  collision_backend=collision_backend,
+                  eval_mode=eval_mode, eval_workers=eval_workers, eval_chunksize=eval_chunksize,
+                  num_generations = 30, num_individuals=mult*nbParts, num_elites = math.ceil(mult*nbParts*0.1), num_mutants = math.ceil(mult*nbParts*0.15), eliteCProb = 0.70)
+            model.fit(verbose = True)
+
+            # Convert dictionary to DataFrame
+            df = pd.DataFrame(model.history)
+            # Export DataFrame to Excel file
+            df.to_excel(writer, sheet_name = f'Iteration{i+1}', index=False)
+            
+            del model
+
+        # Save the Excel file
+        writer.close()
+
