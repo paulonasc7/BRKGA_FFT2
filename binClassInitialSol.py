@@ -44,21 +44,6 @@ class BuildingPlate:
         best_pixel, best_rotation, packingDensity = None, 0, 0 # Initialize packing density at zero  
         potentialArea = (self.area + part.area)
 
-        # ========== CHEAP PREFILTERS (avoid FFT if possible) ==========
-        
-        # Prefilter 1: Check if ANY rotation can fit in remaining vertical space
-        remaining_length = self.length - self.min_occupied_row if self.min_occupied_row <= self.max_occupied_row else self.length
-        
-        # Quick check: find minimum height across all rotations
-        min_part_height = min(s[0] for s in part.shapes)
-        if min_part_height > remaining_length:
-            return False, None, None
-        
-        # Prefilter 2: Check if part width fits in bin width (any rotation)
-        min_part_width = min(s[1] for s in part.shapes)
-        if min_part_width > self.width:
-            return False, None, None
-
         # Get tensor from current binary grid
         startTim = time.time()
 
@@ -76,7 +61,7 @@ class BuildingPlate:
         for currRot in range(nrot):
             shape = part_shapes[currRot]
             
-            # Prefilter 3: Skip rotations that don't fit geometrically
+            # Skip rotations that don't fit bin dimensions
             if shape[0] > self.length or shape[1] > self.width:
                 continue
             
