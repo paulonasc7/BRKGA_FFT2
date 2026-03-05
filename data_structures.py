@@ -23,6 +23,7 @@ class PartData:
     shapes: List[Tuple[int, int]]    # [(h0, w0), (h1, w1), ...] for each rotation
     densities: List[np.ndarray]      # Max consecutive 1s per row for each rotation
     best_rotation: int               # Index of rotation with minimum height
+    rotations_gpu: Optional[List[Any]] = None  # Pre-transferred GPU tensors (avoids CPU->GPU per insert)
     
     @property
     def lengths(self) -> List[int]:

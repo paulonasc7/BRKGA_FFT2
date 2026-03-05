@@ -3,11 +3,27 @@ import numpy as np
 import pandas as pd
 from binClassNew import BuildingPlate
 import csv
-from concurrent.futures import ThreadPoolExecutor
 
 
 # Penalty value for infeasible solutions
 INFEASIBLE_PENALTY = 10000000000000000
+
+# Global executor pool - created once, reused across all calls
+_placement_executor = None
+_placement_executor_workers = 0
+
+
+def _get_placement_executor(num_workers):
+    """Get or create a reusable ThreadPoolExecutor."""
+    global _placement_executor, _placement_executor_workers
+    from concurrent.futures import ThreadPoolExecutor
+    
+    if _placement_executor is None or _placement_executor_workers != num_workers:
+        if _placement_executor is not None:
+            _placement_executor.shutdown(wait=False)
+        _placement_executor = ThreadPoolExecutor(max_workers=num_workers)
+        _placement_executor_workers = num_workers
+    return _placement_executor
 
 
 def _process_single_machine(args):
@@ -55,9 +71,10 @@ def _process_single_machine(args):
             # Use pre-computed best rotation (minimum height)
             best_rotation = part_data.best_rotation
             
-            # Insert at bottom-left
+            # Insert at bottom-left (use GPU tensor if available)
+            gpu_tensor = part_data.rotations_gpu[best_rotation] if part_data.rotations_gpu else None
             newBin.insert(0, mach_data.bin_length-1, part_data.rotations[best_rotation], 
-                         part_data.shapes[best_rotation], part_data.area)
+                         part_data.shapes[best_rotation], part_data.area, gpu_tensor=gpu_tensor)
             newBin.calculate_enclosure_box_length()
             
             newBin.processingTime += mach_part_data.proc_time
@@ -117,14 +134,13 @@ def placementProcedure(problem_data, nbParts, nbMachines, thresholds, chromosome
         machine_tasks.append((i, sorted_sequence, parts, mach_data, collision_backend))
     
     # Process machines (parallel or sequential)
-    if parallel and nbMachines > 1:
-        # Use ThreadPoolExecutor for parallel processing
-        # Note: For GPU backends, threads share the same device which may have some contention
-        # but avoids CUDA context issues that ProcessPoolExecutor would cause
-        with ThreadPoolExecutor(max_workers=nbMachines) as executor:
-            results = list(executor.map(_process_single_machine, machine_tasks))
+    # Only parallelize if we have 4+ machines - for 2 machines overhead exceeds benefit
+    if parallel and nbMachines >= 4:
+        # Use reusable ThreadPoolExecutor (avoids creation/destruction overhead)
+        executor = _get_placement_executor(nbMachines)
+        results = list(executor.map(_process_single_machine, machine_tasks))
     else:
-        # Sequential processing
+        # Sequential processing - faster for small number of machines
         results = [_process_single_machine(task) for task in machine_tasks]
     
     # Check for infeasibility and find worst makespan

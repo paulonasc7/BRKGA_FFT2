@@ -12,11 +12,14 @@ import pandas as pd
 from collision_backend import create_collision_backend
 from data_structures import PartData, MachinePartData, MachineData, ProblemData
 import os
-torch.set_num_threads(1)
+
+# Optimize PyTorch settings for inference workloads
+torch.set_num_threads(1)  # Avoid over-subscription with multiprocessing
+torch.set_grad_enabled(False)  # Disable gradient computation globally
 
 class BRKGA():
     def __init__(self, problem_data, nbParts, nbMachines, thresholds, instanceParts, initialSol,
-                 collision_backend, eval_mode="thread", eval_workers=4, eval_chunksize=1,
+                 collision_backend, eval_mode="auto", eval_workers=4, eval_chunksize=1,
                  num_generations = 200, num_individuals=100, num_elites = 12, num_mutants = 18, eliteCProb = 0.7):
 
         # Input
@@ -27,7 +30,18 @@ class BRKGA():
         self.instanceParts = instanceParts
         self.initialSol = initialSol
         self.collision_backend = collision_backend
-        self.eval_mode = eval_mode
+        
+        # Auto-detect optimal eval_mode based on backend
+        # GPU backends: serial is often faster (avoids GPU contention)
+        # CPU backends: thread parallelism helps
+        if eval_mode == "auto":
+            if "gpu" in collision_backend.name or "cuda" in collision_backend.name:
+                self.eval_mode = "serial"  # GPU already parallel internally
+            else:
+                self.eval_mode = "thread"
+        else:
+            self.eval_mode = eval_mode
+            
         self.eval_workers = int(eval_workers) if eval_workers else 0
         self.eval_chunksize = int(eval_chunksize) if eval_chunksize else 1
         
@@ -185,8 +199,8 @@ if __name__ == "__main__":
     instNumber = int(sys.argv[3])
     #instNumber = 0
     backend_name = sys.argv[4] if len(sys.argv) > 4 else "torch_gpu"
-    eval_mode = sys.argv[5] if len(sys.argv) > 5 else "thread"
-    eval_workers = int(sys.argv[6]) if len(sys.argv) > 6 else 2
+    eval_mode = sys.argv[5] if len(sys.argv) > 5 else "auto"  # "auto" selects serial for GPU, thread for CPU
+    eval_workers = int(sys.argv[6]) if len(sys.argv) > 6 else 4
     eval_chunksize = int(sys.argv[7]) if len(sys.argv) > 7 else 1
     collision_backend = create_collision_backend(backend_name)
 
@@ -254,6 +268,11 @@ if __name__ == "__main__":
         lengths = [s[0] for s in shapes]
         best_rotation = int(np.argmin(lengths))
         
+        # Pre-compute GPU tensors for rotations (avoids CPU->GPU transfer per insert)
+        rotations_gpu = None
+        if hasattr(collision_backend, 'prepare_rotation_tensor'):
+            rotations_gpu = [collision_backend.prepare_rotation_tensor(rot) for rot in rotations]
+        
         parts_dict[part] = PartData(
             id=part,
             area=area[part],
@@ -261,7 +280,8 @@ if __name__ == "__main__":
             rotations=rotations,
             shapes=shapes,
             densities=densities,
-            best_rotation=best_rotation
+            best_rotation=best_rotation,
+            rotations_gpu=rotations_gpu
         )
     
     # PHASE 2: Compute machine-specific data (FFTs, processing times)
@@ -398,8 +418,10 @@ if __name__ == "__main__":
             newBin = BuildingPlate(mach_data.bin_width, mach_data.bin_length, collision_backend)
             machines_dict[f'machine_{mach_idx}']['batches'].append(newBin)
             
-            # Insert the part in the bottomest-leftest position
-            newBin.insert(0, mach_data.bin_length-1, part_data.rotations[bestBatch[3]], part_data.shapes[bestBatch[3]], part_data.area)
+            # Insert the part in the bottomest-leftest position (use GPU tensor if available)
+            rot_idx = bestBatch[3]
+            gpu_tensor = part_data.rotations_gpu[rot_idx] if part_data.rotations_gpu else None
+            newBin.insert(0, mach_data.bin_length-1, part_data.rotations[rot_idx], part_data.shapes[rot_idx], part_data.area, gpu_tensor=gpu_tensor)
             
             # Update batch current state
             newBin.calculate_enclosure_box_length()  # Update box length
@@ -425,8 +447,10 @@ if __name__ == "__main__":
             # Use pre-computed best rotation (minimum height)
             best_rotation = part_data.best_rotation
             
-            # Insert the part in the bottomest-leftest position
-            newBin.insert(bestBatch[2][0], bestBatch[2][1], part_data.rotations[bestBatch[3]], part_data.shapes[bestBatch[3]], part_data.area)
+            # Insert the part in the bottomest-leftest position (use GPU tensor if available)
+            rot_idx = bestBatch[3]
+            gpu_tensor = part_data.rotations_gpu[rot_idx] if part_data.rotations_gpu else None
+            newBin.insert(bestBatch[2][0], bestBatch[2][1], part_data.rotations[rot_idx], part_data.shapes[rot_idx], part_data.area, gpu_tensor=gpu_tensor)
             
             # Update batch current state
             newBin.calculate_enclosure_box_length()  # Update box length

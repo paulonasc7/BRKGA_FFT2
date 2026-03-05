@@ -109,7 +109,7 @@ class BuildingPlate:
             self.enclosure_box_length = self.length - self.min_occupied_row
 
     
-    def insert(self, x, y, partMatrix, shapes, partArea):
+    def insert(self, x, y, partMatrix, shapes, partArea, gpu_tensor=None):
         self.area += partArea
         
         y_start = y - shapes[0] + 1
@@ -117,7 +117,8 @@ class BuildingPlate:
         
         # Use slicing to insert the binary part matrix (cast to uint8 to match grid dtype)
         self.grid[y_start:y_end, x:x + shapes[1]] += partMatrix.astype(np.uint8)
-        self.collision_backend.update_grid_region(self.grid_state, x, y, partMatrix, shapes)
+        # Use pre-computed GPU tensor if available for faster grid state update
+        self.collision_backend.update_grid_region(self.grid_state, x, y, partMatrix, shapes, part_tensor=gpu_tensor)
         
         # Update enclosure box bounds incrementally - O(1)
         self.min_occupied_row = min(self.min_occupied_row, y_start)

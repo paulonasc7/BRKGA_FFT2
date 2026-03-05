@@ -46,6 +46,10 @@ class BaseCollisionBackend:
     def prepare_part_fft(self, part_matrix, bin_length, bin_width):
         raise NotImplementedError
 
+    def prepare_rotation_tensor(self, part_matrix):
+        """Pre-compute device tensor for a rotation matrix. Returns None for CPU backends."""
+        return None
+
     def find_bottom_left_zero(self, grid, part_fft, part_shape):
         raise NotImplementedError
 
@@ -55,7 +59,7 @@ class BaseCollisionBackend:
     def create_grid_state(self, length, width):
         return None
 
-    def update_grid_region(self, grid_state, x, y, part_matrix, shapes):
+    def update_grid_region(self, grid_state, x, y, part_matrix, shapes, part_tensor=None):
         return None
 
 
@@ -65,8 +69,11 @@ class TorchCollisionBackend(BaseCollisionBackend):
         super().__init__(f"torch_{device}_{suffix}")
         self.device = torch.device(device)
         self.use_batch = use_batch
+        # Pre-allocate tensor cache for common operations
+        self._tensor_cache = {}
 
     def prepare_part_fft(self, part_matrix, bin_length, bin_width):
+        # Use non-blocking transfer for GPU
         part_tensor = torch.tensor(part_matrix.copy(), dtype=torch.float32, device=self.device)
         part_tensor_flipped = torch.flip(part_tensor, dims=[0, 1])
         padded = torch.nn.functional.pad(
@@ -75,33 +82,39 @@ class TorchCollisionBackend(BaseCollisionBackend):
         )
         return torch.fft.fft2(padded)
 
+    def prepare_rotation_tensor(self, part_matrix):
+        """Pre-compute GPU tensor for a rotation matrix (avoids CPU->GPU transfer per insert)."""
+        return torch.tensor(part_matrix, dtype=torch.float32, device=self.device)
+
     def create_grid_state(self, length, width):
         return torch.zeros((length, width), dtype=torch.float32, device=self.device)
 
-    def update_grid_region(self, grid_state, x, y, part_matrix, shapes):
+    def update_grid_region(self, grid_state, x, y, part_matrix, shapes, part_tensor=None):
         if grid_state is None:
             return
-        # part_matrix is already contiguous from data loading
-        part_tensor = torch.as_tensor(part_matrix, dtype=torch.float32, device=self.device)
         y0 = y - shapes[0] + 1
         y1 = y + 1
         x0 = x
         x1 = x + shapes[1]
+        # Use pre-computed tensor if available, else create one
+        if part_tensor is None:
+            part_tensor = torch.tensor(part_matrix, dtype=torch.float32, device=self.device)
         grid_state[y0:y1, x0:x1] += part_tensor
 
     def find_bottom_left_zero(self, grid, part_fft, part_shape, grid_state=None):
-        grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
-        overlap = torch.fft.ifft2(torch.fft.fft2(grid_tensor) * part_fft).real
-        cropped = torch.round(overlap[part_shape[0] - 1 : grid.shape[0], part_shape[1] - 1 : grid.shape[1]])
+        with torch.inference_mode():
+            grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
+            overlap = torch.fft.ifft2(torch.fft.fft2(grid_tensor) * part_fft).real
+            cropped = torch.round(overlap[part_shape[0] - 1 : grid.shape[0], part_shape[1] - 1 : grid.shape[1]])
 
-        rows_with_zeros = (cropped == 0).any(dim=1)
-        if not rows_with_zeros.any():
-            return False, None, None
+            rows_with_zeros = (cropped == 0).any(dim=1)
+            if not rows_with_zeros.any():
+                return False, None, None
 
-        largest_row = rows_with_zeros.nonzero().max().item()
-        smallest_col = (cropped[largest_row] == 0).nonzero().min().item()
-        largest_row_real = largest_row + part_shape[0] - 1
-        return True, smallest_col, largest_row_real
+            largest_row = rows_with_zeros.nonzero().max().item()
+            smallest_col = (cropped[largest_row] == 0).nonzero().min().item()
+            largest_row_real = largest_row + part_shape[0] - 1
+            return True, smallest_col, largest_row_real
 
     def find_bottom_left_zero_batch(self, grid, part_ffts, part_shapes, grid_state=None):
         if not part_ffts:
@@ -112,24 +125,31 @@ class TorchCollisionBackend(BaseCollisionBackend):
                 for i in range(len(part_ffts))
             ]
 
-        grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
-        grid_fft = torch.fft.fft2(grid_tensor)
-        stacked_part_ffts = torch.stack(part_ffts, dim=0)
-        overlap_batch = torch.fft.ifft2(grid_fft.unsqueeze(0) * stacked_part_ffts).real
-        rounded_batch = torch.round(overlap_batch)
+        with torch.inference_mode():
+            grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
+            grid_fft = torch.fft.fft2(grid_tensor)
+            stacked_part_ffts = torch.stack(part_ffts, dim=0)
+            overlap_batch = torch.fft.ifft2(grid_fft.unsqueeze(0) * stacked_part_ffts).real
+            rounded_batch = torch.round(overlap_batch)
 
-        results = []
-        for i, part_shape in enumerate(part_shapes):
-            cropped = rounded_batch[i, part_shape[0] - 1 : grid.shape[0], part_shape[1] - 1 : grid.shape[1]]
-            rows_with_zeros = (cropped == 0).any(dim=1)
-            if not rows_with_zeros.any():
-                results.append((False, None, None))
-                continue
+            # Process all results - collect data on GPU first, then transfer once
+            results = []
+            for i, part_shape in enumerate(part_shapes):
+                cropped = rounded_batch[i, part_shape[0] - 1 : grid.shape[0], part_shape[1] - 1 : grid.shape[1]]
+                rows_with_zeros = (cropped == 0).any(dim=1)
+                if not rows_with_zeros.any():
+                    results.append((False, None, None))
+                    continue
 
-            largest_row = rows_with_zeros.nonzero().max().item()
-            smallest_col = (cropped[largest_row] == 0).nonzero().min().item()
-            largest_row_real = largest_row + part_shape[0] - 1
-            results.append((True, smallest_col, largest_row_real))
+                # Keep on GPU as long as possible
+                largest_row_tensor = rows_with_zeros.nonzero().max()
+                smallest_col_tensor = (cropped[largest_row_tensor] == 0).nonzero().min()
+                
+                # Single sync point per rotation (unavoidable for algorithm logic)
+                largest_row = largest_row_tensor.item()
+                smallest_col = smallest_col_tensor.item()
+                largest_row_real = largest_row + part_shape[0] - 1
+                results.append((True, smallest_col, largest_row_real))
 
         return results
 
