@@ -1,6 +1,7 @@
 import numpy as np
 import time
 from collision_backend import create_collision_backend
+from numba_utils import check_vacancy_fit_simple, check_rotations_feasibility, update_vacancy_vector_rows
 
 class BuildingPlate:
     def __init__(self, width, length, collision_backend=None):
@@ -58,26 +59,33 @@ class BuildingPlate:
         nrot = part.nrot
         vacancy = self.vacancy_vector
         part_shapes = part.shapes
-        part_densities = part.densities
         part_rotations = part.rotations
         machPart_ffts = machPart.ffts
 
-        for currRot in range(nrot):
-            shape = part_shapes[currRot]
-            
-            # Skip rotations that don't fit bin dimensions
-            if shape[0] > self.length or shape[1] > self.width:
-                continue
-            
-            dens = part_densities[currRot]
-            
-            subarrays = np.lib.stride_tricks.sliding_window_view(vacancy, shape[0])
-            binaryResult = np.any(np.all(subarrays >= dens, axis=1))
-            
-            if binaryResult:
-                feasible_rotations.append(currRot)
-                feasible_shapes.append(shape)
-                feasible_ffts.append(machPart_ffts[currRot])
+        # Use batched Numba JIT vacancy check (single call for all rotations)
+        if part.densities_flat is not None:
+            # Use pre-prepared JIT data structures for batched check
+            feasibility = check_rotations_feasibility(
+                vacancy, part.densities_flat, part.density_offsets,
+                part.shapes_heights, part.shapes_widths,
+                self.length, self.width, nrot
+            )
+            for currRot in range(nrot):
+                if feasibility[currRot]:
+                    feasible_rotations.append(currRot)
+                    feasible_shapes.append(part_shapes[currRot])
+                    feasible_ffts.append(machPart_ffts[currRot])
+        else:
+            # Fallback to per-rotation check if JIT data not prepared
+            for currRot in range(nrot):
+                shape = part_shapes[currRot]
+                if shape[0] > self.length or shape[1] > self.width:
+                    continue
+                dens = part.densities[currRot]
+                if check_vacancy_fit_simple(vacancy, dens.astype(np.int32)):
+                    feasible_rotations.append(currRot)
+                    feasible_shapes.append(shape)
+                    feasible_ffts.append(machPart_ffts[currRot])
 
         # Use cached grid FFT if available, otherwise compute and cache
         if self._grid_fft_cache is None:
@@ -157,30 +165,6 @@ class BuildingPlate:
         self.min_occupied_row = min(self.min_occupied_row, y_start)
         self.max_occupied_row = max(self.max_occupied_row, y)
 
-        # Update vacancy vector using pre-allocated buffers (reduces allocations)
-        num_rows = y_end - y_start
-        
-        # Use pre-allocated padded buffer (only the needed rows)
-        padded = self._padded_buffer[:num_rows, :]
-        padded[:, 0] = 1  # Left pad
-        padded[:, -1] = 1  # Right pad
-        padded[:, 1:-1] = self.grid[y_start:y_end, :]
-        
-        # Compute differences
-        diffs = np.diff(padded.astype(np.int8), axis=1)
-        
-        # Identify start and end of zero runs
-        start_indices = np.where(diffs == -1)
-        end_indices = np.where(diffs == 1)
-        
-        # Compute lengths of zero runs
-        run_lengths = end_indices[1] - start_indices[1]
-        
-        # Use pre-allocated buffer for max computation
-        max_zeros = self._max_zeros_buffer[:num_rows]
-        max_zeros.fill(0)
-        np.maximum.at(max_zeros, start_indices[0], run_lengths)
-        
-        # Update the vacancy vector
-        self.vacancy_vector[y_start:y_end] = max_zeros
+        # Update vacancy vector using Numba JIT (single pass, no allocations)
+        update_vacancy_vector_rows(self.vacancy_vector, self.grid[y_start:y_end, :], y_start)
             

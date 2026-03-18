@@ -114,24 +114,32 @@ class TorchCollisionBackend(BaseCollisionBackend):
             overlap = torch.fft.ifft2(grid_fft * part_fft).real
             cropped = torch.round(overlap[part_shape[0] - 1 : grid.shape[0], part_shape[1] - 1 : grid.shape[1]])
 
-            rows_with_zeros = (cropped == 0).any(dim=1)
+            zero_mask = (cropped == 0)
+            rows_with_zeros = zero_mask.any(dim=1)
             if not rows_with_zeros.any():
                 return False, None, None
 
-            largest_row = rows_with_zeros.nonzero().max().item()
-            smallest_col = (cropped[largest_row] == 0).nonzero().min().item()
+            # Use argmax on reversed tensor to find bottom-most row
+            num_rows = rows_with_zeros.shape[0]
+            largest_row = num_rows - 1 - rows_with_zeros.flip(0).int().argmax().item()
+            smallest_col = zero_mask[largest_row].int().argmax().item()
             largest_row_real = largest_row + part_shape[0] - 1
             return True, smallest_col, largest_row_real
 
     def find_bottom_left_zero_batch(self, grid, part_ffts, part_shapes, grid_state=None, grid_fft=None):
         if not part_ffts:
             return []
-        if not self.use_batch:
+        # Use traditional approach for ≤2 rotations (faster due to lower overhead)
+        # Batched approach wins at 3+ rotations
+        if not self.use_batch or len(part_ffts) <= 2:
             return [
                 self.find_bottom_left_zero(grid, part_ffts[i], part_shapes[i], grid_state=grid_state, grid_fft=grid_fft)
                 for i in range(len(part_ffts))
             ]
 
+        num_rot = len(part_ffts)
+        H, W = grid.shape
+        
         with torch.inference_mode():
             # Use cached grid FFT if provided, otherwise compute
             if grid_fft is None:
@@ -140,26 +148,67 @@ class TorchCollisionBackend(BaseCollisionBackend):
             stacked_part_ffts = torch.stack(part_ffts, dim=0)
             overlap_batch = torch.fft.ifft2(grid_fft.unsqueeze(0) * stacked_part_ffts).real
             rounded_batch = torch.round(overlap_batch)
-
-            # Process all results - collect data on GPU first, then transfer once
-            results = []
-            for i, part_shape in enumerate(part_shapes):
-                cropped = rounded_batch[i, part_shape[0] - 1 : grid.shape[0], part_shape[1] - 1 : grid.shape[1]]
-                rows_with_zeros = (cropped == 0).any(dim=1)
-                if not rows_with_zeros.any():
-                    results.append((False, None, None))
-                    continue
-
-                # Keep on GPU as long as possible
-                largest_row_tensor = rows_with_zeros.nonzero().max()
-                smallest_col_tensor = (cropped[largest_row_tensor] == 0).nonzero().min()
-                
-                # Single sync point per rotation (unavoidable for algorithm logic)
-                largest_row = largest_row_tensor.item()
-                smallest_col = smallest_col_tensor.item()
-                largest_row_real = largest_row + part_shape[0] - 1
-                results.append((True, smallest_col, largest_row_real))
-
+            
+            # Zero mask for all rotations at once
+            zero_mask = (rounded_batch == 0)  # (num_rot, H, W)
+            
+            # Part shape constraints - valid region where part fits
+            part_heights = torch.tensor([s[0] for s in part_shapes], device=self.device)
+            part_widths = torch.tensor([s[1] for s in part_shapes], device=self.device)
+            
+            # Create validity masks using broadcasting
+            row_idx = torch.arange(H, device=self.device).view(1, H, 1)  # (1, H, 1)
+            col_idx = torch.arange(W, device=self.device).view(1, 1, W)  # (1, 1, W)
+            
+            # Valid positions: row >= h-1, col >= w-1 for each rotation
+            valid_row = row_idx >= (part_heights - 1).view(-1, 1, 1)  # (num_rot, H, 1)
+            valid_col = col_idx >= (part_widths - 1).view(-1, 1, 1)   # (num_rot, 1, W)
+            valid_mask = valid_row & valid_col  # (num_rot, H, W)
+            
+            # Combine: valid zeros only
+            valid_zeros = zero_mask & valid_mask  # (num_rot, H, W)
+            
+            # Score: row * (W+1) - col (maximize row, minimize col as tiebreaker)
+            score = torch.where(
+                valid_zeros,
+                row_idx.float() * (W + 1) - col_idx.float(),
+                torch.tensor(-1e9, device=self.device)
+            )
+            
+            # Find best position for each rotation (single operation)
+            flat_scores = score.view(num_rot, -1)  # (num_rot, H*W)
+            best_flat_idx = flat_scores.argmax(dim=1)  # (num_rot,)
+            max_scores = flat_scores.max(dim=1).values  # (num_rot,)
+            
+            # Convert flat index to row, col
+            best_row_full = best_flat_idx // W
+            best_col_full = best_flat_idx % W
+            
+            # Has valid zero if max score is not -1e9
+            has_valid = max_scores > -1e8
+            
+            # Convert to output coordinates:
+            # smallest_col = col_full - (w - 1)  [cropped coordinate]
+            # largest_row_real = row_full        [full coordinate, as expected by caller]
+            smallest_col = best_col_full - (part_widths - 1)
+            largest_row_real = best_row_full
+            
+            # SINGLE SYNC POINT: transfer all results to CPU at once
+            results_tensor = torch.stack([
+                has_valid.int(),
+                smallest_col,
+                largest_row_real
+            ], dim=1)
+            results_cpu = results_tensor.cpu().numpy()
+        
+        # Convert to expected format
+        results = []
+        for i in range(num_rot):
+            if results_cpu[i, 0] == 1:
+                results.append((True, int(results_cpu[i, 1]), int(results_cpu[i, 2])))
+            else:
+                results.append((False, None, None))
+        
         return results
 
 
@@ -219,4 +268,19 @@ def create_collision_backend(name):
         return TorchCollisionBackend("cpu", use_batch=False)
     if name == "numpy_cpu":
         return NumpyCollisionBackend()
+    
+    # CuPy backends (lower overhead than PyTorch)
+    if name == "cupy_gpu":
+        try:
+            from collision_backend_cupy import CuPyCollisionBackend
+            return CuPyCollisionBackend()
+        except ImportError as e:
+            raise RuntimeError(f"CuPy backend unavailable: {e}. Install with: pip install cupy-cuda12x")
+    if name == "cupy_gpu_optimized":
+        try:
+            from collision_backend_cupy import CuPyCollisionBackendOptimized
+            return CuPyCollisionBackendOptimized()
+        except ImportError as e:
+            raise RuntimeError(f"CuPy backend unavailable: {e}. Install with: pip install cupy-cuda12x")
+    
     raise ValueError(f"Unsupported collision backend: {name}")

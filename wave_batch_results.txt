@@ -1,0 +1,35 @@
+nohup: ignoring input
+
+==================================================
+Testing: eval_mode=serial
+==================================================
+Makespan of initial solution:  246042.18342431998
+
+Initial Population:
+  ->  shape: (500, 100)
+  ->  Best Fitness: 246042.18342432
+Elite avg: 288693.1698
+Generation 0: Best=246042.1834, Time=58.12s
+Elite avg: 273700.7773
+Generation 1: Best=246042.1834, Time=60.36s
+Elite avg: 267986.3532
+Generation 2: Best=246042.1834, Time=60.43s
+Fitness cache: 0/1850 hits (0.0%), 1850 unique solutions
+Total time: 211.93s, Per generation: 70.64s
+
+==================================================
+Testing: eval_mode=wave_batch
+==================================================
+Makespan of initial solution:  246042.18342431998
+
+Initial Population:
+  ->  shape: (500, 100)
+  ->  Best Fitness: 251341.59612960002
+Elite avg: 301510.4730
+Generation 0: Best=251341.5961, Time=40.65s
+Elite avg: 288661.0821
+Generation 1: Best=251341.5961, Time=31.66s
+Elite avg: 281963.4588
+Generation 2: Best=251341.5961, Time=14.70s
+Fitness cache: 0/1850 hits (0.0%), 1850 unique solutions
+Total time: 152.60s, Per generation: 50.87s

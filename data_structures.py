@@ -25,10 +25,36 @@ class PartData:
     best_rotation: int               # Index of rotation with minimum height
     rotations_gpu: Optional[List[Any]] = None  # Pre-transferred GPU tensors (avoids CPU->GPU per insert)
     
+    # Pre-prepared data for batched Numba JIT vacancy check (computed once at part creation)
+    densities_flat: Optional[np.ndarray] = None  # All densities concatenated
+    density_offsets: Optional[np.ndarray] = None  # Start indices into densities_flat
+    shapes_heights: Optional[np.ndarray] = None   # Heights as np.int32 array
+    shapes_widths: Optional[np.ndarray] = None    # Widths as np.int32 array
+    
     @property
     def lengths(self) -> List[int]:
         """Height of each rotation."""
         return [s[0] for s in self.shapes]
+    
+    def prepare_jit_data(self) -> None:
+        """Pre-compute data structures for batched Numba JIT vacancy check."""
+        if self.densities_flat is not None:
+            return  # Already prepared
+        
+        # Flatten all densities into a single array
+        self.densities_flat = np.concatenate([d.astype(np.int32) for d in self.densities])
+        
+        # Track where each rotation's density starts
+        self.density_offsets = np.zeros(len(self.densities) + 1, dtype=np.int32)
+        offset = 0
+        for i, d in enumerate(self.densities):
+            self.density_offsets[i] = offset
+            offset += len(d)
+        self.density_offsets[-1] = offset
+        
+        # Extract shapes as np arrays
+        self.shapes_heights = np.array([s[0] for s in self.shapes], dtype=np.int32)
+        self.shapes_widths = np.array([s[1] for s in self.shapes], dtype=np.int32)
 
 
 @dataclass
