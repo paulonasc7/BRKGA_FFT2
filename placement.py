@@ -73,7 +73,8 @@ def _process_single_machine(args):
             
             # Insert at bottom-left (use GPU tensor if available)
             gpu_tensor = part_data.rotations_gpu[best_rotation] if part_data.rotations_gpu else None
-            newBin.insert(0, mach_data.bin_length-1, part_data.rotations[best_rotation], 
+            uint8_matrix = part_data.rotations_uint8[best_rotation] if part_data.rotations_uint8 else part_data.rotations[best_rotation]
+            newBin.insert(0, mach_data.bin_length-1, uint8_matrix,
                          part_data.shapes[best_rotation], part_data.area, gpu_tensor=gpu_tensor)
             newBin.calculate_enclosure_box_length()
             

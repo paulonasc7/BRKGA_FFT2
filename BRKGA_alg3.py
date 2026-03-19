@@ -80,10 +80,12 @@ class BRKGA():
             max_workers = self.eval_workers if self.eval_workers > 0 else min(32, (os.cpu_count() or 4))
             self._executor = ThreadPoolExecutor(max_workers=max_workers)
         
-        # Fitness memoization cache (avoids re-evaluating duplicate chromosomes)
-        self._fitness_cache = {}
-        self._cache_hits = 0
-        self._cache_misses = 0
+        # Fitness memoization cache (only for serial/thread/process — wave_batch chromosomes
+        # are continuous floats that never repeat, so the cache would have 0% hit rate)
+        if self.eval_mode != "wave_batch":
+            self._fitness_cache = {}
+            self._cache_hits = 0
+            self._cache_misses = 0
 
 
     def evaluate_solution(self, solution):
@@ -104,10 +106,13 @@ class BRKGA():
         return tuple(np.round(solution, 4))
     
     def cal_fitness(self, population):
-        # Check cache for each solution
+        if self.eval_mode == "wave_batch":
+            return self._wave_evaluator.evaluate_batch(np.array(population))
+
+        # Cache-based path for serial/thread/process modes
         results = [None] * len(population)
         to_evaluate = []  # (index, solution) pairs that need evaluation
-        
+
         for i, sol in enumerate(population):
             key = self._hash_solution(sol)
             if key in self._fitness_cache:
@@ -116,18 +121,15 @@ class BRKGA():
             else:
                 to_evaluate.append((i, sol, key))
                 self._cache_misses += 1
-        
+
         # If all cached, return early
         if not to_evaluate:
             return results
-        
+
         # Evaluate only uncached solutions
         solutions_to_eval = [sol for _, sol, _ in to_evaluate]
-        
-        if self.eval_mode == "wave_batch":
-            # Use wave-based GPU batching
-            new_fitness = self._wave_evaluator.evaluate_batch(np.array(solutions_to_eval))
-        elif self.eval_mode == "serial" or self.eval_workers <= 1:
+
+        if self.eval_mode == "serial" or self.eval_workers <= 1:
             new_fitness = [self.evaluate_solution(sol) for sol in solutions_to_eval]
         elif self.eval_mode == "thread":
             new_fitness = list(self._executor.map(self.evaluate_solution, solutions_to_eval))
@@ -139,12 +141,12 @@ class BRKGA():
                 new_fitness = list(executor.map(self.evaluate_solution, solutions_to_eval, chunksize=self.eval_chunksize))
         else:
             raise ValueError(f"Unsupported eval_mode: {self.eval_mode}")
-        
+
         # Store results and update cache
         for (i, _, key), fitness in zip(to_evaluate, new_fitness):
             results[i] = fitness
             self._fitness_cache[key] = fitness
-        
+
         return results
     
     def shutdown(self):
@@ -153,11 +155,12 @@ class BRKGA():
             self._executor.shutdown(wait=False)
             self._executor = None
         
-        # Report cache effectiveness
-        total = self._cache_hits + self._cache_misses
-        if total > 0:
-            hit_rate = 100.0 * self._cache_hits / total
-            print(f"Fitness cache: {self._cache_hits}/{total} hits ({hit_rate:.1f}%), {len(self._fitness_cache)} unique solutions")
+        # Report cache effectiveness (only when cache is active)
+        if self.eval_mode != "wave_batch":
+            total = self._cache_hits + self._cache_misses
+            if total > 0:
+                hit_rate = 100.0 * self._cache_hits / total
+                print(f"Fitness cache: {self._cache_hits}/{total} hits ({hit_rate:.1f}%), {len(self._fitness_cache)} unique solutions")
 
     def partition(self, population, fitness_list):
         fitness_arr = np.asarray(fitness_list)
@@ -342,7 +345,10 @@ if __name__ == "__main__":
         rotations_gpu = None
         if hasattr(collision_backend, 'prepare_rotation_tensor'):
             rotations_gpu = [collision_backend.prepare_rotation_tensor(rot) for rot in rotations]
-        
+
+        # Pre-cast uint8 versions (avoids .astype(np.uint8) on every grid insert)
+        rotations_uint8 = [r.astype(np.uint8) for r in rotations]
+
         part_data = PartData(
             id=part,
             area=area[part],
@@ -351,7 +357,8 @@ if __name__ == "__main__":
             shapes=shapes,
             densities=densities,
             best_rotation=best_rotation,
-            rotations_gpu=rotations_gpu
+            rotations_gpu=rotations_gpu,
+            rotations_uint8=rotations_uint8
         )
         # Pre-compute JIT-optimized data structures for batched vacancy check
         part_data.prepare_jit_data()
@@ -494,7 +501,8 @@ if __name__ == "__main__":
             # Insert the part in the bottomest-leftest position (use GPU tensor if available)
             rot_idx = bestBatch[3]
             gpu_tensor = part_data.rotations_gpu[rot_idx] if part_data.rotations_gpu else None
-            newBin.insert(0, mach_data.bin_length-1, part_data.rotations[rot_idx], part_data.shapes[rot_idx], part_data.area, gpu_tensor=gpu_tensor)
+            uint8_matrix = part_data.rotations_uint8[rot_idx] if part_data.rotations_uint8 else part_data.rotations[rot_idx]
+            newBin.insert(0, mach_data.bin_length-1, uint8_matrix, part_data.shapes[rot_idx], part_data.area, gpu_tensor=gpu_tensor)
             
             # Update batch current state
             newBin.calculate_enclosure_box_length()  # Update box length
@@ -523,7 +531,8 @@ if __name__ == "__main__":
             # Insert the part in the bottomest-leftest position (use GPU tensor if available)
             rot_idx = bestBatch[3]
             gpu_tensor = part_data.rotations_gpu[rot_idx] if part_data.rotations_gpu else None
-            newBin.insert(bestBatch[2][0], bestBatch[2][1], part_data.rotations[rot_idx], part_data.shapes[rot_idx], part_data.area, gpu_tensor=gpu_tensor)
+            uint8_matrix = part_data.rotations_uint8[rot_idx] if part_data.rotations_uint8 else part_data.rotations[rot_idx]
+            newBin.insert(bestBatch[2][0], bestBatch[2][1], uint8_matrix, part_data.shapes[rot_idx], part_data.area, gpu_tensor=gpu_tensor)
             
             # Update batch current state
             newBin.calculate_enclosure_box_length()  # Update box length

@@ -93,14 +93,20 @@ class WaveBatchEvaluator:
         max_total_bins = num_solutions * max_bins_per_sol
         grid_states = torch.zeros((max_total_bins, H, W), dtype=torch.float32, device=self.device)
         grid_ffts = torch.zeros((max_total_bins, H, W), dtype=torch.complex64, device=self.device)
-        
+
+        # Cache index tensors once per machine (reused across all waves and chunks)
+        row_idx = torch.arange(H, device=self.device).view(1, H, 1)
+        col_idx = torch.arange(W, device=self.device).view(1, 1, W)
+        neg_inf = torch.tensor(-1e9, device=self.device)
+
         # Process waves
         max_waves = max(len(seq) for seq in sequences) * 3 if sequences else 0
         for wave in range(max_waves):
             active = [c for c in contexts if not c.is_done and c.is_feasible]
             if not active:
                 break
-            self._process_wave_true_batch(active, mach_data, grid_states, grid_ffts)
+            self._process_wave_true_batch(active, mach_data, grid_states, grid_ffts,
+                                          row_idx, col_idx, neg_inf)
         
         # Collect makespans
         makespans = np.zeros(num_solutions)
@@ -157,7 +163,8 @@ class WaveBatchEvaluator:
         
         return contexts
     
-    def _process_wave_true_batch(self, contexts, mach_data, grid_states, grid_ffts):
+    def _process_wave_true_batch(self, contexts, mach_data, grid_states, grid_ffts,
+                                 row_idx, col_idx, neg_inf):
         """
         TRUE cross-solution batching: batch FFT across ALL contexts at once.
         
@@ -214,39 +221,48 @@ class WaveBatchEvaluator:
                     bs.grid_fft_valid = True
         
         # Phase 3: Collect ALL (context, bin, rotation) tests to batch
-        # Structure: list of (ctx_idx, bin_state, rot, shape, part_fft, part_data, mach_part_data)
-        all_tests = []
+        # Parallel arrays replace list-of-dicts to avoid per-entry dict allocation and
+        # string-keyed lookups in the hot path of _batch_fft_all_tests.
+        test_grid_indices = []   # bin_state.grid_state_idx  (for GPU gather)
+        test_part_ffts    = []   # mach_part_data.ffts[rot]  (for torch.stack)
+        test_heights      = []   # shape[0]                  (for valid-position mask)
+        test_widths       = []   # shape[1]                  (for valid-position mask)
+        test_bin_indices  = []   # bin_idx                   (for Phase-5 tie-breaking)
+        test_shapes       = []   # shape tuple               (for Phase-5 y_start)
+        test_bin_states   = []   # BinState object           (for Phase-5 placement)
+        test_rotations    = []   # rot                       (for Phase-5 placement)
         ctx_to_tests = {i: [] for i in range(len(context_info))}
-        
+        n_tests = 0
+
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             for bin_idx, bin_state in enumerate(ctx.open_bins):
                 # Area check
                 if bin_state.area + part_data.area > ctx.bin_area:
                     continue
-                
+
                 # Vacancy check for each rotation
                 for rot in range(part_data.nrot):
                     shape = part_data.shapes[rot]
                     if shape[0] > H or shape[1] > W:
                         continue
-                    dens = part_data.densities[rot].astype(np.int32)
+                    dens = part_data.densities[rot]
                     if check_vacancy_fit_simple(bin_state.vacancy_vector, dens):
-                        test_entry = {
-                            'ctx_idx': ctx_idx,
-                            'bin_idx': bin_idx,
-                            'bin_state': bin_state,
-                            'rot': rot,
-                            'shape': shape,
-                            'part_fft': mach_part_data.ffts[rot],
-                            'part_data': part_data,
-                            'mach_part_data': mach_part_data
-                        }
-                        all_tests.append(test_entry)
-                        ctx_to_tests[ctx_idx].append(len(all_tests) - 1)
+                        test_grid_indices.append(bin_state.grid_state_idx)
+                        test_part_ffts.append(mach_part_data.ffts[rot])
+                        test_heights.append(shape[0])
+                        test_widths.append(shape[1])
+                        test_bin_indices.append(bin_idx)
+                        test_shapes.append(shape)
+                        test_bin_states.append(bin_state)
+                        test_rotations.append(rot)
+                        ctx_to_tests[ctx_idx].append(n_tests)
+                        n_tests += 1
         
         # Phase 4: Batch FFT collision check for ALL tests at once
-        if all_tests:
-            placement_results = self._batch_fft_all_tests(all_tests, grid_ffts, H, W)
+        if n_tests:
+            placement_results = self._batch_fft_all_tests(
+                n_tests, test_grid_indices, test_part_ffts, test_heights, test_widths,
+                grid_ffts, H, W, row_idx, col_idx, neg_inf)
         else:
             placement_results = []
         
@@ -269,22 +285,21 @@ class WaveBatchEvaluator:
             best_col = float('inf')
             
             for test_idx in test_indices:
-                test = all_tests[test_idx]
                 result = placement_results[test_idx]
-                
+
                 if result is None:
                     continue
-                
+
                 col, row = result
-                bin_idx = test['bin_idx']
-                shape = test['shape']
-                bin_state = test['bin_state']
-                
+                bin_idx  = test_bin_indices[test_idx]
+                shape    = test_shapes[test_idx]
+                bin_state = test_bin_states[test_idx]
+
                 y_start = row - shape[0] + 1
                 new_length = max(bin_state.enclosure_box_length, H - y_start)
                 potential_area = bin_state.area + part_data.area
                 density = potential_area / (new_length * W)
-                
+
                 # First-fit: always prefer lower bin index
                 if bin_idx < best_bin_idx:
                     better = True
@@ -300,19 +315,20 @@ class WaveBatchEvaluator:
                         better = False
                 else:
                     better = False
-                
+
                 if better:
                     best_bin_idx = bin_idx
                     best_density = density
                     best_row = row
                     best_col = col
-                    best_result = (test['bin_state'], col, row, test['rot'], shape, 
+                    best_result = (bin_state, col, row, test_rotations[test_idx], shape,
                                    part_data, mach_part_data)
             
             if best_result is not None:
                 bin_state, x, y, rot, shape, pd, mpd = best_result
-                self._place_part_in_bin(bin_state, x, y, pd.rotations[rot], 
-                                        shape, pd.area, mpd, grid_states)
+                self._place_part_in_bin(bin_state, x, y, pd.rotations_uint8[rot],
+                                        shape, pd.area, mpd, grid_states,
+                                        part_gpu_tensor=pd.rotations_gpu[rot])
                 ctx.current_part_idx += 1
             else:
                 contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
@@ -322,62 +338,63 @@ class WaveBatchEvaluator:
             self._start_new_bin(ctx, part_data, mach_part_data, mach_data, grid_states)
             ctx.current_part_idx += 1
     
-    def _batch_fft_all_tests(self, all_tests, grid_ffts, H, W):
+    def _batch_fft_all_tests(self, n_tests, test_grid_indices, test_part_ffts,
+                              test_heights, test_widths,
+                              grid_ffts, H, W, row_idx, col_idx, neg_inf):
         """
         Perform batched IFFT for ALL tests across ALL contexts.
         Chunks to avoid OOM with large batches.
-        
+
+        Accepts parallel arrays instead of list-of-dicts to avoid per-entry dict
+        allocation and string-keyed attribute lookups in this hot path.
+        row_idx, col_idx, neg_inf are pre-allocated GPU tensors (cached per machine).
+
         Returns list of results: (col, row) or None for each test.
         """
-        n_tests = len(all_tests)
         if n_tests == 0:
             return []
-        
-        # Chunk to avoid OOM - 1250 is empirically optimal for RTX A4000 (16GB)
-        # Smaller = more kernel launches; Larger = memory pressure / OOM
-        CHUNK_SIZE = 500
+
+        # Chunk to avoid OOM - empirically tuned for RTX A4000 (16GB)
+        # Benchmarked: 250=6.05s, 500=5.90s, 750=5.88s (best), 1000=5.89s, 1500=5.88s, 2000+=OOM risk
+        # 750-1500 all within noise; 750 chosen as sweet spot with safe VRAM headroom
+        CHUNK_SIZE = 750
         all_results = [None] * n_tests
-        
+
         for chunk_start in range(0, n_tests, CHUNK_SIZE):
             chunk_end = min(chunk_start + CHUNK_SIZE, n_tests)
-            chunk_tests = all_tests[chunk_start:chunk_end]
-            chunk_n = len(chunk_tests)
-            
+            chunk_n = chunk_end - chunk_start
+
             with torch.inference_mode():
-                # Gather grid FFTs and part FFTs for this chunk
-                grid_indices = torch.tensor([t['bin_state'].grid_state_idx for t in chunk_tests], 
+                # Gather grid FFTs and part FFTs — direct list slices, no comprehensions
+                grid_indices = torch.tensor(test_grid_indices[chunk_start:chunk_end],
                                             device=self.device, dtype=torch.long)
                 batch_grid_ffts = grid_ffts[grid_indices]  # (chunk_n, H, W)
-                batch_part_ffts = torch.stack([t['part_fft'] for t in chunk_tests], dim=0)
-                
+                batch_part_ffts = torch.stack(test_part_ffts[chunk_start:chunk_end], dim=0)
+
                 # Batched IFFT
                 overlap_batch = torch.fft.ifft2(batch_grid_ffts * batch_part_ffts).real
                 rounded_batch = torch.round(overlap_batch)
-                
+
                 # Find valid positions
                 zero_mask = (rounded_batch == 0)
-                
-                part_heights = torch.tensor([t['shape'][0] for t in chunk_tests], device=self.device)
-                part_widths = torch.tensor([t['shape'][1] for t in chunk_tests], device=self.device)
-                
-                row_idx = torch.arange(H, device=self.device).view(1, H, 1)
-                col_idx = torch.arange(W, device=self.device).view(1, 1, W)
-                
+
+                part_heights = torch.tensor(test_heights[chunk_start:chunk_end], device=self.device)
+                part_widths  = torch.tensor(test_widths[chunk_start:chunk_end],  device=self.device)
+
                 valid_row = row_idx >= (part_heights - 1).view(-1, 1, 1)
                 valid_col = col_idx >= (part_widths - 1).view(-1, 1, 1)
                 valid_mask = valid_row & valid_col
                 valid_zeros = zero_mask[:, :H, :W] & valid_mask
-                
+
                 # Score: prefer bottom-left (high row, low col)
                 score = torch.where(
                     valid_zeros,
                     row_idx.float() * (W + 1) - col_idx.float(),
-                    torch.tensor(-1e9, device=self.device)
+                    neg_inf
                 )
                 
                 flat_scores = score.view(chunk_n, -1)
-                best_flat_idx = flat_scores.argmax(dim=1)
-                max_scores = flat_scores.max(dim=1).values
+                max_scores, best_flat_idx = flat_scores.max(dim=1)
                 
                 best_row = best_flat_idx // W
                 best_col = best_flat_idx % W
@@ -394,14 +411,16 @@ class WaveBatchEvaluator:
         
         return all_results
     
-    def _place_part_in_bin(self, bin_state, x, y, part_matrix, shape, area, mach_part_data, grid_states):
+    def _place_part_in_bin(self, bin_state, x, y, part_matrix, shape, area, mach_part_data, grid_states,
+                           part_gpu_tensor=None):
         y_start = y - shape[0] + 1
         y_end = y + 1
-        
-        bin_state.grid[y_start:y_end, x:x+shape[1]] += part_matrix.astype(np.uint8)
-        
-        part_tensor = torch.as_tensor(part_matrix, dtype=torch.float32, device=self.device)
-        grid_states[bin_state.grid_state_idx, y_start:y_end, x:x+shape[1]] += part_tensor
+
+        bin_state.grid[y_start:y_end, x:x+shape[1]] += part_matrix
+
+        if part_gpu_tensor is None:
+            part_gpu_tensor = torch.as_tensor(part_matrix, dtype=torch.float32, device=self.device)
+        grid_states[bin_state.grid_state_idx, y_start:y_end, x:x+shape[1]] += part_gpu_tensor
         bin_state.grid_fft_valid = False
         
         update_vacancy_vector_rows(bin_state.vacancy_vector, bin_state.grid[y_start:y_end, :], y_start)
@@ -433,8 +452,9 @@ class WaveBatchEvaluator:
         
         best_rot = part_data.best_rotation
         shape = part_data.shapes[best_rot]
-        self._place_part_in_bin(new_bin, 0, ctx.bin_length - 1, part_data.rotations[best_rot],
-                                shape, part_data.area, mach_part_data, grid_states)
+        self._place_part_in_bin(new_bin, 0, ctx.bin_length - 1, part_data.rotations_uint8[best_rot],
+                                shape, part_data.area, mach_part_data, grid_states,
+                                part_gpu_tensor=part_data.rotations_gpu[best_rot])
         ctx.open_bins.append(new_bin)
 
 

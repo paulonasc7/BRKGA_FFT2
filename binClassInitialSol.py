@@ -1,7 +1,7 @@
 import numpy as np
 import time
 from collision_backend import create_collision_backend
-from numba_utils import check_vacancy_fit_simple
+from numba_utils import check_vacancy_fit_simple, update_vacancy_vector_rows
 
 class BuildingPlate:
     def __init__(self, width, length, collision_backend=None):
@@ -30,10 +30,6 @@ class BuildingPlate:
         
         # Cached grid FFT (invalidated on insert)
         self._grid_fft_cache = None
-        
-        # Pre-allocate reusable buffers for vacancy vector updates (avoid allocations per insert)
-        self._padded_buffer = np.ones((length, width + 2), dtype=np.uint8)
-        self._max_zeros_buffer = np.zeros(length, dtype=np.int32)
 
 
     def save_plate_to_file(self, filename):
@@ -130,7 +126,7 @@ class BuildingPlate:
         y_end = y + 1
         
         # Use slicing to insert the binary part matrix (cast to uint8 to match grid dtype)
-        self.grid[y_start:y_end, x:x + shapes[1]] += partMatrix.astype(np.uint8)
+        self.grid[y_start:y_end, x:x + shapes[1]] += partMatrix
         # Use pre-computed GPU tensor if available for faster grid state update
         self.collision_backend.update_grid_region(self.grid_state, x, y, partMatrix, shapes, part_tensor=gpu_tensor)
         
@@ -141,30 +137,6 @@ class BuildingPlate:
         self.min_occupied_row = min(self.min_occupied_row, y_start)
         self.max_occupied_row = max(self.max_occupied_row, y)
 
-        # Update vacancy vector using pre-allocated buffers (reduces allocations)
-        num_rows = y_end - y_start
-        
-        # Use pre-allocated padded buffer (only the needed rows)
-        padded = self._padded_buffer[:num_rows, :]
-        padded[:, 0] = 1  # Left pad
-        padded[:, -1] = 1  # Right pad
-        padded[:, 1:-1] = self.grid[y_start:y_end, :]
-        
-        # Compute differences
-        diffs = np.diff(padded.astype(np.int8), axis=1)
-        
-        # Identify start and end of zero runs
-        start_indices = np.where(diffs == -1)
-        end_indices = np.where(diffs == 1)
-        
-        # Compute lengths of zero runs
-        run_lengths = end_indices[1] - start_indices[1]
-        
-        # Use pre-allocated buffer for max computation
-        max_zeros = self._max_zeros_buffer[:num_rows]
-        max_zeros.fill(0)
-        np.maximum.at(max_zeros, start_indices[0], run_lengths)
-        
-        # Update the vacancy vector
-        self.vacancy_vector[y_start:y_end] = max_zeros
+        # Update vacancy vector using Numba JIT (same as binClassNew.py)
+        update_vacancy_vector_rows(self.vacancy_vector, self.grid[y_start:y_end, :], y_start)
             
