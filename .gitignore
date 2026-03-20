@@ -25,3 +25,6 @@ env/
 .tmp/
 temp/
 tmp/
+
+# Remote runner (contains Paperspace token — do not push)
+remote.py
