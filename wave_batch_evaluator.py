@@ -17,7 +17,25 @@ import numpy as np
 import torch
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass, field
+from collections import defaultdict
 from numba_utils import check_vacancy_fit_simple, update_vacancy_vector_rows
+
+
+@torch.jit.script
+def _jit_max_consecutive_zeros(rows: torch.Tensor) -> torch.Tensor:
+    """
+    Compute max consecutive zeros per row for GPU vacancy update.
+    rows: (N, W) float32 - grid rows (0.0=empty, >0.0=occupied)
+    returns: (N,) long - max consecutive free cells per row
+    """
+    W = rows.shape[1]
+    current = torch.zeros(rows.shape[0], dtype=torch.long, device=rows.device)
+    max_run = torch.zeros(rows.shape[0], dtype=torch.long, device=rows.device)
+    for j in range(W):
+        col_occ = rows[:, j] > 0.5
+        current = torch.where(col_occ, torch.zeros_like(current), current + 1)
+        max_run = torch.maximum(max_run, current)
+    return max_run
 
 
 @dataclass
@@ -58,8 +76,8 @@ class BatchPlacementContext:
 class WaveBatchEvaluator:
     """Evaluates many solutions in parallel using true cross-solution FFT batching."""
     
-    def __init__(self, problem_data, nbParts, nbMachines, thresholds, 
-                 instance_parts, collision_backend, device='cuda'):
+    def __init__(self, problem_data, nbParts, nbMachines, thresholds,
+                 instance_parts, collision_backend, device='cuda', use_gpu_vacancy=False):
         self.problem_data = problem_data
         self.nbParts = nbParts
         self.nbMachines = nbMachines
@@ -69,6 +87,10 @@ class WaveBatchEvaluator:
         self.device = device
         self.machines = problem_data.machines
         self.parts = problem_data.parts
+        self.use_gpu_vacancy = use_gpu_vacancy
+        # Per-machine transient state (set in _process_machine_batch, cleared after)
+        self._vacancy_gpu = None   # (max_total_bins, H) long tensor on GPU
+        self._dirty_bins = None    # set of grid_state_idx values needing vacancy recompute
         
     def evaluate_batch(self, chromosomes: np.ndarray) -> List[float]:
         num_solutions = len(chromosomes)
@@ -94,6 +116,11 @@ class WaveBatchEvaluator:
         grid_states = torch.zeros((max_total_bins, H, W), dtype=torch.float32, device=self.device)
         grid_ffts = torch.zeros((max_total_bins, H, W), dtype=torch.complex64, device=self.device)
 
+        # IMP-3: Allocate GPU vacancy tensor (all bins start fully free = bin_width)
+        if self.use_gpu_vacancy:
+            self._vacancy_gpu = torch.full((max_total_bins, H), W, dtype=torch.long, device=self.device)
+            self._dirty_bins = set()
+
         # Cache index tensors once per machine (reused across all waves and chunks)
         row_idx = torch.arange(H, device=self.device).view(1, H, 1)
         col_idx = torch.arange(W, device=self.device).view(1, 1, W)
@@ -114,10 +141,15 @@ class WaveBatchEvaluator:
             if not ctx.is_feasible:
                 makespans[ctx.solution_idx] = 1e16
             else:
-                total = sum(b.proc_time + b.proc_time_height + mach_data.setup_time 
+                total = sum(b.proc_time + b.proc_time_height + mach_data.setup_time
                            for b in ctx.open_bins if b.area > 0)
                 makespans[ctx.solution_idx] = total
-        
+
+        # Clean up per-machine transient state
+        if self.use_gpu_vacancy:
+            self._vacancy_gpu = None
+            self._dirty_bins = None
+
         return makespans
     
     def _decode_sequences(self, chromosomes, machine_idx):
@@ -220,6 +252,10 @@ class WaveBatchEvaluator:
                 for bs in invalid_bin_states:
                     bs.grid_fft_valid = True
         
+        # IMP-3: Flush dirty bins — batch-update vacancy_gpu from grid_states
+        if self.use_gpu_vacancy and self._dirty_bins:
+            self._update_vacancy_gpu(grid_states, H, W)
+
         # Phase 3: Collect ALL (context, bin, rotation) tests to batch
         # Parallel arrays replace list-of-dicts to avoid per-entry dict allocation and
         # string-keyed lookups in the hot path of _batch_fft_all_tests.
@@ -234,29 +270,63 @@ class WaveBatchEvaluator:
         ctx_to_tests = {i: [] for i in range(len(context_info))}
         n_tests = 0
 
-        for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
-            for bin_idx, bin_state in enumerate(ctx.open_bins):
-                # Area check
-                if bin_state.area + part_data.area > ctx.bin_area:
-                    continue
+        if self.use_gpu_vacancy:
+            # IMP-3 GPU path: collect area+shape candidates, batch GPU vacancy check
+            vacancy_candidates = []   # (bin_state, part_data, rot)
+            candidate_meta = []       # (ctx_idx, bin_idx, bin_state, rot, mach_part_data, shape, part_data)
 
-                # Vacancy check for each rotation
-                for rot in range(part_data.nrot):
-                    shape = part_data.shapes[rot]
-                    if shape[0] > H or shape[1] > W:
+            for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
+                for bin_idx, bin_state in enumerate(ctx.open_bins):
+                    if bin_state.area + part_data.area > ctx.bin_area:
                         continue
-                    dens = part_data.densities[rot]
-                    if check_vacancy_fit_simple(bin_state.vacancy_vector, dens):
-                        test_grid_indices.append(bin_state.grid_state_idx)
-                        test_part_ffts.append(mach_part_data.ffts[rot])
-                        test_heights.append(shape[0])
-                        test_widths.append(shape[1])
-                        test_bin_indices.append(bin_idx)
-                        test_shapes.append(shape)
-                        test_bin_states.append(bin_state)
-                        test_rotations.append(rot)
-                        ctx_to_tests[ctx_idx].append(n_tests)
-                        n_tests += 1
+                    for rot in range(part_data.nrot):
+                        shape = part_data.shapes[rot]
+                        if shape[0] > H or shape[1] > W:
+                            continue
+                        vacancy_candidates.append((bin_state, part_data, rot))
+                        candidate_meta.append((ctx_idx, bin_idx, bin_state, rot, mach_part_data, shape, part_data))
+
+            vacancy_ok = self._check_vacancy_gpu(vacancy_candidates) if vacancy_candidates else []
+
+            for k, ok in enumerate(vacancy_ok):
+                if not ok:
+                    continue
+                ctx_idx, bin_idx, bin_state, rot, mach_part_data, shape, part_data = candidate_meta[k]
+                test_grid_indices.append(bin_state.grid_state_idx)
+                test_part_ffts.append(mach_part_data.ffts[rot])
+                test_heights.append(shape[0])
+                test_widths.append(shape[1])
+                test_bin_indices.append(bin_idx)
+                test_shapes.append(shape)
+                test_bin_states.append(bin_state)
+                test_rotations.append(rot)
+                ctx_to_tests[ctx_idx].append(n_tests)
+                n_tests += 1
+        else:
+            # Original CPU path: Numba vacancy check per (bin, rotation) candidate
+            for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
+                for bin_idx, bin_state in enumerate(ctx.open_bins):
+                    # Area check
+                    if bin_state.area + part_data.area > ctx.bin_area:
+                        continue
+
+                    # Vacancy check for each rotation
+                    for rot in range(part_data.nrot):
+                        shape = part_data.shapes[rot]
+                        if shape[0] > H or shape[1] > W:
+                            continue
+                        dens = part_data.densities[rot]
+                        if check_vacancy_fit_simple(bin_state.vacancy_vector, dens):
+                            test_grid_indices.append(bin_state.grid_state_idx)
+                            test_part_ffts.append(mach_part_data.ffts[rot])
+                            test_heights.append(shape[0])
+                            test_widths.append(shape[1])
+                            test_bin_indices.append(bin_idx)
+                            test_shapes.append(shape)
+                            test_bin_states.append(bin_state)
+                            test_rotations.append(rot)
+                            ctx_to_tests[ctx_idx].append(n_tests)
+                            n_tests += 1
         
         # Phase 4: Batch FFT collision check for ALL tests at once
         if n_tests:
@@ -338,6 +408,63 @@ class WaveBatchEvaluator:
             self._start_new_bin(ctx, part_data, mach_part_data, mach_data, grid_states)
             ctx.current_part_idx += 1
     
+    def _update_vacancy_gpu(self, grid_states, H, W):
+        """
+        IMP-3: Batch-recompute vacancy_gpu for all dirty bins from grid_states.
+        Called once per wave (before Phase 3) instead of once per placement.
+        """
+        dirty_list = list(self._dirty_bins)
+        grid_idx_t = torch.tensor(dirty_list, device=self.device, dtype=torch.long)
+        with torch.inference_mode():
+            batch_grids = grid_states[grid_idx_t]          # (N, H, W)
+            rows = batch_grids.reshape(-1, W)               # (N*H, W)
+            vacancy_rows = _jit_max_consecutive_zeros(rows) # (N*H,)
+            self._vacancy_gpu[grid_idx_t] = vacancy_rows.reshape(-1, H)
+        self._dirty_bins.clear()
+
+    def _check_vacancy_gpu(self, candidates):
+        """
+        IMP-3: Batch GPU vacancy check for all (bin_state, part_data, rot) candidates.
+        Groups by density length and uses torch.unfold for vectorized window check.
+        Returns list of bools in the same order as candidates.
+        """
+        if not candidates:
+            return []
+
+        results = [False] * len(candidates)
+        H = self._vacancy_gpu.shape[1]
+
+        # Group by density length (part height for this rotation)
+        groups = defaultdict(list)  # density_len -> [(original_idx, bin_state, part_data, rot)]
+        for i, (bin_state, part_data, rot) in enumerate(candidates):
+            h = part_data.shapes[rot][0]
+            groups[h].append((i, bin_state, part_data, rot))
+
+        for h, group in groups.items():
+            if h > H:
+                continue  # Part taller than bin — never fits (already filtered, but safe)
+
+            n = len(group)
+            grid_state_indices = torch.tensor(
+                [x[1].grid_state_idx for x in group],
+                device=self.device, dtype=torch.long
+            )
+            # Stack density arrays: (n, h)
+            density_tensors = torch.stack(
+                [x[2].densities_gpu[x[3]] for x in group], dim=0
+            )
+            # Vacancy rows for these bins: (n, H)
+            vac = self._vacancy_gpu[grid_state_indices]
+            # Sliding windows of size h: (n, H-h+1, h)
+            windows = vac.unfold(1, h, 1)
+            # Check if any window satisfies vacancy >= density for all rows
+            fits = (windows >= density_tensors.unsqueeze(1)).all(dim=2).any(dim=1)  # (n,)
+            fits_list = fits.cpu().tolist()
+            for k, (orig_idx, _, _, _) in enumerate(group):
+                results[orig_idx] = bool(fits_list[k])
+
+        return results
+
     def _batch_fft_all_tests(self, n_tests, test_grid_indices, test_part_ffts,
                               test_heights, test_widths,
                               grid_ffts, H, W, row_idx, col_idx, neg_inf):
@@ -424,15 +551,18 @@ class WaveBatchEvaluator:
         y_start = y - shape[0] + 1
         y_end = y + 1
 
-        bin_state.grid[y_start:y_end, x:x+shape[1]] += part_matrix
-
         if part_gpu_tensor is None:
             part_gpu_tensor = torch.as_tensor(part_matrix, dtype=torch.float32, device=self.device)
         grid_states[bin_state.grid_state_idx, y_start:y_end, x:x+shape[1]] += part_gpu_tensor
         bin_state.grid_fft_valid = False
-        
-        update_vacancy_vector_rows(bin_state.vacancy_vector, bin_state.grid[y_start:y_end, :], y_start)
-        
+
+        if self.use_gpu_vacancy:
+            # IMP-3: mark bin dirty for batch vacancy recompute; skip CPU grid + Numba
+            self._dirty_bins.add(bin_state.grid_state_idx)
+        else:
+            bin_state.grid[y_start:y_end, x:x+shape[1]] += part_matrix
+            update_vacancy_vector_rows(bin_state.vacancy_vector, bin_state.grid[y_start:y_end, :], y_start)
+
         bin_state.area += area
         bin_state.min_occupied_row = min(bin_state.min_occupied_row, y_start)
         bin_state.max_occupied_row = max(bin_state.max_occupied_row, y)
@@ -457,7 +587,11 @@ class WaveBatchEvaluator:
         )
         
         grid_states[grid_idx].zero_()
-        
+
+        # IMP-3: initialize vacancy_gpu for this new bin (fully free = bin_width)
+        if self.use_gpu_vacancy:
+            self._vacancy_gpu[grid_idx, :] = new_bin.bin_width
+
         best_rot = part_data.best_rotation
         shape = part_data.shapes[best_rot]
         self._place_part_in_bin(new_bin, 0, ctx.bin_length - 1, part_data.rotations_uint8[best_rot],

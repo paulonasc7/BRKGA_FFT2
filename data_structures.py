@@ -25,6 +25,7 @@ class PartData:
     best_rotation: int               # Index of rotation with minimum height
     rotations_gpu: Optional[List[Any]] = None    # Pre-transferred GPU tensors (avoids CPU->GPU per insert)
     rotations_uint8: Optional[List[np.ndarray]] = None  # Pre-cast uint8 versions (avoids astype per insert)
+    densities_gpu: Optional[List[Any]] = None    # Pre-transferred GPU long tensors for IMP-3 vacancy check
     
     # Pre-prepared data for batched Numba JIT vacancy check (computed once at part creation)
     densities_flat: Optional[np.ndarray] = None  # All densities concatenated

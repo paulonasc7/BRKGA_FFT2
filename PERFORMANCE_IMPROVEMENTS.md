@@ -198,6 +198,35 @@ The CPU grid exists solely to support:
 
 **Option B:** Saves the numpy grid write overhead (~0.2s) while keeping the Numba path for vacancy computation. Simpler to implement.
 
+### Implementation result
+
+**Status: IMPLEMENTED** behind `use_gpu_vacancy` toggle (argv[9] = '1'). Default is `False` (original behavior).
+
+**Approach used:** Option A — GPU vacancy tensor `vacancy_gpu` of shape `(max_total_bins, H)`, batch-updated once per wave using a JIT-compiled max-consecutive-zeros scan. Phase 3 vacancy check replaced by `_check_vacancy_gpu` using `torch.unfold` sliding window comparison.
+
+**Measured result (10 generations, 50 parts, 2 machines):**
+
+| Mode | Time/gen (mean) |
+|------|-----------------|
+| `use_gpu_vacancy=False` (baseline) | **5.7s** |
+| `use_gpu_vacancy=True` (GPU path) | **6.4s** (+0.7s) |
+
+**Result: regression.** The GPU vacancy approach is ~12% slower than baseline.
+
+**Root cause:** The current code achieves implicit CPU-GPU overlap in Phase 3:
+- Phase 2 launches GPU FFT batch asynchronously (non-blocking)
+- Phase 3 runs Numba vacancy check on CPU while GPU executes Phase 2 in the background
+- Phase 4 starts the IFFT batch — by which time both CPU (Phase 3) and GPU (Phase 2) are done
+
+The GPU vacancy check breaks this overlap:
+- `_update_vacancy_gpu` forces a CUDA sync (GPU must finish Phase 2 before vacancy update starts)
+- `_check_vacancy_gpu` forces another CUDA sync via `.cpu().tolist()` before Phase 4 can begin
+- The JIT function (`_jit_max_consecutive_zeros`) launches W=300 sequential GPU kernels per vacancy update, each with overhead
+
+Net effect: what was parallel (CPU Numba + GPU FFT) becomes serial (GPU FFT → GPU vacancy update → CPU collect → GPU vacancy check → CPU collect → GPU IFFT).
+
+**Recommendation:** Use `use_gpu_vacancy=False` (default). The GPU vacancy toggle is available for experimentation but currently degrades performance. A potential future improvement would be to fuse the vacancy update with the grid FFT computation (Phase 2) to eliminate the extra sync points.
+
 ---
 
 ## IMP-4: Replace list-of-dicts with parallel arrays in `_process_wave_true_batch`
@@ -631,7 +660,7 @@ Saving is smaller than estimated. The `torch.tensor` stall time in the profiler 
 |---|-------------|-------------|---------------|--------|--------|
 | IMP-1 | Use pre-computed GPU tensors in `_place_part_in_bin` | ~1.5s (16%) | **−1.0s (−13%)** | DONE | Low |
 | IMP-2 | Cache `torch.arange` / scalar tensors | ~0.2–0.3s (3%) | **~0s (noise)** | DONE | Low |
-| IMP-3 | Eliminate dual numpy/GPU grid | ~0.6s (7%) | — | Pending | High |
+| IMP-3 | Eliminate dual numpy/GPU grid (GPU vacancy) | ~0.6s (7%) | **+0.7s (REGRESSION)** | IMPLEMENTED (toggle) | High |
 | IMP-4 | Parallel arrays instead of list-of-dicts | ~0.3–0.5s (4%) | **−0.09s** | DONE | Medium |
 | IMP-6 | Increase CHUNK_SIZE | ~0.3–0.5s (4%) | **−0.04s** | DONE | Low |
 | IMP-5 | Remove redundant `.astype(np.int32)` | ~0.1s (1%) | **−0.05s** | DONE | Low |
