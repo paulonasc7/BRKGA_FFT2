@@ -22,8 +22,7 @@ torch.set_grad_enabled(False)  # Disable gradient computation globally
 class BRKGA():
     def __init__(self, problem_data, nbParts, nbMachines, thresholds, instanceParts, initialSol,
                  collision_backend, eval_mode="auto", eval_workers=4, eval_chunksize=1,
-                 num_generations = 200, num_individuals=100, num_elites = 12, num_mutants = 18, eliteCProb = 0.7,
-                 use_gpu_vacancy=False):
+                 num_generations = 200, num_individuals=100, num_elites = 12, num_mutants = 18, eliteCProb = 0.7):
 
         # Input
         self.problem_data = problem_data  # ProblemData dataclass with parts and machines
@@ -75,8 +74,7 @@ class BRKGA():
             # Initialize wave batch evaluator for GPU batching
             self._wave_evaluator = WaveBatchEvaluator(
                 problem_data, nbParts, nbMachines, thresholds,
-                instanceParts, collision_backend,
-                use_gpu_vacancy=use_gpu_vacancy
+                instanceParts, collision_backend
             )
         elif self.eval_mode == "thread" and self.eval_workers > 1:
             max_workers = self.eval_workers if self.eval_workers > 0 else min(32, (os.cpu_count() or 4))
@@ -274,7 +272,6 @@ if __name__ == "__main__":
     eval_workers = int(sys.argv[6]) if len(sys.argv) > 6 else 4
     eval_chunksize = int(sys.argv[7]) if len(sys.argv) > 7 else 1
     num_generations = int(sys.argv[8]) if len(sys.argv) > 8 else 30
-    use_gpu_vacancy = (sys.argv[9] == '1') if len(sys.argv) > 9 else False
     collision_backend = create_collision_backend(backend_name)
 
     '''DEFINE DATA'''
@@ -352,11 +349,6 @@ if __name__ == "__main__":
         # Pre-cast uint8 versions (avoids .astype(np.uint8) on every grid insert)
         rotations_uint8 = [r.astype(np.uint8) for r in rotations]
 
-        # Pre-compute GPU density tensors for IMP-3 GPU vacancy check (use_gpu_vacancy=True only)
-        densities_gpu = None
-        if use_gpu_vacancy:
-            densities_gpu = [torch.tensor(d, dtype=torch.long, device='cuda') for d in densities]
-
         part_data = PartData(
             id=part,
             area=area[part],
@@ -366,8 +358,7 @@ if __name__ == "__main__":
             densities=densities,
             best_rotation=best_rotation,
             rotations_gpu=rotations_gpu,
-            rotations_uint8=rotations_uint8,
-            densities_gpu=densities_gpu
+            rotations_uint8=rotations_uint8
         )
         # Pre-compute JIT-optimized data structures for batched vacancy check
         part_data.prepare_jit_data()
@@ -603,8 +594,7 @@ if __name__ == "__main__":
             model = BRKGA(problem_data, nbParts, nbMachines, thresholds, instanceParts, array,
                   collision_backend=collision_backend,
                   eval_mode=eval_mode, eval_workers=eval_workers, eval_chunksize=eval_chunksize,
-                  num_generations=num_generations, num_individuals=mult*nbParts, num_elites = math.ceil(mult*nbParts*0.1), num_mutants = math.ceil(mult*nbParts*0.15), eliteCProb = 0.70,
-                  use_gpu_vacancy=use_gpu_vacancy)
+                  num_generations=num_generations, num_individuals=mult*nbParts, num_elites = math.ceil(mult*nbParts*0.1), num_mutants = math.ceil(mult*nbParts*0.15), eliteCProb = 0.70)
             model.fit(verbose = True)
 
             # Convert dictionary to DataFrame
