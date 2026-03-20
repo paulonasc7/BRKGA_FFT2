@@ -20,7 +20,7 @@ The Paperspace Gradient notebook exposes a **Jupyter server** with a REST API an
 
 | Item | Value |
 |------|-------|
-| Paperspace URL | `https://nmmi4k4b83.clg07azjl.paperspacegradient.com` |
+| Paperspace URL | `https://n066qklbsx.clg07azjl.paperspacegradient.com` |
 | Token location | Hardcoded in `remote.py` (env var `PAPERSPACE_TOKEN` overrides) |
 | Remote project path | `/notebooks/BRKGA_FFT2/` |
 | Remote working dir | `/notebooks/BRKGA_FFT2/` (use `--cwd` flag) |

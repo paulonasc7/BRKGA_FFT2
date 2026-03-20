@@ -566,6 +566,65 @@ The cache adds overhead per evaluation:
 
 ---
 
+## IMP-11: Pre-build integer index tensors before the chunk loop
+
+**File:** `wave_batch_evaluator.py`, `_batch_fft_all_tests`
+
+### Issue
+
+Inside the chunk loop (one iteration per chunk of 750 tests), three Python-list → GPU-tensor conversions happen on every iteration:
+
+```python
+grid_indices = torch.tensor(test_grid_indices[chunk_start:chunk_end],
+                            device=self.device, dtype=torch.long)   # per chunk
+part_heights = torch.tensor(test_heights[chunk_start:chunk_end], device=self.device)  # per chunk
+part_widths  = torch.tensor(test_widths[chunk_start:chunk_end],  device=self.device)  # per chunk
+```
+
+Each `torch.tensor(..., device='cuda')` call transfers data from a Python list to GPU memory and can trigger a CUDA sync point. With ~275 chunk iterations per 4-eval profiling window (~69/eval), this produces ~206 unnecessary CUDA interactions per batch evaluation. The profiler attributed ~11.9s cumulative to `torch.tensor` calls (3841 calls total), largely as GPU stall time while the GPU was finishing the previous `ifft2`.
+
+### Change
+
+Build all three integer arrays as GPU tensors **once** before the chunk loop, then slice (slicing a GPU tensor is a free zero-copy view):
+
+```python
+# Once before the loop — 3 CUDA transfers total
+with torch.inference_mode():
+    all_grid_indices = torch.tensor(test_grid_indices, device=self.device, dtype=torch.long)
+    all_heights      = torch.tensor(test_heights,      device=self.device, dtype=torch.long)
+    all_widths       = torch.tensor(test_widths,       device=self.device, dtype=torch.long)
+
+for chunk_start in range(0, n_tests, CHUNK_SIZE):
+    ...
+    grid_indices = all_grid_indices[chunk_start:chunk_end]  # free view
+    part_heights = all_heights[chunk_start:chunk_end]       # free view
+    part_widths  = all_widths[chunk_start:chunk_end]        # free view
+```
+
+`test_part_ffts` is still stacked per-chunk (`torch.stack`) to keep VRAM usage bounded — pre-stacking all part FFTs at once would require O(n_tests × H × W) complex64 memory (potentially 1–2 GB per wave), risking OOM.
+
+### Expected impact
+
+Estimated ~0.3–1.0s savings by eliminating CUDA sync points. The profiler's 11.9s attribution to `torch.tensor` was mostly GPU stall time, so the actual saving depends on how much of that stall was driven by these specific calls vs. the remaining `torch.stack` and `ifft2` operations.
+
+### Implementation result
+
+**Status: IMPLEMENTED** — `wave_batch_evaluator.py`, `_batch_fft_all_tests`
+
+Correctness verified: initial solution makespan and all per-generation best fitness values identical to pre-IMP-11 baseline (246042.18342432 throughout, P50M2-0 instance).
+
+Measured result (500-solution batch, 10-run × 3-gen = 30 samples):
+
+| | Mean | Std |
+|--|------|-----|
+| Before IMP-11 (after IMP-8) | 5.86s | ±0.09s |
+| After IMP-11 | **5.74s** | ±0.09s |
+| **Saving** | **−0.12s** | |
+
+Saving is smaller than estimated. The `torch.tensor` stall time in the profiler was driven primarily by the GPU being busy with `ifft2` and `torch.stack`, not by the integer tensor creation itself. Eliminating the per-chunk integer transfers removed sync points but the `torch.stack` call per chunk still acts as a sync barrier. The saving is genuine but the profiler attribution overstated the opportunity.
+
+---
+
 ## Summary: Prioritized by Impact
 
 | # | Improvement | Est. Savings | Actual Saving | Status | Effort |
@@ -580,6 +639,7 @@ The cache adds overhead per evaluation:
 | IMP-7 | Single `torch.max` instead of `argmax`+`max` | ~0.05–0.1s | **−0.17s** | DONE | Low |
 | IMP-9 | Use Numba JIT in `binClassInitialSol.py` | N/A (init only) | N/A (init only) | DONE | Low |
 | IMP-10 | Remove useless fitness cache | ~0.05s/gen | ~0s (early-return bypass already eliminated the per-gen overhead) | DONE | Low |
+| IMP-11 | Pre-build integer index tensors before chunk loop | ~0.3–1.0s | **−0.12s** | DONE | Low |
 
 ### Measured progress
 
@@ -592,4 +652,5 @@ The cache adds overhead per evaluation:
 | After + IMP-5 | 6.12s | ±0.09s |
 | After + IMP-6 | 6.08s | ±0.12s |
 | After + IMP-7 | 5.91s | ±0.04s |
-| After + IMP-8 | **5.86s** | ±0.09s |
+| After + IMP-8 | 5.86s | ±0.09s |
+| After + IMP-11 | **5.74s** | ±0.09s |

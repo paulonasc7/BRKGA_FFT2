@@ -360,14 +360,25 @@ class WaveBatchEvaluator:
         CHUNK_SIZE = 750
         all_results = [None] * n_tests
 
+        # IMP-11: Pre-build integer index tensors ONCE on GPU before the chunk loop.
+        # Per-chunk slicing of a GPU tensor is a zero-cost view — no allocation, no
+        # CUDA sync. Eliminates 3 torch.tensor() CUDA sync points per chunk.
+        # Part FFTs are still stacked per-chunk to keep VRAM usage bounded.
+        with torch.inference_mode():
+            all_grid_indices = torch.tensor(test_grid_indices, device=self.device, dtype=torch.long)
+            all_heights      = torch.tensor(test_heights,      device=self.device, dtype=torch.long)
+            all_widths       = torch.tensor(test_widths,       device=self.device, dtype=torch.long)
+
         for chunk_start in range(0, n_tests, CHUNK_SIZE):
             chunk_end = min(chunk_start + CHUNK_SIZE, n_tests)
             chunk_n = chunk_end - chunk_start
 
             with torch.inference_mode():
-                # Gather grid FFTs and part FFTs — direct list slices, no comprehensions
-                grid_indices = torch.tensor(test_grid_indices[chunk_start:chunk_end],
-                                            device=self.device, dtype=torch.long)
+                # Free views into pre-built GPU tensors — no allocation, no CUDA sync
+                grid_indices    = all_grid_indices[chunk_start:chunk_end]
+                part_heights    = all_heights[chunk_start:chunk_end]
+                part_widths     = all_widths[chunk_start:chunk_end]
+
                 batch_grid_ffts = grid_ffts[grid_indices]  # (chunk_n, H, W)
                 batch_part_ffts = torch.stack(test_part_ffts[chunk_start:chunk_end], dim=0)
 
@@ -377,9 +388,6 @@ class WaveBatchEvaluator:
 
                 # Find valid positions
                 zero_mask = (rounded_batch == 0)
-
-                part_heights = torch.tensor(test_heights[chunk_start:chunk_end], device=self.device)
-                part_widths  = torch.tensor(test_widths[chunk_start:chunk_end],  device=self.device)
 
                 valid_row = row_idx >= (part_heights - 1).view(-1, 1, 1)
                 valid_col = col_idx >= (part_widths - 1).view(-1, 1, 1)
