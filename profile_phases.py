@@ -157,7 +157,8 @@ class TimedEvaluator(WaveBatchEvaluator):
         test_heights, test_widths = [], []
         test_bin_indices, test_shapes = [], []
         test_bin_states, test_rotations = [], []
-        ctx_to_tests = {i: [] for i in range(len(context_info))}
+        test_ctx_indices, test_enclosure_lengths = [], []
+        test_bin_areas, test_part_areas = [], []
         n_tests = 0
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             for bin_idx, bin_state in enumerate(ctx.open_bins):
@@ -173,55 +174,45 @@ class TimedEvaluator(WaveBatchEvaluator):
                         test_heights.append(shape[0]); test_widths.append(shape[1])
                         test_bin_indices.append(bin_idx); test_shapes.append(shape)
                         test_bin_states.append(bin_state); test_rotations.append(rot)
-                        ctx_to_tests[ctx_idx].append(n_tests); n_tests += 1
+                        test_ctx_indices.append(ctx_idx)
+                        test_enclosure_lengths.append(bin_state.enclosure_box_length)
+                        test_bin_areas.append(bin_state.area)
+                        test_part_areas.append(part_data.area)
+                        n_tests += 1
         self._n_tests += n_tests
         self._pt[3] += self._s() - t
 
         # ── Phase 4 ──────────────────────────────────────────────────────────
         t = self._s()
-        placement_results = self._batch_fft_all_tests(
+        placement_results, all_scores = self._batch_fft_all_tests(
             n_tests, test_grid_indices, test_part_ffts, test_heights, test_widths,
-            grid_ffts, H, W, row_idx, col_idx, neg_inf) if n_tests else []
+            test_bin_indices, test_enclosure_lengths, test_bin_areas, test_part_areas,
+            grid_ffts, H, W, row_idx, col_idx, neg_inf) if n_tests else ([], np.array([], dtype=np.float32))
         self._pt[4] += self._s() - t
 
         # ── Phase 5 ──────────────────────────────────────────────────────────
         t = self._s()
+        n_contexts = len(context_info)
+        best_ti_per_ctx = [-1] * n_contexts
+        best_sc_per_ctx = np.full(n_contexts, -np.inf, dtype=np.float32)
+        for ti, ctx_idx in enumerate(test_ctx_indices):
+            sc = all_scores[ti]
+            if sc > best_sc_per_ctx[ctx_idx]:
+                best_sc_per_ctx[ctx_idx] = sc
+                best_ti_per_ctx[ctx_idx] = ti
         contexts_needing_new_bin = []
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
-            tidxs = ctx_to_tests[ctx_idx]
-            if not tidxs:
+            ti = best_ti_per_ctx[ctx_idx]
+            if ti == -1 or placement_results[ti] is None:
                 contexts_needing_new_bin.append((ctx, part_data, mach_part_data)); continue
-            best_result = None
-            best_bin_idx = float('inf'); best_density = 0
-            best_row = -1; best_col = float('inf')
-            for ti in tidxs:
-                res = placement_results[ti]
-                if res is None: continue
-                col, row    = res
-                bin_idx     = test_bin_indices[ti]
-                shape       = test_shapes[ti]
-                bin_state   = test_bin_states[ti]
-                y_start     = row - shape[0] + 1
-                new_length  = max(bin_state.enclosure_box_length, H - y_start)
-                density     = (bin_state.area + part_data.area) / (new_length * W)
-                if bin_idx < best_bin_idx: better = True
-                elif bin_idx == best_bin_idx:
-                    better = (density > best_density or
-                              (density == best_density and row > best_row) or
-                              (density == best_density and row == best_row and col < best_col))
-                else: better = False
-                if better:
-                    best_bin_idx=bin_idx; best_density=density
-                    best_row=row; best_col=col
-                    best_result=(bin_state,col,row,test_rotations[ti],shape,part_data,mach_part_data)
-            if best_result:
-                bs,x,y,rot,shape,pd_,mpd = best_result
-                self._place_part_in_bin(bs,x,y,pd_.rotations_uint8[rot],
-                                        shape,pd_.area,mpd,grid_states,
-                                        part_gpu_tensor=pd_.rotations_gpu[rot])
-                ctx.current_part_idx += 1
-            else:
-                contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
+            col, row  = placement_results[ti]
+            bin_state = test_bin_states[ti]
+            rot       = test_rotations[ti]
+            shape     = test_shapes[ti]
+            self._place_part_in_bin(bin_state, col, row, part_data.rotations_uint8[rot],
+                                    shape, part_data.area, mach_part_data, grid_states,
+                                    part_gpu_tensor=part_data.rotations_gpu[rot])
+            ctx.current_part_idx += 1
         self._pt[5] += self._s() - t
 
         # ── Phase 6 ──────────────────────────────────────────────────────────

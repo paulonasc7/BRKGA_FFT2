@@ -223,15 +223,18 @@ class WaveBatchEvaluator:
         # Phase 3: Collect ALL (context, bin, rotation) tests to batch
         # Parallel arrays replace list-of-dicts to avoid per-entry dict allocation and
         # string-keyed lookups in the hot path of _batch_fft_all_tests.
-        test_grid_indices = []   # bin_state.grid_state_idx  (for GPU gather)
-        test_part_ffts    = []   # mach_part_data.ffts[rot]  (for torch.stack)
-        test_heights      = []   # shape[0]                  (for valid-position mask)
-        test_widths       = []   # shape[1]                  (for valid-position mask)
-        test_bin_indices  = []   # bin_idx                   (for Phase-5 tie-breaking)
-        test_shapes       = []   # shape tuple               (for Phase-5 y_start)
-        test_bin_states   = []   # BinState object           (for Phase-5 placement)
-        test_rotations    = []   # rot                       (for Phase-5 placement)
-        ctx_to_tests = {i: [] for i in range(len(context_info))}
+        test_grid_indices      = []   # bin_state.grid_state_idx       (for GPU gather)
+        test_part_ffts         = []   # mach_part_data.ffts[rot]       (for torch.stack)
+        test_heights           = []   # shape[0]                       (for valid-position mask)
+        test_widths            = []   # shape[1]                       (for valid-position mask)
+        test_bin_indices       = []   # bin_idx                        (for GPU score)
+        test_shapes            = []   # shape tuple                    (for Phase-5 placement)
+        test_bin_states        = []   # BinState object                (for Phase-5 placement)
+        test_rotations         = []   # rot                            (for Phase-5 placement)
+        test_ctx_indices       = []   # ctx_idx                        (for per-context argmax)
+        test_enclosure_lengths = []   # bin_state.enclosure_box_length (for GPU density)
+        test_bin_areas         = []   # bin_state.area                 (for GPU density)
+        test_part_areas        = []   # part_data.area                 (for GPU density)
         n_tests = 0
 
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
@@ -255,83 +258,51 @@ class WaveBatchEvaluator:
                         test_shapes.append(shape)
                         test_bin_states.append(bin_state)
                         test_rotations.append(rot)
-                        ctx_to_tests[ctx_idx].append(n_tests)
+                        test_ctx_indices.append(ctx_idx)
+                        test_enclosure_lengths.append(bin_state.enclosure_box_length)
+                        test_bin_areas.append(bin_state.area)
+                        test_part_areas.append(part_data.area)
                         n_tests += 1
         
         # Phase 4: Batch FFT collision check for ALL tests at once
         if n_tests:
-            placement_results = self._batch_fft_all_tests(
+            placement_results, all_scores = self._batch_fft_all_tests(
                 n_tests, test_grid_indices, test_part_ffts, test_heights, test_widths,
+                test_bin_indices, test_enclosure_lengths, test_bin_areas, test_part_areas,
                 grid_ffts, H, W, row_idx, col_idx, neg_inf)
         else:
-            placement_results = []
+            placement_results, all_scores = [], np.array([], dtype=np.float32)
         
-        # Phase 5: Process results - find best placement per context
+        # Phase 5: Find best placement per context using GPU-computed scores.
+        # Scores encode the full tie-breaking hierarchy (bin_idx > density > row > col)
+        # so a single linear scan replaces the nested Python comparison loop.
+        n_contexts = len(context_info)
+        best_ti_per_ctx = [-1] * n_contexts          # winning test index per context
+        best_sc_per_ctx = np.full(n_contexts, -np.inf, dtype=np.float32)
+
+        for ti, ctx_idx in enumerate(test_ctx_indices):
+            sc = all_scores[ti]
+            if sc > best_sc_per_ctx[ctx_idx]:
+                best_sc_per_ctx[ctx_idx] = sc
+                best_ti_per_ctx[ctx_idx] = ti
+
         contexts_needing_new_bin = []
-        
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
-            test_indices = ctx_to_tests[ctx_idx]
-            
-            if not test_indices:
-                # No feasible tests - need new bin
+            ti = best_ti_per_ctx[ctx_idx]
+
+            if ti == -1 or placement_results[ti] is None:
                 contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
                 continue
-            
-            # Find best placement following first-fit + tie-breaking rules
-            best_result = None
-            best_bin_idx = float('inf')  # First-fit: prefer lower bin index
-            best_density = 0
-            best_row = -1
-            best_col = float('inf')
-            
-            for test_idx in test_indices:
-                result = placement_results[test_idx]
 
-                if result is None:
-                    continue
+            col, row  = placement_results[ti]
+            bin_state = test_bin_states[ti]
+            rot       = test_rotations[ti]
+            shape     = test_shapes[ti]
 
-                col, row = result
-                bin_idx  = test_bin_indices[test_idx]
-                shape    = test_shapes[test_idx]
-                bin_state = test_bin_states[test_idx]
-
-                y_start = row - shape[0] + 1
-                new_length = max(bin_state.enclosure_box_length, H - y_start)
-                potential_area = bin_state.area + part_data.area
-                density = potential_area / (new_length * W)
-
-                # First-fit: always prefer lower bin index
-                if bin_idx < best_bin_idx:
-                    better = True
-                elif bin_idx == best_bin_idx:
-                    # Same bin: use density > row > col tie-breaking
-                    if density > best_density:
-                        better = True
-                    elif density == best_density and row > best_row:
-                        better = True
-                    elif density == best_density and row == best_row and col < best_col:
-                        better = True
-                    else:
-                        better = False
-                else:
-                    better = False
-
-                if better:
-                    best_bin_idx = bin_idx
-                    best_density = density
-                    best_row = row
-                    best_col = col
-                    best_result = (bin_state, col, row, test_rotations[test_idx], shape,
-                                   part_data, mach_part_data)
-            
-            if best_result is not None:
-                bin_state, x, y, rot, shape, pd, mpd = best_result
-                self._place_part_in_bin(bin_state, x, y, pd.rotations_uint8[rot],
-                                        shape, pd.area, mpd, grid_states,
-                                        part_gpu_tensor=pd.rotations_gpu[rot])
-                ctx.current_part_idx += 1
-            else:
-                contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
+            self._place_part_in_bin(bin_state, col, row, part_data.rotations_uint8[rot],
+                                    shape, part_data.area, mach_part_data, grid_states,
+                                    part_gpu_tensor=part_data.rotations_gpu[rot])
+            ctx.current_part_idx += 1
         
         # Phase 6: Handle new bins
         for ctx, part_data, mach_part_data in contexts_needing_new_bin:
@@ -340,30 +311,34 @@ class WaveBatchEvaluator:
     
     def _batch_fft_all_tests(self, n_tests, test_grid_indices, test_part_ffts,
                               test_heights, test_widths,
+                              test_bin_indices, test_enclosure_lengths,
+                              test_bin_areas, test_part_areas,
                               grid_ffts, H, W, row_idx, col_idx, neg_inf):
         """
         Perform batched IFFT for ALL tests across ALL contexts.
         Chunks to avoid OOM with large batches.
 
-        Accepts parallel arrays instead of list-of-dicts to avoid per-entry dict
-        allocation and string-keyed attribute lookups in this hot path.
-        row_idx, col_idx, neg_inf are pre-allocated GPU tensors (cached per machine).
-
-        Returns list of results: (col, row) or None for each test.
+        Computes a composite placement score on the GPU encoding the full
+        tie-breaking hierarchy: bin_idx > density > row > col.
+        Returns (all_results, all_scores) so Phase 5 only needs a linear scan.
         """
         if n_tests == 0:
-            return []
+            return [], np.array([], dtype=np.float32)
 
         # Chunk to avoid OOM - empirically tuned for RTX A4000 (16GB)
         # Benchmarked: 250=6.05s, 500=5.90s, 750=5.88s (best), 1000=5.89s, 1500=5.88s, 2000+=OOM risk
         # 750-1500 all within noise; 750 chosen as sweet spot with safe VRAM headroom
         CHUNK_SIZE = 750
         all_results = [None] * n_tests
+        all_scores  = np.full(n_tests, -1e18, dtype=np.float32)
+        rows_np  = np.zeros(n_tests, dtype=np.float32)
+        cols_np  = np.zeros(n_tests, dtype=np.float32)
+        valid_np = np.zeros(n_tests, dtype=bool)
 
-        # IMP-11: Pre-build integer index tensors ONCE on GPU before the chunk loop.
-        # Per-chunk slicing of a GPU tensor is a zero-cost view — no allocation, no
-        # CUDA sync. Eliminates 3 torch.tensor() CUDA sync points per chunk.
-        # Part FFTs are still stacked per-chunk to keep VRAM usage bounded.
+        # Pre-build GPU index tensors once; per-chunk slices are zero-cost views.
+        # Score data (bin_indices, enclosure_lengths, bin_areas, part_areas) stays on CPU
+        # — numpy vectorized ops on ~2000 elements are sub-millisecond and avoid the
+        # ~13 extra CUDA kernel launches per chunk that GPU scoring would require.
         with torch.inference_mode():
             all_grid_indices = torch.tensor(test_grid_indices, device=self.device, dtype=torch.long)
             all_heights      = torch.tensor(test_heights,      device=self.device, dtype=torch.long)
@@ -408,16 +383,38 @@ class WaveBatchEvaluator:
                 best_col = best_flat_idx % W
                 has_valid = max_scores > -1e8
                 smallest_cols = best_col - (part_widths - 1)
-                
-                # Transfer to CPU
-                results_cpu = torch.stack([has_valid.int(), smallest_cols, best_row], dim=1).cpu().numpy()
-            
-            # Store results
+
+                # Transfer (has_valid, col, row) to CPU — same as original
+                results_cpu = torch.stack([has_valid.int(), smallest_cols, best_row],
+                                          dim=1).cpu().numpy()
+
             for i in range(chunk_n):
                 if results_cpu[i, 0] == 1:
-                    all_results[chunk_start + i] = (int(results_cpu[i, 1]), int(results_cpu[i, 2]))
-        
-        return all_results
+                    c, r = int(results_cpu[i, 1]), int(results_cpu[i, 2])
+                    all_results[chunk_start + i] = (c, r)
+                    cols_np[chunk_start + i] = c
+                    rows_np[chunk_start + i] = r
+                    valid_np[chunk_start + i] = True
+
+        # Compute composite placement scores on CPU with numpy.
+        # ~2000-element vectorized ops are sub-millisecond; avoids ~13 CUDA kernel
+        # launches per chunk that would be needed to do this on the GPU.
+        # Score encodes tie-breaking hierarchy: bin_idx > density > row > col.
+        # Multipliers chosen so each level dominates the next for actual value ranges:
+        #   bin_idx 0-10, density 0-1, row 0-H (~300), col 0-W (~200).
+        enc_np = np.asarray(test_enclosure_lengths, dtype=np.float32)
+        ba_np  = np.asarray(test_bin_areas,          dtype=np.float32)
+        pa_np  = np.asarray(test_part_areas,         dtype=np.float32)
+        bi_np  = np.asarray(test_bin_indices,        dtype=np.float32)
+        ht_np  = np.asarray(test_heights,            dtype=np.float32)
+
+        y_starts  = rows_np - ht_np + 1
+        new_lens  = np.maximum(enc_np, H - y_starts)
+        densities = (ba_np + pa_np) / (new_lens * W)
+        all_scores = -bi_np * 1e9 + densities * 1e6 + rows_np * 1e3 - cols_np
+        all_scores[~valid_np] = -1e18
+
+        return all_results, all_scores
     
     def _place_part_in_bin(self, bin_state, x, y, part_matrix, shape, area, mach_part_data, grid_states,
                            part_gpu_tensor=None):
