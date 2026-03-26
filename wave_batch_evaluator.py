@@ -92,7 +92,7 @@ class WaveBatchEvaluator:
         max_bins_per_sol = 10
         max_total_bins = num_solutions * max_bins_per_sol
         grid_states = torch.zeros((max_total_bins, H, W), dtype=torch.float32, device=self.device)
-        grid_ffts = torch.zeros((max_total_bins, H, W), dtype=torch.complex64, device=self.device)
+        grid_ffts = torch.zeros((max_total_bins, H, W // 2 + 1), dtype=torch.complex64, device=self.device)
 
         # Cache index tensors once per machine (reused across all waves and chunks)
         row_idx = torch.arange(H, device=self.device).view(1, H, 1)
@@ -215,7 +215,7 @@ class WaveBatchEvaluator:
             with torch.inference_mode():
                 indices = torch.tensor(invalid_grid_indices, device=self.device)
                 batch_grids = grid_states[indices]  # (N, H, W)
-                batch_ffts = torch.fft.fft2(batch_grids)  # ONE batched FFT!
+                batch_ffts = torch.fft.rfft2(batch_grids)  # ONE batched rFFT!
                 grid_ffts[indices] = batch_ffts
                 for bs in invalid_bin_states:
                     bs.grid_fft_valid = True
@@ -379,11 +379,11 @@ class WaveBatchEvaluator:
                 part_heights    = all_heights[chunk_start:chunk_end]
                 part_widths     = all_widths[chunk_start:chunk_end]
 
-                batch_grid_ffts = grid_ffts[grid_indices]  # (chunk_n, H, W)
+                batch_grid_ffts = grid_ffts[grid_indices]  # (chunk_n, H, W//2+1)
                 batch_part_ffts = torch.stack(test_part_ffts[chunk_start:chunk_end], dim=0)
 
-                # Batched IFFT
-                overlap_batch = torch.fft.ifft2(batch_grid_ffts * batch_part_ffts).real
+                # Batched IFFT (real-valued output via irfft2)
+                overlap_batch = torch.fft.irfft2(batch_grid_ffts * batch_part_ffts, s=(H, W))
                 rounded_batch = torch.round(overlap_batch)
 
                 # Find valid positions

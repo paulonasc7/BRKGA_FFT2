@@ -80,7 +80,7 @@ class TorchCollisionBackend(BaseCollisionBackend):
             part_tensor_flipped,
             (0, bin_width - part_matrix.shape[1], 0, bin_length - part_matrix.shape[0]),
         )
-        return torch.fft.fft2(padded)
+        return torch.fft.rfft2(padded)
 
     def prepare_rotation_tensor(self, part_matrix):
         """Pre-compute GPU tensor for a rotation matrix (avoids CPU->GPU transfer per insert)."""
@@ -104,15 +104,16 @@ class TorchCollisionBackend(BaseCollisionBackend):
     def compute_grid_fft(self, grid_state):
         """Compute and return the grid FFT for caching."""
         with torch.inference_mode():
-            return torch.fft.fft2(grid_state)
+            return torch.fft.rfft2(grid_state)
 
     def find_bottom_left_zero(self, grid, part_fft, part_shape, grid_state=None, grid_fft=None):
         with torch.inference_mode():
+            H, W = grid.shape
             if grid_fft is None:
                 grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
-                grid_fft = torch.fft.fft2(grid_tensor)
-            overlap = torch.fft.ifft2(grid_fft * part_fft).real
-            cropped = torch.round(overlap[part_shape[0] - 1 : grid.shape[0], part_shape[1] - 1 : grid.shape[1]])
+                grid_fft = torch.fft.rfft2(grid_tensor)
+            overlap = torch.fft.irfft2(grid_fft * part_fft, s=(H, W))
+            cropped = torch.round(overlap[part_shape[0] - 1 : H, part_shape[1] - 1 : W])
 
             zero_mask = (cropped == 0)
             rows_with_zeros = zero_mask.any(dim=1)
@@ -139,14 +140,14 @@ class TorchCollisionBackend(BaseCollisionBackend):
 
         num_rot = len(part_ffts)
         H, W = grid.shape
-        
+
         with torch.inference_mode():
             # Use cached grid FFT if provided, otherwise compute
             if grid_fft is None:
                 grid_tensor = grid_state if grid_state is not None else torch.as_tensor(grid, dtype=torch.float32, device=self.device)
-                grid_fft = torch.fft.fft2(grid_tensor)
+                grid_fft = torch.fft.rfft2(grid_tensor)
             stacked_part_ffts = torch.stack(part_ffts, dim=0)
-            overlap_batch = torch.fft.ifft2(grid_fft.unsqueeze(0) * stacked_part_ffts).real
+            overlap_batch = torch.fft.irfft2(grid_fft.unsqueeze(0) * stacked_part_ffts, s=(H, W))
             rounded_batch = torch.round(overlap_batch)
             
             # Zero mask for all rotations at once

@@ -81,7 +81,9 @@ def setup_problem(nbParts=50, nbMachines=2, instNumber=0, backend_name="torch_gp
         if hasattr(collision_backend, 'prepare_rotation_tensor'):
             rotations_gpu = [collision_backend.prepare_rotation_tensor(rot) for rot in rotations]
         
-        parts_dict[part] = PartData(
+        rotations_uint8 = [r.astype(np.uint8) for r in rotations]
+
+        part_data = PartData(
             id=part,
             area=area[part],
             nrot=nrot,
@@ -89,8 +91,11 @@ def setup_problem(nbParts=50, nbMachines=2, instNumber=0, backend_name="torch_gp
             shapes=shapes,
             densities=densities,
             best_rotation=best_rotation,
-            rotations_gpu=rotations_gpu
+            rotations_gpu=rotations_gpu,
+            rotations_uint8=rotations_uint8
         )
+        part_data.prepare_jit_data()
+        parts_dict[part] = part_data
     
     for m in range(nbMachines):
         binLength = machSpec['L(mm)'].iloc[m]
@@ -165,7 +170,7 @@ def profile_generations(num_gens=3, backend_name="torch_gpu", mult=10):
     model = BRKGA(
         problem_data, nbParts, nbMachines, thresholds, instanceParts, initial_sol,
         collision_backend=collision_backend,
-        eval_mode="auto", eval_workers=4, eval_chunksize=1,
+        eval_mode="wave_batch", eval_workers=4, eval_chunksize=1,
         num_generations=num_gens, 
         num_individuals=num_individuals,
         num_elites=num_elites,
