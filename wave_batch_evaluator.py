@@ -19,6 +19,14 @@ from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass, field
 from numba_utils import check_vacancy_fit_simple, update_vacancy_vector_rows
 
+# Lazy-load custom CUDA kernel for batched grid updates (compiles on first use)
+try:
+    from cuda_batch_update import batch_grid_update as _cuda_batch_update
+    _HAS_CUDA_KERNEL = True
+except Exception:
+    _cuda_batch_update = None
+    _HAS_CUDA_KERNEL = False
+
 
 @dataclass
 class BinState:
@@ -69,7 +77,34 @@ class WaveBatchEvaluator:
         self.device = device
         self.machines = problem_data.machines
         self.parts = problem_data.parts
-        
+
+        # Pre-build flat GPU tensor of all part rotation matrices for the batch kernel.
+        # part_update_meta: (part_id, rot) -> (flat_offset, height, width)
+        self.flat_parts_gpu = None
+        self.part_update_meta = {}
+        if _HAS_CUDA_KERNEL and torch.cuda.is_available():
+            flat_list = []
+            offset = 0
+            ok = True
+            for part_id in problem_data.instance_parts_unique:
+                pd_ = problem_data.parts[part_id]
+                if not pd_.rotations_gpu:
+                    ok = False; break
+                for rot in range(pd_.nrot):
+                    t = pd_.rotations_gpu[rot]
+                    if t is None or not t.is_cuda:
+                        ok = False; break
+                    h, w = pd_.shapes[rot]
+                    self.part_update_meta[(part_id, rot)] = (offset, h, w)
+                    flat_list.append(t.flatten())
+                    offset += h * w
+                if not ok:
+                    break
+            if ok and flat_list:
+                self.flat_parts_gpu = torch.cat(flat_list)
+            else:
+                self.part_update_meta = {}
+
     def evaluate_batch(self, chromosomes: np.ndarray) -> List[float]:
         num_solutions = len(chromosomes)
         machine_makespans = []
@@ -286,7 +321,11 @@ class WaveBatchEvaluator:
                 best_sc_per_ctx[ctx_idx] = sc
                 best_ti_per_ctx[ctx_idx] = ti
 
+        # Collect placements; separate GPU and CPU work so the GPU kernel
+        # fires in one shot and CPU updates can overlap with its execution.
         contexts_needing_new_bin = []
+        _placements = []  # (bin_state, col, row, rot, shape, part_data, mach_part_data)
+
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             ti = best_ti_per_ctx[ctx_idx]
 
@@ -299,10 +338,43 @@ class WaveBatchEvaluator:
             rot       = test_rotations[ti]
             shape     = test_shapes[ti]
 
-            self._place_part_in_bin(bin_state, col, row, part_data.rotations_uint8[rot],
-                                    shape, part_data.area, mach_part_data, grid_states,
-                                    part_gpu_tensor=part_data.rotations_gpu[rot])
+            bin_state.grid_fft_valid = False
+            _placements.append((bin_state, col, row, rot, shape, part_data, mach_part_data))
             ctx.current_part_idx += 1
+
+        if _placements:
+            if self.flat_parts_gpu is not None:
+                # Option A: single CUDA kernel launch for all placements
+                _kernel_args = []
+                for bin_state, col, row, rot, shape, pd_, _ in _placements:
+                    y_start = row - shape[0] + 1
+                    flat_offset, ph, pw = self.part_update_meta[(pd_.id, rot)]
+                    _kernel_args.append(
+                        (bin_state.grid_state_idx, y_start, col, flat_offset, ph, pw))
+                _cuda_batch_update(grid_states, self.flat_parts_gpu, _kernel_args, H, W)
+            else:
+                # Option C fallback: tight GPU loop (no custom kernel)
+                for bin_state, col, row, rot, shape, pd_, _ in _placements:
+                    y_start = row - shape[0] + 1
+                    part_gpu = (pd_.rotations_gpu[rot]
+                                if pd_.rotations_gpu and pd_.rotations_gpu[rot] is not None
+                                else torch.as_tensor(pd_.rotations[rot],
+                                                     dtype=torch.float32, device=self.device))
+                    grid_states[bin_state.grid_state_idx, y_start:row+1,
+                                col:col+shape[1]] += part_gpu
+
+            # CPU updates — run while GPU kernel executes (async)
+            for bin_state, col, row, rot, shape, pd_, mpd in _placements:
+                y_start = row - shape[0] + 1
+                bin_state.grid[y_start:row+1, col:col+shape[1]] += pd_.rotations_uint8[rot]
+                update_vacancy_vector_rows(
+                    bin_state.vacancy_vector, bin_state.grid[y_start:row+1, :], y_start)
+                bin_state.area += pd_.area
+                bin_state.min_occupied_row = min(bin_state.min_occupied_row, y_start)
+                bin_state.max_occupied_row = max(bin_state.max_occupied_row, row)
+                bin_state.enclosure_box_length = bin_state.bin_length - bin_state.min_occupied_row
+                bin_state.proc_time += mpd.proc_time
+                bin_state.proc_time_height = max(bin_state.proc_time_height, mpd.proc_time_height)
         
         # Phase 6: Handle new bins
         for ctx, part_data, mach_part_data in contexts_needing_new_bin:

@@ -1,37 +1,38 @@
 # Phase 5 Optimization Analysis
 
-## Current state
+**Last updated:** 2026-03-26
 
-Phase 5 accounts for **27.2% of total wave time** (~6.2s across 5 generations, ~17ms/wave, ~365 waves).
+## Current state (after optimizations)
 
-It runs **after** Phase 4 has returned `placement_results` — a flat list of `(col, row)` or `None` for every (context, bin, rotation) test that was submitted to the batched IFFT.
+Phase 5 now accounts for **14.0% of total wave time** (~2.63s across 5 generations, ~7.3ms/wave, 360 waves). Down from 27.2% before optimizations.
 
-Phase 5 has two distinct sub-parts:
+Both Idea 1 (NumPy scoring) and Idea 2 (CUDA batch kernel) have been implemented. The remaining Phase 5 time is dominated by CPU updates (NumPy grid writes + Numba vacancy), not GPU launches.
 
-### 5a. Selection loop (lines 272-325 in wave_batch_evaluator.py)
+### What Phase 5 does now (post-optimization)
 
-For each of ~500 contexts per wave, iterates over its test results (typically 2-12 per context), computes density, and applies first-fit + density + bottom-left tie-breaking to select the single best placement. Pure Python arithmetic and comparisons — no GPU, no Numba.
+1. **Best-per-context selection** — Uses pre-computed `all_scores` (numpy composite scores from `_batch_fft_all_tests`) to find the best test per context via simple numpy operations. No per-test Python density loop.
+2. **GPU grid updates** — Single custom CUDA kernel launch via `cuda_batch_update.py` processes all ~450 placements per wave in parallel.
+3. **CPU grid updates** — NumPy grid writes + Numba vacancy updates (overlaps with async GPU execution).
 
-**Scale per wave:** ~500 contexts x ~4 tests/context = ~2000 iterations of the inner loop. Each iteration does a few arithmetic ops, list indexing, and comparisons. This is lightweight per-iteration, but adds up across 365 waves.
+### Original analysis (pre-optimization, for reference)
 
-### 5b. `_place_part_in_bin` (lines 422-441 in wave_batch_evaluator.py)
+Phase 5 had two distinct sub-parts:
 
-Called once per context that found a valid placement (~400-490 of the 500 contexts per wave). Each call does:
+#### 5a. Selection loop (eliminated by Idea 1)
 
-1. **CPU grid update:** `bin_state.grid[y_start:y_end, x:x+shape[1]] += part_matrix` — NumPy slice-add on a uint8 array. Small region (part-sized), fast.
-2. **GPU grid update:** `grid_states[bin_state.grid_state_idx, y_start:y_end, x:x+shape[1]] += part_gpu_tensor` — a CUDA kernel launch for a small 2D slice. **Each call is a separate CUDA kernel launch.**
-3. **Numba vacancy update:** `update_vacancy_vector_rows(vacancy_vector, grid_rows, y_start)` — JIT-compiled, scans modified rows for max consecutive zeros. Fast per call, but called ~450 times per wave.
-4. **Scalar bookkeeping:** area, min/max row, enclosure box, proc_time updates.
+For each of ~500 contexts per wave, iterated over test results (typically 2-12 per context), computed density, and applied tie-breaking. ~2000 Python iterations per wave with density arithmetic.
 
-**The critical bottleneck in 5b is the sequential CUDA kernel launches.** With ~450 placements per wave and ~365 waves, that's ~164,000 individual CUDA kernel launches for tiny slice updates. Each launch has fixed overhead (~5-10 us on A4000), so this alone accounts for ~1-2s.
+#### 5b. `_place_part_in_bin` (restructured by Idea 2)
+
+Each call was a separate CUDA kernel launch. With ~450 placements per wave and ~365 waves, that was ~164,000 individual CUDA kernel launches for tiny slice updates.
 
 ---
 
 ## Optimization ideas
 
-### Idea 1: Move the selection loop (5a) to GPU
+### Idea 1: Move scoring out of Python loop → NumPy composite scores
 
-**Status:** Recommended as first implementation.
+**Status:** IMPLEMENTED (2026-03-25). Saved ~0.30s/gen (4.53s → 4.23s).
 
 **What:** Instead of iterating over `placement_results` in Python to find the best placement per context, compute the best placement per context entirely on the GPU as part of Phase 4.
 
@@ -152,67 +153,27 @@ Savings estimate: **1-3s over 5 generations**.
 
 ---
 
-### Idea 2: Batch the GPU grid updates (5b)
+### Idea 2: Batch the GPU grid updates (5b) → Custom CUDA kernel
 
-**Status:** Recommended as second implementation.
+**Status:** IMPLEMENTED (2026-03-26). Saved ~0.43s/gen (4.23s → 3.80s). Phase 5 dropped from ~22.7% → 14.0%.
 
-**What:** Instead of calling `grid_states[idx, y:y+h, x:x+w] += tensor` ~450 times per wave (450 separate CUDA kernel launches), restructure `_place_part_in_bin` to separate GPU and CPU work, allowing better CUDA pipelining.
+**What was implemented:** Option A (custom CUDA kernel) instead of the originally-recommended Option C (tight GPU loop). A single CUDA kernel launch processes all ~450 placements per wave in parallel, using 1D thread indexing with binary search over prefix-sum offsets.
 
-**How (Option C — recommended, lowest risk):**
+**Key files:**
+- `cuda_batch_update.py` — CUDA kernel source, JIT compilation via `load_inline`, Python wrapper
+- `wave_batch_evaluator.py` — `flat_parts_gpu` pre-computation in `__init__`, two-pass Phase 5 restructuring
 
-Currently, for each context that found a placement, we call `_place_part_in_bin` which interleaves:
-1. CPU grid update
-2. GPU grid update (CUDA kernel launch)
-3. Numba vacancy update
-4. Scalar bookkeeping
+**Implementation details:**
+- All part rotation matrices pre-concatenated into `flat_parts_gpu` (single GPU tensor) at init time
+- `part_update_meta` dict maps `(part_id, rot) → (flat_offset, h, w)` for indexing
+- Falls back to sequential GPU slice updates if CUDA kernel compilation fails
+- First compilation takes 2-3 min; cached `.so` used for subsequent runs
 
-The CPU work between GPU launches forces the CUDA command queue to stall — each launch must wait for the Python interpreter to finish the CPU work before issuing the next one.
+**Bugs encountered during implementation:**
+1. GPU pointer dereference from host C++ code → segfault. Fixed by passing `total_cells` as explicit int parameter.
+2. `load_inline(name='cuda_batch_update')` overrode `sys.modules['cuda_batch_update']` → TypeError when importing Python wrapper. Fixed by using `name='_cuda_batch_update_ext'`.
 
-**Restructure into two passes:**
-
-```python
-# Pass 1: Collect all placement decisions and do ALL GPU updates back-to-back
-gpu_updates = []  # list of (grid_state_idx, y_start, y_end, x, x_end, part_gpu_tensor)
-cpu_updates = []  # list of (bin_state, y_start, y_end, x, shape, part_matrix_uint8, area, mpd)
-
-for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
-    # ... existing selection logic to find best_result ...
-    if best_result is not None:
-        bs, x, y, rot, shape, pd, mpd = best_result
-        y_start = y - shape[0] + 1
-        y_end = y + 1
-        # Queue GPU update
-        gpu_updates.append((bs.grid_state_idx, y_start, y_end, x, x + shape[1], pd.rotations_gpu[rot]))
-        # Queue CPU update
-        cpu_updates.append((bs, y_start, y_end, x, shape, pd.rotations_uint8[rot], pd.area, mpd))
-        bs.grid_fft_valid = False
-        ctx.current_part_idx += 1
-    else:
-        contexts_needing_new_bin.append(...)
-
-# Pass 2a: All GPU updates in a tight loop (CUDA can pipeline these)
-for grid_idx, y_start, y_end, x, x_end, part_gpu in gpu_updates:
-    grid_states[grid_idx, y_start:y_end, x:x_end] += part_gpu
-
-# Pass 2b: All CPU updates (NumPy grid, vacancy, bookkeeping)
-for bs, y_start, y_end, x, shape, part_uint8, area, mpd in cpu_updates:
-    bs.grid[y_start:y_end, x:x+shape[1]] += part_uint8
-    update_vacancy_vector_rows(bs.vacancy_vector, bs.grid[y_start:y_end, :], y_start)
-    bs.area += area
-    bs.min_occupied_row = min(bs.min_occupied_row, y_start)
-    bs.max_occupied_row = max(bs.max_occupied_row, y_end - 1)
-    bs.enclosure_box_length = bs.bin_length - bs.min_occupied_row
-    bs.proc_time += mpd.proc_time
-    bs.proc_time_height = max(bs.proc_time_height, mpd.proc_time_height)
-```
-
-**Why this helps:** Pass 2a issues ~450 CUDA kernel launches with no Python computation between them. The CUDA driver can queue them all up and execute them with minimal stall. Pass 2b runs on CPU and can overlap with GPU execution of the queued kernels.
-
-**Correctness note:** This is safe because within a single wave, no two contexts share a bin — each context places one part into one of *its own* bins. So the GPU grid updates are all to non-overlapping regions, and the order doesn't matter.
-
-**Expected impact:** Moderate. Savings: **0.5-1.5s over 5 generations** (rough estimate). The benefit comes from CUDA pipelining — instead of launch-wait-CPU-launch-wait-CPU, it's launch-launch-launch-...-then-CPU.
-
-**Risk:** Low. No correctness risk — just reordering operations that are already independent. The only constraint is that `grid_fft_valid` must be set to False before the next wave's Phase 2, which already happens.
+**Option C (tight GPU loop) was also implemented as fallback** — used when `flat_parts_gpu` is None.
 
 ---
 
@@ -250,10 +211,8 @@ for bs, y_start, y_end, x, shape, part_uint8, area, mpd in cpu_updates:
 
 ---
 
-## Recommended implementation order
+## Implementation status
 
-1. **Idea 1 (GPU-side selection)** — highest impact on Phase 5 Python time. Eliminates the per-context selection loop entirely.
-
-2. **Idea 2 (defer GPU updates)** — low risk, addresses CUDA launch overhead in `_place_part_in_bin`. Independent of Idea 1.
-
-3. Reassess after implementing 1 and 2. If Phase 5 is still significant, revisit Ideas 3 and 4.
+1. **Idea 1 (NumPy scoring)** — DONE. Eliminated per-test Python density loop. Saved ~0.30s/gen.
+2. **Idea 2 (CUDA batch kernel)** — DONE. Eliminated sequential CUDA launches. Saved ~0.43s/gen.
+3. **Ideas 3, 4, 5** — Deferred. Phase 5 is now 14% of total time. The dominant bottleneck is now Phase 4 (66%), so further Phase 5 optimization has diminishing returns. Future optimization effort should target Phase 4 (chunk strategy, VRAM management) or Phase 3 (vacancy checks).

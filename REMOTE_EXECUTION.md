@@ -20,7 +20,7 @@ The Paperspace Gradient notebook exposes a **Jupyter server** with a REST API an
 
 | Item | Value |
 |------|-------|
-| Paperspace URL | `https://n066qklbsx.clg07azjl.paperspacegradient.com` |
+| Paperspace URL | `https://np8noopp50.clg07azjl.paperspacegradient.com` (changes when notebook restarts) |
 | Token location | Hardcoded in `remote.py` (env var `PAPERSPACE_TOKEN` overrides) |
 | Remote project path | `/notebooks/BRKGA_FFT2/` |
 | Remote working dir | `/notebooks/BRKGA_FFT2/` (use `--cwd` flag) |
@@ -196,7 +196,9 @@ python remote.py download BRKGA_FFT2/OriginalInitialSol_P50M2-0_prob_10.xlsx res
 ## Notes & Gotchas
 
 - **`numba` may not be installed** on a fresh Paperspace session. Run `pip install numba -q` before the first experiment.
-- **Token expiry:** If the Paperspace URL/token changes, update `PAPERSPACE_URL` and `PAPERSPACE_TOKEN` in `remote.py` (or set them as environment variables).
+- **Token expiry:** If the Paperspace URL/token changes, update `PAPERSPACE_URL` and `PAPERSPACE_TOKEN` in `remote.py` (or set them as environment variables). The URL changes every time the notebook restarts.
 - **Timeout:** Long runs (200 generations, large instances) can take 10–30+ minutes. Set `--timeout` accordingly (in seconds).
+- **CUDA kernel first-run compilation:** `cuda_batch_update.py` JIT-compiles a CUDA kernel via `torch.utils.cpp_extension.load_inline`. First run takes 2-3 minutes. The compiled `.so` is cached in `~/.cache/torch_extensions/`. Use `--timeout 300` or higher for the first run after a cache clear.
+- **CUDA cache invalidation:** If you change the CUDA kernel source in `cuda_batch_update.py`, clear the cache on Paperspace: `rm -rf /root/.cache/torch_extensions/py311_cu121/_cuda_batch_update_ext/`
 - **Kernel lifecycle:** Each `run` or `exec` call starts a fresh kernel and kills it when done. State does not persist between calls.
 - **Paperspace sleep:** If the Gradient notebook goes idle, the Jupyter server may stop. The user needs to wake it manually from the Paperspace dashboard.

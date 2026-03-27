@@ -2,7 +2,7 @@
 
 Complete technical reference for the BRKGA-based 2D nesting optimizer. Written to give a future reader (or AI assistant) full context without needing to re-analyze the codebase.
 
-**Last updated:** 2026-03-19
+**Last updated:** 2026-03-26
 **Benchmark command:** `python BRKGA_alg3.py 50 2 0 torch_gpu wave_batch 1 1 3`
 
 ---
@@ -126,7 +126,7 @@ fitness_list = list(elite_fitness_list) + offspring_fitness_list  # elite fitnes
 - `fit(verbose)`: The main generational loop (see Section 2).
 - `shutdown()`: Cleans up executor, reports cache stats (for non-wave_batch only).
 
-#### `wave_batch_evaluator.py` (468 lines) — THE CRITICAL FILE for wave_batch mode
+#### `wave_batch_evaluator.py` (~500 lines) — THE CRITICAL FILE for wave_batch mode
 
 This is where ~99% of per-generation time is spent in wave_batch mode.
 
@@ -135,6 +135,11 @@ This is where ~99% of per-generation time is spent in wave_batch mode.
 **Data structures:**
 - `BinState` (dataclass): Tracks one bin's grid (numpy + GPU), vacancy vector, area, enclosure bounds, processing times.
 - `BatchPlacementContext` (dataclass): Tracks one solution-machine combination's progress through the greedy placement algorithm.
+
+**`__init__` pre-computation:**
+- Builds `self.flat_parts_gpu`: All part rotation matrices concatenated into a single float32 CUDA tensor at init time. Used by the custom CUDA kernel for batched grid updates.
+- Builds `self.part_update_meta`: Dict mapping `(part_id, rot) → (flat_offset, h, w)` for indexing into `flat_parts_gpu`.
+- Falls back gracefully if CUDA kernel compilation fails (`flat_parts_gpu = None`).
 
 **`evaluate_batch(chromosomes)` flow:**
 1. For each machine (0, 1): call `_process_machine_batch()`
@@ -151,16 +156,18 @@ This is where ~99% of per-generation time is spent in wave_batch mode.
 This is the function that runs ~25-50 times per machine (once per part placement "depth"). Each wave:
 
 - **Phase 1: Gather part info** — For each active context, identify the next part to place, check feasibility (size fits bin dimensions).
-- **Phase 2: Batch grid FFT update** — Collect all bins whose grid FFT is invalid, compute FFT in ONE batched `torch.fft.fft2()` call across all of them.
-- **Phase 3: Collect all tests** — For each (context × bin × rotation) triple, check vacancy (Numba JIT), and if feasible, record the test into parallel arrays (`test_grid_indices`, `test_part_ffts`, `test_heights`, `test_widths`, etc.).
-- **Phase 4: Batch FFT collision check** — Call `_batch_fft_all_tests()` which performs ONE chunked `torch.fft.ifft2()` for ALL tests, finds valid positions via GPU masking and scoring, transfers results to CPU in ONE `.cpu()` call per chunk.
-- **Phase 5: Best placement selection** — For each context, find the best result (first-fit bin, then density tie-breaking, then bottom-left preference). Execute the placement.
+- **Phase 2: Batch grid FFT update** — Collect all bins whose grid FFT is invalid, compute FFT in ONE batched `torch.fft.rfft2()` call across all of them.
+- **Phase 3: Collect all tests** — For each (context × bin × rotation) triple, check vacancy (Numba JIT), and if feasible, record the test into parallel arrays (`test_grid_indices`, `test_part_ffts`, `test_heights`, `test_widths`, etc.). Also collects `test_ctx_indices`, `test_enclosure_lengths`, `test_bin_areas`, `test_part_areas` for GPU-side scoring.
+- **Phase 4: Batch FFT collision check** — Call `_batch_fft_all_tests()` which performs ONE chunked `torch.fft.irfft2()` for ALL tests, finds valid positions via GPU masking and scoring, transfers results to CPU in ONE `.cpu()` call per chunk. Returns both `placement_results` and per-test `all_scores` (NumPy-computed composite scores incorporating density, row, and column).
+- **Phase 5: Best placement selection + execution** — Two-pass approach:
+  1. Find best test per context using pre-computed scores (simple NumPy argmax, no Python density loop).
+  2. Execute all GPU grid updates in one batch via custom CUDA kernel (`cuda_batch_update.py`), then all CPU updates (NumPy grid + Numba vacancy) which overlap with async GPU.
 - **Phase 6: New bins** — Any context that found no valid placement gets a new bin.
 
 **`_batch_fft_all_tests()` — the GPU workhorse:**
 - Chunks tests into groups of 750 (tuned for RTX A4000, 16GB VRAM)
-- Each chunk: gather grid FFTs and part FFTs via tensor indexing → batched IFFT → round → mask valid positions (row ≥ h-1, col ≥ w-1) → score = row*(W+1) - col (maximize row, minimize col) → single `torch.max()` for both value and index → transfer to CPU
-- Returns list of `(col, row)` or `None` per test
+- Each chunk: gather grid FFTs and part FFTs via tensor indexing → batched `irfft2` → round → mask valid positions (row ≥ h-1, col ≥ w-1) → score = row*(W+1) - col (maximize row, minimize col) → single `torch.max()` for both value and index → transfer to CPU
+- Returns list of `(col, row)` or `None` per test, plus per-test composite `all_scores` (numpy array)
 
 **`_place_part_in_bin()` — the placement executor:**
 - Updates numpy grid (uint8) for vacancy tracking
@@ -168,6 +175,25 @@ This is the function that runs ~25-50 times per machine (once per part placement
 - Updates vacancy vector via Numba JIT
 - Updates area, enclosure bounds, processing times
 - Invalidates grid FFT cache flag
+- Still used by `_start_new_bin()` (Phase 6); Phase 5 uses the batched CUDA kernel path instead
+
+#### `cuda_batch_update.py` (194 lines) — custom CUDA kernel for Phase 5
+
+Replaces ~450 sequential CUDA kernel launches per wave with a single kernel launch that processes all placements in parallel.
+
+**Architecture:**
+- Uses `torch.utils.cpp_extension.load_inline` to JIT-compile CUDA code at first use
+- Compiled `.so` cached in `~/.cache/torch_extensions/` (first run takes 2-3 min)
+- Uses `name='_cuda_batch_update_ext'` to avoid Python module namespace collision with the `.py` file
+- `total_cells` passed as explicit int parameter — never dereferences GPU pointer from host code (avoids segfault on discrete GPUs)
+
+**Kernel design:**
+- 1D thread grid, one thread per cell across all placements
+- Binary search over prefix-sum `cell_offsets` array maps each thread to its placement
+- No atomics needed — each placement writes to a unique `(grid_idx, row, col)` region
+- Pre-computed `flat_parts_gpu` tensor (all part rotations concatenated) indexed via `part_update_meta`
+
+**Python wrapper:** `batch_grid_update(grid_states, flat_parts_gpu, placements, H, W)` — builds per-wave index tensors from a list of `(grid_state_idx, y_start, x_start, flat_offset, h, w)` tuples and dispatches the kernel.
 
 **`_start_new_bin()` — creates a fresh bin:**
 - Allocates numpy grid + zeros the GPU grid slot
@@ -262,7 +288,15 @@ All functions use `@jit(nopython=True, cache=True)` for ahead-of-time compilatio
 
 Two classes: `CuPyCollisionBackend` (basic) and `CuPyCollisionBackendOptimized` (custom CUDA kernel for position extraction). **Benchmarked as 4.7x slower than PyTorch** due to worse cuFFT plan caching. Not used.
 
-#### `profile_quick.py` (276 lines) — profiling utility
+#### `profile_phases.py` (303 lines) — per-phase wall-clock profiler
+
+Standalone script that provides accurate per-phase timing of `_process_wave_true_batch`. Subclasses `WaveBatchEvaluator` as `TimedEvaluator`, inserting `torch.cuda.synchronize()` + `time.perf_counter()` around each phase boundary. No cProfile distortion.
+
+Usage: `python profile_phases.py 50 2 0 torch_gpu 5` (nbParts, nbMachines, instNumber, backend, n_generations)
+
+Produces a breakdown table showing time, percentage, and ms/wave for all 6 phases. This is the authoritative profiling tool for wave_batch performance.
+
+#### `profile_quick.py` (276 lines) — cProfile-based profiling utility
 
 Standalone script that sets up the problem and profiles BRKGA generations using cProfile. Has `setup_problem()` function (useful for benchmarking) and two modes:
 - `profile`: Runs 3 generations under cProfile, prints top functions by cumulative and self time
@@ -400,36 +434,37 @@ Parse → instanceParts[50]        instancePartsUnique[~40]
 
 ## 7. Performance Profile and Bottlenecks
 
-### Current performance (after all optimizations through IMP-10)
+### Current performance (after all optimizations through CUDA batch kernel)
 
 | Metric | Value |
 |--------|-------|
-| Time per generation (wave_batch, P50M2, 500 individuals) | ~5.9s |
+| Time per generation (wave_batch, P50M2, 500 individuals) | **~3.80s** |
 | Time per generation (serial, P50M2, 500 individuals) | ~18.2s |
-| wave_batch speedup over serial | ~3.1x |
-| Total optimization speedup (from original ~40s/gen) | ~6.8x |
+| wave_batch speedup over serial | ~4.8x |
+| Total optimization speedup (from original ~40s/gen) | **~10.5x** |
 
-### Where time is spent in wave_batch mode (per generation, ~5.9s)
+### Where time is spent in wave_batch mode (5 generations, 360 waves, profiled with `profile_phases.py`)
 
-| Component | Time | % | Notes |
-|-----------|------|---|-------|
-| `torch.fft.ifft2` (batched IFFT) | ~0.22s | 3.7% | The actual FFT computation — already minimal |
-| `torch.fft.fft2` (grid FFT updates) | ~0.09s | 1.5% | Batch grid FFT for invalid bins |
-| GPU→CPU data transfer (`.cpu()`) | ~0.30s | 5.1% | One transfer per CHUNK_SIZE (750 tests) |
-| `torch.tensor()` / GPU sync stalls | ~3.07s | 52% | Dominant cost — GPU sync blocking CPU |
-| `_place_part_in_bin` overhead | ~1.11s | 19% | Per-placement numpy + GPU grid updates |
-| `update_vacancy_vector_rows` (Numba) | ~0.44s | 7.5% | Vacancy vector maintenance |
-| Python loop overhead | ~0.67s | 11% | Context iteration, list building |
+| Phase | Time(s) | % | ms/wave | Description |
+|-------|---------|---|---------|-------------|
+| Phase 1 | 0.074 | 0.4% | 0.20 | Gather context info |
+| Phase 2 | 0.900 | 4.8% | 2.50 | Batch grid FFTs (`rfft2`) |
+| Phase 3 | 1.418 | 7.6% | 3.94 | Vacancy check + collect tests |
+| **Phase 4** | **12.398** | **66.1%** | **34.44** | **Batch IFFT (`irfft2`) — dominant** |
+| Phase 5 | 2.629 | 14.0% | 7.30 | Best placement + grid updates |
+| Phase 6 | 1.347 | 7.2% | 3.74 | Open new bins |
+| **TOTAL** | **18.766** | 100% | | |
 
 ### The fundamental bottleneck
 
-The FFT computation itself (IFFT + FFT) is only ~5% of time. The dominant cost (~52%) is **GPU synchronization stalls** — the CPU blocks waiting for GPU operations to complete. This happens because the greedy sequential placement algorithm requires CPU-side decisions (which bin? which rotation?) before the next GPU operation can be issued. This is an inherent tension between the algorithm's sequential nature and GPU's batch-parallel strength.
+Phase 4 (batched IFFT) now dominates at 66% of wave time. The FFT math itself is fast, but the chunked approach (750 tests per chunk) still incurs GPU sync stalls between chunks. The remaining Phase 5 time (~7.3ms/wave) is dominated by CPU updates (NumPy grid + Numba vacancy), not GPU launches — the custom CUDA kernel eliminated launch overhead.
 
 ### Remaining optimization opportunities
 
 | ID | Description | Status | Expected Impact |
 |----|-------------|--------|-----------------|
 | IMP-3 | Eliminate dual numpy/GPU grid | Pending | ~0.6s (high effort) |
+| Phase 4 chunk size | Increase CHUNK_SIZE if VRAM allows | Not started | Fewer sync points |
 | Cheap prefilters | Bounding box / row-range checks before FFT | Not started | Instance-dependent |
 | Hybrid collision | Direct overlap for small parts instead of FFT | Not started | Moderate |
 
@@ -442,6 +477,8 @@ The FFT computation itself (IFFT + FFT) is only ~5% of time. The dominant cost (
 | CuPy backend | 4.7x slower | Worse cuFFT plan caching |
 | FP16 FFT | 0% improvement | Requires power-of-2 padding (cancels gain) |
 | Dynamic FFT size | Deferred | Complex, interacts with batching |
+| GPU-side indexed gather (Phase 4) | No improvement | Overhead of extra tensors negated benefit |
+| GPU-side score computation (scatter_reduce) | No improvement | Too few tests/context (~4) for GPU to win |
 
 ---
 
@@ -475,6 +512,14 @@ All 17 original recommendations addressed:
 | IMP-10 | Remove fitness cache for wave_batch | ~0s (was already bypassed) |
 | IMP-3 | Eliminate dual numpy/GPU grid | **Pending** |
 
+### Post-IMP optimizations (2026-03-25/26)
+
+| Change | Before → After | Saving | File(s) |
+|--------|----------------|--------|---------|
+| `rfft2`/`irfft2` instead of `fft2`/`ifft2` | 5.74s → 4.53s | **-1.21s (-21%)** | `wave_batch_evaluator.py`, `collision_backend.py` |
+| NumPy-side composite scoring (density + position) | 4.53s → 4.23s | **-0.30s (-7%)** | `wave_batch_evaluator.py` |
+| Custom CUDA kernel for batched grid updates | 4.23s → 3.80s | **-0.43s (-10%)** | `cuda_batch_update.py`, `wave_batch_evaluator.py` |
+
 ### Cumulative wave_batch performance
 
 | State | Mean time (500-sol batch) |
@@ -486,7 +531,10 @@ All 17 original recommendations addressed:
 | After +IMP-5 | 6.12s |
 | After +IMP-6 | 6.08s |
 | After +IMP-7 | 5.91s |
-| After +IMP-8 | **5.86s** |
+| After +IMP-8 | 5.86s |
+| After rfft2/irfft2 | 4.53s |
+| After numpy scoring | 4.23s |
+| After CUDA batch kernel | **3.80s** |
 
 ---
 

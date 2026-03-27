@@ -52,8 +52,10 @@ python remote.py run "nvidia-smi" --cwd /notebooks/BRKGA_FFT2
 | `binClassNew.py` | `BuildingPlate` class — bin packing with FFT collision detection |
 | `collision_backend.py` | GPU FFT backend (torch) for collision checking |
 | `wave_batch_evaluator.py` | Batches FFT ops across multiple solutions simultaneously (latest approach) |
+| `cuda_batch_update.py` | Custom CUDA kernel for batched GPU grid updates in Phase 5 (JIT-compiled via `load_inline`) |
 | `data_structures.py` | Dataclasses for parts, machines, problem data |
 | `numba_utils.py` | JIT-compiled vacancy checking (called ~100K×/run) |
+| `profile_phases.py` | Per-phase wall-clock profiling of wave_batch_evaluator |
 | `data/Instances/` | Problem instance files (`P50M2-0.txt`, etc.) |
 | `data/partsMatrices/` | Binary part shape matrices (`.npy`) |
 | `remote.py` | Autonomous remote runner — **gitignored** |
@@ -70,3 +72,42 @@ python remote.py run "nvidia-smi" --cwd /notebooks/BRKGA_FFT2
 6. Reason about results, iterate.
 
 The user's intent is for you to drive this loop autonomously — proposing changes, running experiments, reading results, and iterating — with minimal manual intervention on their part.
+
+---
+
+## Performance optimization summary
+
+**Also see → [PHASE5_OPTIMIZATION.md](PHASE5_OPTIMIZATION.md)** for detailed analysis of Phase 5 optimization ideas (status of each).
+
+### Current performance (P50M2-0, 500 individuals, wave_batch, torch_gpu)
+
+| Metric | Value |
+|--------|-------|
+| Mean gen time | **~3.80s** |
+| Original baseline (pre-optimization) | ~40s/gen |
+| Total speedup | **~10.5x** |
+
+### Key optimizations applied (most recent session)
+
+| Change | Impact | File(s) |
+|--------|--------|---------|
+| `rfft2`/`irfft2` instead of `fft2`/`ifft2` | 5.74s → 4.53s | `wave_batch_evaluator.py`, `collision_backend.py` |
+| NumPy-side composite scoring (moved density calc out of Python loop) | 4.53s → 4.23s | `wave_batch_evaluator.py` |
+| Custom CUDA kernel for batched GPU grid updates | 4.23s → 3.80s | `cuda_batch_update.py`, `wave_batch_evaluator.py` |
+
+### Phase breakdown (5 gens, 360 waves, profiled with `profile_phases.py`)
+
+| Phase | Time(s) | % | Description |
+|-------|---------|---|-------------|
+| Phase 1 | 0.074 | 0.4% | Gather context info |
+| Phase 2 | 0.900 | 4.8% | Batch grid FFTs |
+| Phase 3 | 1.418 | 7.6% | Vacancy check + collect tests |
+| **Phase 4** | **12.398** | **66.1%** | **Batch IFFT (dominant)** |
+| Phase 5 | 2.629 | 14.0% | Find best placements + grid updates |
+| Phase 6 | 1.347 | 7.2% | Open new bins |
+
+### Important notes for the CUDA kernel
+
+- **First-run compilation**: `cuda_batch_update.py` uses `torch.utils.cpp_extension.load_inline` to JIT-compile a CUDA kernel. First run takes 2-3 minutes. The compiled `.so` is cached in `~/.cache/torch_extensions/` for subsequent runs.
+- **Cache invalidation**: If you change the CUDA kernel source, delete the cache: `rm -rf /root/.cache/torch_extensions/py311_cu121/_cuda_batch_update_ext/`
+- **Fallback**: If CUDA compilation fails, the evaluator falls back to sequential GPU slice updates (Option C) automatically.
