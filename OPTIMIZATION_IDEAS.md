@@ -1,13 +1,13 @@
 # Optimization Ideas for Generation Speed
 
-**Current baseline:** ~3.54s/gen (P50M2-0, 500 individuals, wave_batch, torch_gpu, RTX A4000)
+**Current baseline:** ~3.32s/gen (P50M2-0, 500 individuals, wave_batch, torch_gpu, RTX A4000)
 **Original baseline (pre-all-optimizations):** ~3.80s/gen
 
-**Phase breakdown (% of total time) — updated after Idea 5:**
-- Phase 4 (Batch IFFT): **58.1%** — still the dominant target
-- Phase 5 (Best placements + grid updates): 16.9%
-- Phase 3 (Vacancy check + collect tests): 9.8%
-- Phase 6 (Open new bins): 8.9%
+**Phase breakdown (% of total time) — updated after Ideas 5 + 8:**
+- Phase 4 (Batch IFFT): **58.9%** — still the dominant target
+- Phase 5 (Best placements + grid updates): 16.7%
+- Phase 6 (Open new bins): 8.7%
+- Phase 3 (Vacancy check + collect tests): 9.5%
 - Phase 2 (Batch grid FFTs): 5.8%
 - Phase 1 (Gather context): 0.5%
 
@@ -133,12 +133,12 @@ Output: has_valid    (chunk_n,) bool
 
 ---
 
-## Idea 6: Eliminate CPU grid mirror
+## ~~Idea 6: Eliminate CPU grid mirror~~ — TESTED, SEVERE REGRESSION, REVERTED
 
-**Target:** Phase 5 (14.0%)
-**Expected savings:** 0.05-0.1s/gen
+**Target:** Phase 5 (16.7%)
+**Expected savings:** 0.05-0.1s/gen (predicted)
+**Actual result:** Phase 5 exploded from 7.6→17.9 ms/wave (+137%), gen time 3.32→4.2s. **REVERTED.**
 **Effort:** Medium
-**Priority:** LOW
 
 **What:** Every `BinState` has both `bin_state.grid` (NumPy uint8) and a GPU `grid_states[idx]` (float32). After each placement, the part is written to both. The CPU grid exists only for vacancy vector updates.
 
@@ -162,6 +162,8 @@ This eliminates the `bin_state.grid` array entirely. The GPU→CPU transfer of a
 **Risk:** The GPU grid is float32 and accumulates via addition. After many parts, values could be 2, 3, etc. The vacancy check only cares about zero vs nonzero, so `rows_cpu > 0` gives the correct binary grid for vacancy computation. However, `update_vacancy_vector_rows` currently counts consecutive zeros — it needs the grid values to be 0 where empty. As long as the GPU grid only ever gets part matrices added (which are 0/1), nonzero means occupied, which is correct.
 
 **Sync hazard:** The CUDA batch kernel updates GPU grids asynchronously. If you immediately read `grid_states[idx, y_start:row+1, :].cpu()`, you'll race with the kernel. You need a `torch.cuda.synchronize()` before the CPU transfer, which partially negates the savings.
+
+**Why it failed:** Each `.cpu()` call per placement forces a GPU stream flush, completely eliminating the CPU-GPU overlap that currently exists in Phase 5. The per-placement DtoH transfer (~30KB × 500 placements = 15MB/wave) added on top. The `bin_state.grid` CPU mirror is actually doing valuable work — it lets the CPU update the vacancy vector concurrently with the async GPU kernel. Do not attempt again.
 
 ---
 
@@ -197,23 +199,21 @@ def batch_vacancy_check(vacancies, densities, vac_offsets, den_offsets, n_checks
 
 ---
 
-## Idea 8: Batch Phase 6 new-bin creation
+## ~~Idea 8: Batch Phase 6 new-bin creation~~ — IMPLEMENTED ✓
 
-**Target:** Phase 6 (7.2%)
+**Target:** Phase 6 (8.9% → 8.7%)
 **Expected savings:** 0.05-0.1s/gen
+**Actual result:** **3.54s → 3.32s (−0.22s, −6%); Phase 6: 4.30→3.93 ms/wave (−8%)**
 **Effort:** Low
-**Priority:** LOW
+**Status:** Committed (c4a6292)
 
-**What:** `_start_new_bin` calls `_place_part_in_bin` which does individual GPU operations. When many contexts need new bins in the same wave, batch the GPU work.
+**What was done:** Replaced serial `_start_new_bin()` loop with a batched approach:
+1. Create all `BinState` objects (CPU) in one pass
+2. Zero all new GPU grids with a single `grid_states.index_fill_(0, idx_tensor, 0.0)`
+3. Place all first parts with one `_cuda_batch_update` kernel call
+4. Do all CPU updates (numpy grid + vacancy vector) concurrently
 
-**Where to change:**
-- `wave_batch_evaluator.py` — Phase 6 (lines ~380-382). Instead of calling `_start_new_bin` in a loop:
-  1. Create all new `BinState` objects (CPU-only: numpy grid, vacancy vector)
-  2. Batch all `grid_states[grid_idx].zero_()` into one operation
-  3. Use the existing CUDA batch kernel to place all first parts at once
-  4. Do CPU updates for all new bins
-
-This reuses the same pattern as Phase 5's batched updates.
+First part always goes at bottom-left with `best_rotation` — no FFT needed, so the CUDA kernel handles the write directly.
 
 ---
 
@@ -237,10 +237,10 @@ This reuses the same pattern as Phase 5's batched updates.
 
 1. ~~**Idea 3**~~ (pre-allocate chunk tensors) — **tested, no benefit, reverted**
 2. ~~**Idea 5**~~ (`torch.compile`) — **implemented, −0.26s/gen (−7%), committed**
-3. **Idea 2** (bin-0-first) — worth trying with adaptive toggle, measure carefully
-4. **Idea 8** (batch Phase 6) — straightforward reuse of existing CUDA kernel
-5. ~~**Idea 4**~~ (fused CUDA kernel) — superseded by Idea 5
-6. **Idea 6** (eliminate CPU grid) — modest win, watch for sync hazard
+3. ~~**Idea 8**~~ (batch Phase 6) — **implemented, −0.22s/gen (−6%), committed**
+4. ~~**Idea 6**~~ (eliminate CPU grid) — **tested, severe regression (+137% Phase 5), reverted**
+5. **Idea 2** (bin-0-first) — worth trying with adaptive toggle, measure carefully
+6. ~~**Idea 4**~~ (fused CUDA kernel) — superseded by Idea 5
 7. **Idea 9** (pre-allocate grid_states) — negligible due to CUDA caching allocator, skip unless touching that code anyway
 8. **Idea 7** (batch vacancy) — math doesn't strongly support it, skip unless Phase 3 share grows
 9. ~~**Idea 1**~~ (fp16 FFT) — already tested and rejected, skip
