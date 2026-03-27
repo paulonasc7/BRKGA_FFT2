@@ -1,14 +1,15 @@
 # Optimization Ideas for Generation Speed
 
-**Current baseline:** ~3.80s/gen (P50M2-0, 500 individuals, wave_batch, torch_gpu, RTX A4000)
+**Current baseline:** ~3.54s/gen (P50M2-0, 500 individuals, wave_batch, torch_gpu, RTX A4000)
+**Original baseline (pre-all-optimizations):** ~3.80s/gen
 
-**Phase breakdown (% of total time):**
-- Phase 4 (Batch IFFT): **66.1%** — the dominant target
-- Phase 5 (Best placements + grid updates): 14.0%
-- Phase 3 (Vacancy check + collect tests): 7.6%
-- Phase 6 (Open new bins): 7.2%
-- Phase 2 (Batch grid FFTs): 4.8%
-- Phase 1 (Gather context): 0.4%
+**Phase breakdown (% of total time) — updated after Idea 5:**
+- Phase 4 (Batch IFFT): **58.1%** — still the dominant target
+- Phase 5 (Best placements + grid updates): 16.9%
+- Phase 3 (Vacancy check + collect tests): 9.8%
+- Phase 6 (Open new bins): 8.9%
+- Phase 2 (Batch grid FFTs): 5.8%
+- Phase 1 (Gather context): 0.5%
 
 ---
 
@@ -51,12 +52,12 @@ Phase 5 then merges results from both passes.
 
 ---
 
-## Idea 3: Pre-allocate chunk tensors
+## ~~Idea 3: Pre-allocate chunk tensors~~ — TESTED, NO BENEFIT
 
 **Target:** Phase 4 (66.1%)
-**Expected savings:** 0.1-0.15s/gen
+**Expected savings:** 0.1-0.15s/gen (predicted)
+**Actual result:** ~0s improvement — REVERTED
 **Effort:** Low
-**Priority:** HIGH (easy win)
 
 **What:** Inside `_batch_fft_all_tests`, each chunk iteration allocates new GPU tensors via `torch.tensor(...)` and `torch.stack(...)`. These trigger CUDA memory allocation calls. Pre-allocating reusable buffers eliminates this overhead.
 
@@ -79,6 +80,8 @@ Then in the chunk loop, use `buf[:chunk_n].copy_(data)` instead of creating new 
 **Also:** The `results_cpu` transfer (line ~460-461: `.cpu().numpy()`) creates a new CPU tensor each time. Pre-allocate a pinned-memory CPU buffer and use `.copy_()` with `non_blocking=True`.
 
 **Note on `torch.stack`:** Stacking a Python list of tensors is already somewhat optimized in PyTorch. The bigger win is likely the index tensors (`grid_indices`, `heights`, `widths`) which go through `torch.tensor(python_list)` — that's a CPU→GPU copy with implicit sync.
+
+**Why it didn't work:** PyTorch's CUDA caching allocator reuses large memory blocks at near-zero cost (pointer lookup). The allocations we eliminated (~675 MB/chunk in theory) were already essentially free in practice. Implemented and benchmarked: gen time went from 3.80s → ~3.95s (within noise, no improvement). Reverted.
 
 ---
 
@@ -111,41 +114,22 @@ Output: has_valid    (chunk_n,) bool
 
 ---
 
-## Idea 5: `torch.compile` on Phase 4 inner loop
+## Idea 5: `torch.compile` on Phase 4 inner loop — IMPLEMENTED ✓
 
-**Target:** Phase 4 (66.1%)
+**Target:** Phase 4 (66.1% → 58.1%)
 **Expected savings:** 0.1-0.3s/gen
+**Actual result:** **3.80s → 3.54s (−0.26s, −7%); Phase 4: 34.4 → 28.0 ms/wave (−19%)**
 **Effort:** Low
-**Priority:** MEDIUM
+**Status:** Committed (49b902a)
 
-**What:** PyTorch 2.x `torch.compile` with the Triton backend can automatically fuse elementwise + reduction operations. The post-IFFT operations (round, masking, scoring, argmax) are good candidates.
+**What was done:** Extracted the post-IFFT block (round → mask → score → argmax, ~10 kernel launches) into a module-level `_post_ifft_score` function and compiled it with `torch.compile(dynamic=True, fullgraph=True)`. Triton fuses the elementwise ops into ~2 kernels, cutting VRAM bandwidth by ~5x for that block.
 
-**Where to change:**
-- `wave_batch_evaluator.py` — Extract the post-IFFT code (lines ~434-461) into a standalone function and decorate it:
-
-```python
-@torch.compile(mode="reduce-overhead")
-def _post_ifft_score(overlap_batch, part_heights, part_widths, row_idx, col_idx, neg_inf, H, W):
-    rounded_batch = torch.round(overlap_batch)
-    zero_mask = (rounded_batch == 0)
-    valid_row = row_idx >= (part_heights - 1).view(-1, 1, 1)
-    valid_col = col_idx >= (part_widths - 1).view(-1, 1, 1)
-    valid_zeros = zero_mask[:, :H, :W] & valid_row & valid_col
-    score = torch.where(valid_zeros, row_idx.float() * (W + 1) - col_idx.float(), neg_inf)
-    flat_scores = score.view(score.shape[0], -1)
-    max_scores, best_flat_idx = flat_scores.max(dim=1)
-    best_row = best_flat_idx // W
-    best_col = best_flat_idx % W
-    has_valid = max_scores > -1e8
-    smallest_cols = best_col - (part_widths - 1)
-    return has_valid, smallest_cols, best_row
-```
-
-**Caveat:** First call triggers compilation (~30s). Use `mode="reduce-overhead"` for CUDA graph capture. Test that results are identical. If `torch.compile` doesn't help, the manual CUDA kernel (Idea 4) is the fallback.
-
-**Dynamic shapes:** The last chunk is often smaller than `CHUNK_SIZE`, which would trigger a recompilation. Pad the last chunk to full `CHUNK_SIZE` and mask out padding to ensure a single compiled graph.
-
-**PyTorch version:** Update to PyTorch >= 2.4 on Paperspace for best `torch.compile` stability. 2.1.1 had rough edges.
+**Key implementation details:**
+- `dynamic=True` instead of `mode="reduce-overhead"`: handles varying chunk sizes (last chunk is smaller) without padding. One compiled graph covers all chunk sizes and both machines.
+- W derived from `col_idx.shape[-1]` (tensor shape) rather than passed as a Python int — avoids per-machine specialization.
+- Guarded with `if hasattr(torch, 'compile')` for backwards compatibility.
+- First run incurs a one-time Triton compilation spike (~3s extra in gen 2). Subsequent runs use the disk-cached kernel.
+- PyTorch version on Paperspace was already new enough (no upgrade needed).
 
 ---
 
@@ -251,11 +235,11 @@ This reuses the same pattern as Phase 5's batched updates.
 
 ## Implementation Order
 
-1. **Idea 3** (pre-allocate chunk tensors) — guaranteed win, low effort, do first
-2. **Idea 5** (`torch.compile`) — low effort, update PyTorch to >= 2.4 first, test if it fuses post-IFFT ops
+1. ~~**Idea 3**~~ (pre-allocate chunk tensors) — **tested, no benefit, reverted**
+2. ~~**Idea 5**~~ (`torch.compile`) — **implemented, −0.26s/gen (−7%), committed**
 3. **Idea 2** (bin-0-first) — worth trying with adaptive toggle, measure carefully
 4. **Idea 8** (batch Phase 6) — straightforward reuse of existing CUDA kernel
-5. **Idea 4** (fused CUDA kernel) — only if Idea 5 fails to deliver
+5. ~~**Idea 4**~~ (fused CUDA kernel) — superseded by Idea 5
 6. **Idea 6** (eliminate CPU grid) — modest win, watch for sync hazard
 7. **Idea 9** (pre-allocate grid_states) — negligible due to CUDA caching allocator, skip unless touching that code anyway
 8. **Idea 7** (batch vacancy) — math doesn't strongly support it, skip unless Phase 3 share grows
