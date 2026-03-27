@@ -415,10 +415,69 @@ class WaveBatchEvaluator:
                 bin_state.proc_time += mpd.proc_time
                 bin_state.proc_time_height = max(bin_state.proc_time_height, mpd.proc_time_height)
         
-        # Phase 6: Handle new bins
-        for ctx, part_data, mach_part_data in contexts_needing_new_bin:
-            self._start_new_bin(ctx, part_data, mach_part_data, mach_data, grid_states)
-            ctx.current_part_idx += 1
+        # Phase 6: Batch new-bin creation.
+        # Previously called _start_new_bin() per context (serial GPU ops).
+        # Now: one index_fill_ to zero all new grids + one CUDA kernel for all first placements.
+        if contexts_needing_new_bin:
+            _new_placements = []  # (new_bin, part_data, mach_part_data, best_rot, shape)
+            _new_grid_indices = []
+
+            # Step 1: Create all BinState objects (CPU only)
+            for ctx, part_data, mach_part_data in contexts_needing_new_bin:
+                grid_idx = ctx.next_grid_idx
+                ctx.next_grid_idx += 1
+                new_bin = BinState(
+                    bin_idx=len(ctx.open_bins),
+                    grid=np.zeros((ctx.bin_length, ctx.bin_width), dtype=np.uint8),
+                    vacancy_vector=np.zeros(ctx.bin_length, dtype=np.int32) + ctx.bin_width,
+                    grid_state_idx=grid_idx,
+                    area=0.0, enclosure_box_length=0,
+                    min_occupied_row=ctx.bin_length, max_occupied_row=-1,
+                    proc_time=0.0, proc_time_height=0.0,
+                    grid_fft_valid=False, parts_assigned=[],
+                    bin_length=ctx.bin_length, bin_width=ctx.bin_width
+                )
+                best_rot = part_data.best_rotation
+                shape = part_data.shapes[best_rot]
+                ctx.open_bins.append(new_bin)
+                ctx.current_part_idx += 1
+                _new_placements.append((new_bin, part_data, mach_part_data, best_rot, shape))
+                _new_grid_indices.append(grid_idx)
+
+            # Step 2: Zero all new GPU grids in one op
+            _new_idx_t = torch.tensor(_new_grid_indices, device=self.device, dtype=torch.long)
+            grid_states.index_fill_(0, _new_idx_t, 0.0)
+
+            # Step 3: Batch GPU part placements (single CUDA kernel or tight fallback loop)
+            if self.flat_parts_gpu is not None:
+                _kernel_args = []
+                for new_bin, part_data, _, best_rot, shape in _new_placements:
+                    y_start = new_bin.bin_length - shape[0]
+                    flat_offset, ph, pw = self.part_update_meta[(part_data.id, best_rot)]
+                    _kernel_args.append((new_bin.grid_state_idx, y_start, 0, flat_offset, ph, pw))
+                _cuda_batch_update(grid_states, self.flat_parts_gpu, _kernel_args, H, W)
+            else:
+                for new_bin, part_data, _, best_rot, shape in _new_placements:
+                    y_start = new_bin.bin_length - shape[0]
+                    part_gpu = (part_data.rotations_gpu[best_rot]
+                                if part_data.rotations_gpu and part_data.rotations_gpu[best_rot] is not None
+                                else torch.as_tensor(part_data.rotations[best_rot],
+                                                     dtype=torch.float32, device=self.device))
+                    grid_states[new_bin.grid_state_idx, y_start:new_bin.bin_length, 0:shape[1]] += part_gpu
+
+            # Step 4: CPU updates — run while GPU kernel executes (async)
+            for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
+                y_start = new_bin.bin_length - shape[0]
+                new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] += part_data.rotations_uint8[best_rot]
+                update_vacancy_vector_rows(
+                    new_bin.vacancy_vector, new_bin.grid[y_start:new_bin.bin_length, :], y_start)
+                new_bin.area += part_data.area
+                new_bin.min_occupied_row = y_start
+                new_bin.max_occupied_row = new_bin.bin_length - 1
+                new_bin.enclosure_box_length = shape[0]
+                new_bin.proc_time += mach_part_data.proc_time
+                new_bin.proc_time_height = mach_part_data.proc_time_height
+                new_bin.grid_fft_valid = False
     
     def _batch_fft_all_tests(self, n_tests, test_grid_indices, test_part_ffts,
                               test_heights, test_widths,
