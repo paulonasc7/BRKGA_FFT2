@@ -28,6 +28,45 @@ except Exception:
     _HAS_CUDA_KERNEL = False
 
 
+def _post_ifft_score(overlap_batch, part_heights, part_widths, row_idx, col_idx, neg_inf):
+    """
+    Fused post-IFFT scoring: round → mask → score → argmax.
+
+    Decorated with torch.compile so Triton fuses the ~10 elementwise kernels into
+    1-2 kernels, cutting VRAM bandwidth by ~5-6x for this block.
+
+    W is derived from col_idx so dynamic=True handles all chunk sizes and both
+    machines with a single compiled graph.
+    """
+    chunk_n = overlap_batch.shape[0]
+    W = col_idx.shape[-1]
+    zero_mask = (overlap_batch.round() == 0)
+    valid_row = row_idx >= (part_heights - 1).view(-1, 1, 1)
+    valid_col = col_idx >= (part_widths - 1).view(-1, 1, 1)
+    valid_zeros = zero_mask & valid_row & valid_col
+    score = torch.where(
+        valid_zeros,
+        row_idx.float() * (W + 1) - col_idx.float(),
+        neg_inf
+    )
+    max_scores, best_flat_idx = score.view(chunk_n, -1).max(dim=1)
+    best_row = best_flat_idx // W
+    best_col = best_flat_idx % W
+    has_valid = max_scores > -1e8
+    return has_valid, best_col - (part_widths - 1), best_row
+
+
+# Compile if torch.compile is available (PyTorch >= 2.0).
+# dynamic=True: one compiled graph handles all chunk sizes and both machines.
+# fullgraph=True: error rather than silently falling back to eager on a graph break.
+# First call triggers Triton compilation (~30s); subsequent calls use the cached kernel.
+if hasattr(torch, 'compile'):
+    _post_ifft_score = torch.compile(_post_ifft_score, dynamic=True, fullgraph=True)
+    _HAS_TORCH_COMPILE = True
+else:
+    _HAS_TORCH_COMPILE = False
+
+
 @dataclass
 class BinState:
     """State for a single bin."""
@@ -431,30 +470,11 @@ class WaveBatchEvaluator:
 
                 # Batched IFFT (real-valued output via irfft2)
                 overlap_batch = torch.fft.irfft2(batch_grid_ffts * batch_part_ffts, s=(H, W))
-                rounded_batch = torch.round(overlap_batch)
 
-                # Find valid positions
-                zero_mask = (rounded_batch == 0)
-
-                valid_row = row_idx >= (part_heights - 1).view(-1, 1, 1)
-                valid_col = col_idx >= (part_widths - 1).view(-1, 1, 1)
-                valid_mask = valid_row & valid_col
-                valid_zeros = zero_mask[:, :H, :W] & valid_mask
-
-                # Score: prefer bottom-left (high row, low col)
-                score = torch.where(
-                    valid_zeros,
-                    row_idx.float() * (W + 1) - col_idx.float(),
-                    neg_inf
-                )
-                
-                flat_scores = score.view(chunk_n, -1)
-                max_scores, best_flat_idx = flat_scores.max(dim=1)
-                
-                best_row = best_flat_idx // W
-                best_col = best_flat_idx % W
-                has_valid = max_scores > -1e8
-                smallest_cols = best_col - (part_widths - 1)
+                # Fused post-IFFT scoring via torch.compile (Triton kernel).
+                # Replaces ~10 separate elementwise/reduction kernel launches with ~2.
+                has_valid, smallest_cols, best_row = _post_ifft_score(
+                    overlap_batch, part_heights, part_widths, row_idx, col_idx, neg_inf)
 
                 # Transfer (has_valid, col, row) to CPU — same as original
                 results_cpu = torch.stack([has_valid.int(), smallest_cols, best_row],
