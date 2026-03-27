@@ -294,58 +294,143 @@ class WaveBatchEvaluator:
                 for bs in invalid_bin_states:
                     bs.grid_fft_valid = True
         
-        # Phase 3: Collect ALL (context, bin, rotation) tests to batch
-        # Parallel arrays replace list-of-dicts to avoid per-entry dict allocation and
-        # string-keyed lookups in the hot path of _batch_fft_all_tests.
-        test_grid_indices      = []   # bin_state.grid_state_idx       (for GPU gather)
-        test_part_ffts         = []   # mach_part_data.ffts[rot]       (for torch.stack)
-        test_heights           = []   # shape[0]                       (for valid-position mask)
-        test_widths            = []   # shape[1]                       (for valid-position mask)
-        test_bin_indices       = []   # bin_idx                        (for GPU score)
-        test_shapes            = []   # shape tuple                    (for Phase-5 placement)
-        test_bin_states        = []   # BinState object                (for Phase-5 placement)
-        test_rotations         = []   # rot                            (for Phase-5 placement)
-        test_ctx_indices       = []   # ctx_idx                        (for per-context argmax)
-        test_enclosure_lengths = []   # bin_state.enclosure_box_length (for GPU density)
-        test_bin_areas         = []   # bin_state.area                 (for GPU density)
-        test_part_areas        = []   # part_data.area                 (for GPU density)
-        n_tests = 0
+        # Phase 3 / Phase 4: Two-pass collection + IFFT.
+        #
+        # Because bin_idx dominates the composite score (×1e9 multiplier), any valid
+        # placement in bin B always beats a valid placement in bin B+1.  We exploit this:
+        #   Pass 1 — for each context, test only its FIRST bin that passes area + vacancy.
+        #   Pass 2 — only for contexts with no geometric hit in Pass 1, test remaining bins.
+        # In the common case (most parts fit into their first open bin), Pass 2 is tiny or
+        # empty, halving or better the total IFFT work.
+        #
+        # Parallel arrays use the same layout as before; Pass-1 and Pass-2 results are
+        # concatenated before Phase 5, which is left entirely unchanged.
+
+        n_contexts = len(context_info)
+        ctx_first_valid_bin = [-1] * n_contexts   # bin_idx of first vacancy-passing bin
+
+        # ---- Pass 1 collection ---------------------------------------------------
+        p1_grid_indices      = []
+        p1_part_ffts         = []
+        p1_heights           = []
+        p1_widths            = []
+        p1_bin_indices       = []
+        p1_shapes            = []
+        p1_bin_states        = []
+        p1_rotations         = []
+        p1_ctx_indices       = []
+        p1_enclosure_lengths = []
+        p1_bin_areas         = []
+        p1_part_areas        = []
+        p1_n_tests = 0
 
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             for bin_idx, bin_state in enumerate(ctx.open_bins):
-                # Area check
                 if bin_state.area + part_data.area > ctx.bin_area:
                     continue
-
-                # Vacancy check for each rotation
+                rots_passing = []
                 for rot in range(part_data.nrot):
                     shape = part_data.shapes[rot]
                     if shape[0] > H or shape[1] > W:
                         continue
-                    dens = part_data.densities[rot]
-                    if check_vacancy_fit_simple(bin_state.vacancy_vector, dens):
-                        test_grid_indices.append(bin_state.grid_state_idx)
-                        test_part_ffts.append(mach_part_data.ffts[rot])
-                        test_heights.append(shape[0])
-                        test_widths.append(shape[1])
-                        test_bin_indices.append(bin_idx)
-                        test_shapes.append(shape)
-                        test_bin_states.append(bin_state)
-                        test_rotations.append(rot)
-                        test_ctx_indices.append(ctx_idx)
-                        test_enclosure_lengths.append(bin_state.enclosure_box_length)
-                        test_bin_areas.append(bin_state.area)
-                        test_part_areas.append(part_data.area)
-                        n_tests += 1
-        
-        # Phase 4: Batch FFT collision check for ALL tests at once
-        if n_tests:
-            placement_results, all_scores = self._batch_fft_all_tests(
-                n_tests, test_grid_indices, test_part_ffts, test_heights, test_widths,
-                test_bin_indices, test_enclosure_lengths, test_bin_areas, test_part_areas,
+                    if check_vacancy_fit_simple(bin_state.vacancy_vector,
+                                               part_data.densities[rot]):
+                        rots_passing.append((rot, shape))
+                if rots_passing:
+                    ctx_first_valid_bin[ctx_idx] = bin_idx
+                    for rot, shape in rots_passing:
+                        p1_grid_indices.append(bin_state.grid_state_idx)
+                        p1_part_ffts.append(mach_part_data.ffts[rot])
+                        p1_heights.append(shape[0])
+                        p1_widths.append(shape[1])
+                        p1_bin_indices.append(bin_idx)
+                        p1_shapes.append(shape)
+                        p1_bin_states.append(bin_state)
+                        p1_rotations.append(rot)
+                        p1_ctx_indices.append(ctx_idx)
+                        p1_enclosure_lengths.append(bin_state.enclosure_box_length)
+                        p1_bin_areas.append(bin_state.area)
+                        p1_part_areas.append(part_data.area)
+                        p1_n_tests += 1
+                    break  # only first valid bin goes into Pass 1
+
+        # ---- Phase 4a: IFFT for Pass 1 ------------------------------------------
+        if p1_n_tests:
+            p1_placement_results, p1_all_scores = self._batch_fft_all_tests(
+                p1_n_tests, p1_grid_indices, p1_part_ffts, p1_heights, p1_widths,
+                p1_bin_indices, p1_enclosure_lengths, p1_bin_areas, p1_part_areas,
                 grid_ffts, H, W, row_idx, col_idx, neg_inf)
         else:
-            placement_results, all_scores = [], np.array([], dtype=np.float32)
+            p1_placement_results, p1_all_scores = [], np.array([], dtype=np.float32)
+
+        # Determine which contexts already have a valid geometric placement from Pass 1.
+        # Valid = score strictly above -1e18 (the sentinel for "no zero-overlap position").
+        ctx_p1_hit = [False] * n_contexts
+        for ti, ctx_idx in enumerate(p1_ctx_indices):
+            if p1_all_scores[ti] > -1e18:
+                ctx_p1_hit[ctx_idx] = True
+
+        # ---- Pass 2 collection: remaining bins for Pass-1 misses ----------------
+        p2_grid_indices      = []
+        p2_part_ffts         = []
+        p2_heights           = []
+        p2_widths            = []
+        p2_bin_indices       = []
+        p2_shapes            = []
+        p2_bin_states        = []
+        p2_rotations         = []
+        p2_ctx_indices       = []
+        p2_enclosure_lengths = []
+        p2_bin_areas         = []
+        p2_part_areas        = []
+        p2_n_tests = 0
+
+        for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
+            if ctx_p1_hit[ctx_idx]:
+                continue  # Pass 1 already found a valid placement
+            first_valid = ctx_first_valid_bin[ctx_idx]  # skip this bin (already tested)
+            for bin_idx, bin_state in enumerate(ctx.open_bins):
+                if bin_idx == first_valid:
+                    continue  # already in Pass 1 (and found no geometric fit)
+                if bin_state.area + part_data.area > ctx.bin_area:
+                    continue
+                for rot in range(part_data.nrot):
+                    shape = part_data.shapes[rot]
+                    if shape[0] > H or shape[1] > W:
+                        continue
+                    if check_vacancy_fit_simple(bin_state.vacancy_vector,
+                                               part_data.densities[rot]):
+                        p2_grid_indices.append(bin_state.grid_state_idx)
+                        p2_part_ffts.append(mach_part_data.ffts[rot])
+                        p2_heights.append(shape[0])
+                        p2_widths.append(shape[1])
+                        p2_bin_indices.append(bin_idx)
+                        p2_shapes.append(shape)
+                        p2_bin_states.append(bin_state)
+                        p2_rotations.append(rot)
+                        p2_ctx_indices.append(ctx_idx)
+                        p2_enclosure_lengths.append(bin_state.enclosure_box_length)
+                        p2_bin_areas.append(bin_state.area)
+                        p2_part_areas.append(part_data.area)
+                        p2_n_tests += 1
+
+        # ---- Phase 4b: IFFT for Pass 2 ------------------------------------------
+        if p2_n_tests:
+            p2_placement_results, p2_all_scores = self._batch_fft_all_tests(
+                p2_n_tests, p2_grid_indices, p2_part_ffts, p2_heights, p2_widths,
+                p2_bin_indices, p2_enclosure_lengths, p2_bin_areas, p2_part_areas,
+                grid_ffts, H, W, row_idx, col_idx, neg_inf)
+        else:
+            p2_placement_results, p2_all_scores = [], np.array([], dtype=np.float32)
+
+        # Merge Pass 1 + Pass 2 into flat arrays that Phase 5 consumes unchanged.
+        test_ctx_indices  = p1_ctx_indices  + p2_ctx_indices
+        test_bin_states   = p1_bin_states   + p2_bin_states
+        test_rotations    = p1_rotations    + p2_rotations
+        test_shapes       = p1_shapes       + p2_shapes
+        placement_results = p1_placement_results + p2_placement_results
+        all_scores        = (np.concatenate([p1_all_scores, p2_all_scores])
+                             if p2_n_tests else p1_all_scores)
         
         # Phase 5: Find best placement per context using GPU-computed scores.
         # Scores encode the full tie-breaking hierarchy (bin_idx > density > row > col)

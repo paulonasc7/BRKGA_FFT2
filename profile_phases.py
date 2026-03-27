@@ -151,17 +151,75 @@ class TimedEvaluator(WaveBatchEvaluator):
                 for bs in invalid_bs: bs.grid_fft_valid = True
         self._pt[2] += self._s() - t
 
-        # ── Phase 3 ──────────────────────────────────────────────────────────
+        # ── Phase 3a  Pass-1 collection (first valid bin per context) ────────
         t = self._s()
-        test_grid_indices, test_part_ffts = [], []
-        test_heights, test_widths = [], []
-        test_bin_indices, test_shapes = [], []
-        test_bin_states, test_rotations = [], []
-        test_ctx_indices, test_enclosure_lengths = [], []
-        test_bin_areas, test_part_areas = [], []
-        n_tests = 0
+        n_contexts = len(context_info)
+        ctx_first_valid_bin = [-1] * n_contexts
+        p1_grid_indices, p1_part_ffts = [], []
+        p1_heights, p1_widths = [], []
+        p1_bin_indices, p1_shapes = [], []
+        p1_bin_states, p1_rotations = [], []
+        p1_ctx_indices, p1_enclosure_lengths = [], []
+        p1_bin_areas, p1_part_areas = [], []
+        p1_n_tests = 0
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             for bin_idx, bin_state in enumerate(ctx.open_bins):
+                if bin_state.area + part_data.area > ctx.bin_area:
+                    continue
+                rots_passing = []
+                for rot in range(part_data.nrot):
+                    shape = part_data.shapes[rot]
+                    if shape[0]>H or shape[1]>W: continue
+                    if check_vacancy_fit_simple(bin_state.vacancy_vector,
+                                               part_data.densities[rot]):
+                        rots_passing.append((rot, shape))
+                if rots_passing:
+                    ctx_first_valid_bin[ctx_idx] = bin_idx
+                    for rot, shape in rots_passing:
+                        p1_grid_indices.append(bin_state.grid_state_idx)
+                        p1_part_ffts.append(mach_part_data.ffts[rot])
+                        p1_heights.append(shape[0]); p1_widths.append(shape[1])
+                        p1_bin_indices.append(bin_idx); p1_shapes.append(shape)
+                        p1_bin_states.append(bin_state); p1_rotations.append(rot)
+                        p1_ctx_indices.append(ctx_idx)
+                        p1_enclosure_lengths.append(bin_state.enclosure_box_length)
+                        p1_bin_areas.append(bin_state.area)
+                        p1_part_areas.append(part_data.area)
+                        p1_n_tests += 1
+                    break
+        self._pt['3a'] += self._s() - t
+
+        # ── Phase 4a  IFFT for Pass 1 ─────────────────────────────────────────
+        t = self._s()
+        if p1_n_tests:
+            p1_placement_results, p1_all_scores = self._batch_fft_all_tests(
+                p1_n_tests, p1_grid_indices, p1_part_ffts, p1_heights, p1_widths,
+                p1_bin_indices, p1_enclosure_lengths, p1_bin_areas, p1_part_areas,
+                grid_ffts, H, W, row_idx, col_idx, neg_inf)
+        else:
+            p1_placement_results, p1_all_scores = [], np.array([], dtype=np.float32)
+        self._pt['4a'] += self._s() - t
+
+        # ── Phase 3b  Pass-2 collection (remaining bins for misses) ──────────
+        t = self._s()
+        ctx_p1_hit = [False] * n_contexts
+        for ti, ctx_idx in enumerate(p1_ctx_indices):
+            if p1_all_scores[ti] > -1e18:
+                ctx_p1_hit[ctx_idx] = True
+        p2_grid_indices, p2_part_ffts = [], []
+        p2_heights, p2_widths = [], []
+        p2_bin_indices, p2_shapes = [], []
+        p2_bin_states, p2_rotations = [], []
+        p2_ctx_indices, p2_enclosure_lengths = [], []
+        p2_bin_areas, p2_part_areas = [], []
+        p2_n_tests = 0
+        for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
+            if ctx_p1_hit[ctx_idx]:
+                continue
+            first_valid = ctx_first_valid_bin[ctx_idx]
+            for bin_idx, bin_state in enumerate(ctx.open_bins):
+                if bin_idx == first_valid:
+                    continue
                 if bin_state.area + part_data.area > ctx.bin_area:
                     continue
                 for rot in range(part_data.nrot):
@@ -169,26 +227,38 @@ class TimedEvaluator(WaveBatchEvaluator):
                     if shape[0]>H or shape[1]>W: continue
                     if check_vacancy_fit_simple(bin_state.vacancy_vector,
                                                part_data.densities[rot]):
-                        test_grid_indices.append(bin_state.grid_state_idx)
-                        test_part_ffts.append(mach_part_data.ffts[rot])
-                        test_heights.append(shape[0]); test_widths.append(shape[1])
-                        test_bin_indices.append(bin_idx); test_shapes.append(shape)
-                        test_bin_states.append(bin_state); test_rotations.append(rot)
-                        test_ctx_indices.append(ctx_idx)
-                        test_enclosure_lengths.append(bin_state.enclosure_box_length)
-                        test_bin_areas.append(bin_state.area)
-                        test_part_areas.append(part_data.area)
-                        n_tests += 1
-        self._n_tests += n_tests
-        self._pt[3] += self._s() - t
+                        p2_grid_indices.append(bin_state.grid_state_idx)
+                        p2_part_ffts.append(mach_part_data.ffts[rot])
+                        p2_heights.append(shape[0]); p2_widths.append(shape[1])
+                        p2_bin_indices.append(bin_idx); p2_shapes.append(shape)
+                        p2_bin_states.append(bin_state); p2_rotations.append(rot)
+                        p2_ctx_indices.append(ctx_idx)
+                        p2_enclosure_lengths.append(bin_state.enclosure_box_length)
+                        p2_bin_areas.append(bin_state.area)
+                        p2_part_areas.append(part_data.area)
+                        p2_n_tests += 1
+        self._n_tests += p1_n_tests + p2_n_tests
+        self._pt['3b'] += self._s() - t
 
-        # ── Phase 4 ──────────────────────────────────────────────────────────
+        # ── Phase 4b  IFFT for Pass 2 ─────────────────────────────────────────
         t = self._s()
-        placement_results, all_scores = self._batch_fft_all_tests(
-            n_tests, test_grid_indices, test_part_ffts, test_heights, test_widths,
-            test_bin_indices, test_enclosure_lengths, test_bin_areas, test_part_areas,
-            grid_ffts, H, W, row_idx, col_idx, neg_inf) if n_tests else ([], np.array([], dtype=np.float32))
-        self._pt[4] += self._s() - t
+        if p2_n_tests:
+            p2_placement_results, p2_all_scores = self._batch_fft_all_tests(
+                p2_n_tests, p2_grid_indices, p2_part_ffts, p2_heights, p2_widths,
+                p2_bin_indices, p2_enclosure_lengths, p2_bin_areas, p2_part_areas,
+                grid_ffts, H, W, row_idx, col_idx, neg_inf)
+        else:
+            p2_placement_results, p2_all_scores = [], np.array([], dtype=np.float32)
+        self._pt['4b'] += self._s() - t
+
+        # Merge for Phase 5
+        test_ctx_indices  = p1_ctx_indices  + p2_ctx_indices
+        test_bin_states   = p1_bin_states   + p2_bin_states
+        test_rotations    = p1_rotations    + p2_rotations
+        test_shapes       = p1_shapes       + p2_shapes
+        placement_results = p1_placement_results + p2_placement_results
+        all_scores        = (np.concatenate([p1_all_scores, p2_all_scores])
+                             if p2_n_tests else p1_all_scores)
 
         # ── Phase 5 ──────────────────────────────────────────────────────────
         t = self._s()
@@ -254,25 +324,34 @@ class TimedEvaluator(WaveBatchEvaluator):
 
     def report(self):
         total = sum(self._pt.values())
-        names = {1:'Phase 1  gather context_info',
-                 2:'Phase 2  batch grid FFTs',
-                 3:'Phase 3  vacancy check + collect',
-                 4:'Phase 4  batch IFFT',
-                 5:'Phase 5  find best placements',
-                 6:'Phase 6  open new bins'}
-        print(f"\n{'='*65}")
+        rows = [
+            (1,    'Phase 1   gather context_info'),
+            (2,    'Phase 2   batch grid FFTs'),
+            ('3a', 'Phase 3a  P1 collect (first valid bin)'),
+            ('4a', 'Phase 4a  P1 IFFT'),
+            ('3b', 'Phase 3b  P2 collect (remaining bins)'),
+            ('4b', 'Phase 4b  P2 IFFT'),
+            (5,    'Phase 5   find best placements'),
+            (6,    'Phase 6   open new bins'),
+        ]
+        t34a = self._pt['3a'] + self._pt['4a']
+        t34b = self._pt['3b'] + self._pt['4b']
+        print(f"\n{'='*70}")
         print(f"PHASE BREAKDOWN  ({self._n_waves} waves, {NUM_INDIVIDUALS} individuals)")
-        print(f"{'='*65}")
-        print(f"{'Phase':<36} {'Time(s)':>8} {'%':>7} {'ms/wave':>9}")
-        print(f"{'-'*65}")
-        for i in range(1,7):
-            t = self._pt[i]
-            print(f"{names[i]:<36} {t:>8.3f} {100*t/total:>6.1f}% "
+        print(f"{'='*70}")
+        print(f"{'Phase':<41} {'Time(s)':>8} {'%':>7} {'ms/wave':>9}")
+        print(f"{'-'*70}")
+        for key, name in rows:
+            t = self._pt[key]
+            print(f"{name:<41} {t:>8.3f} {100*t/total:>6.1f}% "
                   f"{1000*t/max(self._n_waves,1):>8.2f}ms")
-        print(f"{'-'*65}")
-        print(f"{'TOTAL (wave fn only)':<36} {total:>8.3f} {'100.0%':>7}")
+        print(f"{'-'*70}")
+        print(f"  {'P1 subtotal (3a+4a)':<39} {t34a:>8.3f} {100*t34a/total:>6.1f}%")
+        print(f"  {'P2 subtotal (3b+4b)':<39} {t34b:>8.3f} {100*t34b/total:>6.1f}%")
+        print(f"{'-'*70}")
+        print(f"{'TOTAL (wave fn only)':<41} {total:>8.3f} {'100.0%':>7}")
         print(f"\nAvg tests/wave : {self._n_tests/max(self._n_waves,1):.1f}")
-        print(f"{'='*65}")
+        print(f"{'='*70}")
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
