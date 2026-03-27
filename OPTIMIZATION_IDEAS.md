@@ -245,7 +245,7 @@ This reuses the same pattern as Phase 5's batched updates.
 **Where to change:**
 - `wave_batch_evaluator.py` — Move lines ~128-131 from `_process_machine_batch` to `__init__`. Zero out at the start of each call instead of re-allocating.
 
-**Reality check:** PyTorch's CUDA caching allocator reuses memory blocks after the first generation, so re-allocation after gen 1 is effectively just a cache lookup. Savings are marginal (~0.01s). Not harmful, but don't expect measurable improvement.
+**Reality check:** PyTorch's CUDA caching allocator reuses memory blocks after the first generation, so re-allocation after gen 1 is effectively just a cache lookup. Savings are marginal (~0.01s). Not harmful, but don't expect measurable improvements.
 
 ---
 
