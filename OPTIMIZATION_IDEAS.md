@@ -76,7 +76,7 @@ Then in the chunk loop, use `buf[:chunk_n].copy_(data)` instead of creating new 
 
 ## Idea 4: Fused post-IFFT CUDA kernel
 
-**Target:** Phase 4 (66.1%)
+**Target:** Phase 4 (now 43.9% after Idea 2)
 **Expected savings:** 0.15-0.3s/gen
 **Effort:** High
 **Priority:** MEDIUM
@@ -158,7 +158,7 @@ This eliminates the `bin_state.grid` array entirely. The GPU→CPU transfer of a
 
 ## Idea 7: Batch Phase 3 vacancy checks
 
-**Target:** Phase 3 (7.6%)
+**Target:** Phase 3a + 3b (8.5% + 4.8% = 13.3% combined)
 **Expected savings:** 0.05-0.1s/gen
 **Effort:** Medium
 **Priority:** LOW
@@ -184,7 +184,7 @@ def batch_vacancy_check(vacancies, densities, vac_offsets, den_offsets, n_checks
 
 **Caveat:** The vacancy vectors are different lengths per bin (all are `H=300` but that's the same for all bins on a machine). The density arrays vary by part and rotation. Pre-packing into contiguous arrays has overhead. This is worth it only if the Python-level per-call overhead of Numba is significant vs the actual computation.
 
-**Math check:** Phase 3 total is 1.42s over 5 gens with ~3750 calls/wave x 360 waves = ~1.35M calls. That's ~1us/call. The Numba compute itself (scanning a 300-element array) is most of that time — Python call overhead is a small fraction. `prange` thread-pool overhead for individually-fast calls may not help. **Skip unless Phase 3 grows in relative share after other optimizations.**
+**Math check:** After Idea 2, Phase 3a+3b total is ~1.67s over 5 gens (357 waves). Phase 3 is now 13.3% of total — a meaningful share. With ~1038 tests/wave and vacancy checks being ~1µs/call, the Numba compute itself (scanning a 300-element array) dominates; Python call overhead is a small fraction. `prange` thread-pool overhead for individually-fast calls may not help. Worth revisiting now that Phase 3 share has grown relative to Phase 4.
 
 ---
 
@@ -228,10 +228,10 @@ First part always goes at bottom-left with `best_rotation` — no FFT needed, so
 2. ~~**Idea 5**~~ (`torch.compile`) — **implemented, −0.26s/gen (−7%), committed**
 3. ~~**Idea 8**~~ (batch Phase 6) — **implemented, −0.22s/gen (−6%), committed**
 4. ~~**Idea 6**~~ (eliminate CPU grid) — **tested, severe regression (+137% Phase 5), reverted**
-5. **Idea 2** (bin-0-first) — worth trying with adaptive toggle, measure carefully
+5. ~~**Idea 2**~~ (first-valid-bin early exit) — **implemented, −1.03s/gen (−31%), committed**
 6. ~~**Idea 4**~~ (fused CUDA kernel) — superseded by Idea 5
 7. **Idea 9** (pre-allocate grid_states) — negligible due to CUDA caching allocator, skip unless touching that code anyway
-8. **Idea 7** (batch vacancy) — math doesn't strongly support it, skip unless Phase 3 share grows
+8. **Idea 7** (batch vacancy) — Phase 3 now 13.3% of total after Idea 2, worth revisiting
 9. ~~**Idea 1**~~ (fp16 FFT) — already tested and rejected, skip
 
 **Note:** Idea 1 (fp16) was previously benchmarked and shown to give 0% improvement due to power-of-2 padding requirements in cuFFT. Do not re-implement without first verifying that the cuFFT restriction has been lifted in a newer PyTorch/CUDA version.
