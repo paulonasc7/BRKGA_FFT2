@@ -23,32 +23,34 @@
 
 ---
 
-## Idea 2: Speculative bin-0-first early exit
+## Idea 2: First-valid-bin early exit
 
-**Target:** Phase 4 (66.1%)
+**Target:** Phase 4 (58.9%)
 **Expected savings:** 0.3-0.8s/gen (instance-dependent, likely on the optimistic end)
 **Effort:** Medium
-**Priority:** MEDIUM (deprioritized below Ideas 3 and 5 due to two-sync-point overhead risk)
+**Priority:** MEDIUM
 
-**What:** Currently all (context x bin x rotation) tests are batched into one IFFT call. But the algorithm is first-fit: if bin 0 has a valid placement, bins 1+ are irrelevant for that context. By processing bin 0 first, we can skip IFFT work for contexts that succeed.
+**What:** Currently all (context × bin × rotation) tests are batched into one IFFT call. But the scoring function encodes `bin_idx` as the most significant component (`-bin_idx * 1e9`), so the lowest-indexed bin with a valid placement always wins. If we evaluate that bin first and find a hit, all higher-indexed bins are irrelevant for that context.
 
 **How:** Split `_process_wave_true_batch` Phase 3+4 into two passes:
 
-1. **Pass 1 — bin 0 only:** Collect tests only for `bin_idx == 0`. Run `_batch_fft_all_tests` on those. Identify which contexts got a valid placement.
-2. **Pass 2 — remaining bins:** For contexts that failed bin 0, collect tests for bins 1+. Run `_batch_fft_all_tests` again.
+1. **Pass 1 — first valid bin per context:** For each context, find the first open bin that passes the area check AND passes `check_vacancy_fit_simple` for at least one rotation. Collect tests for that bin only. Run `_batch_fft_all_tests`. Identify which contexts got a valid geometric placement.
+2. **Pass 2 — remaining bins:** For contexts where Pass 1 found no valid placement, collect tests for all their remaining open bins. Run `_batch_fft_all_tests` again.
 
 Phase 5 then merges results from both passes.
 
+**Why "first valid bin", not "bin 0":** Different contexts may have a different first valid bin — e.g. context A's bin 0 might fail the area check while context B's bin 0 passes. Pass 1 should use the first bin that actually produces tests for each context, not always `open_bins[0]`. This ensures Pass 1 is as small as possible (exactly one bin per context) and never wastes IFFT work on bins that are guaranteed to produce zero tests.
+
+**Early-exit correctness:** Since the first valid bin has the lowest `bin_idx` among all feasible bins for a context, any valid geometric placement found in Pass 1 is guaranteed to be globally optimal. Pass 1 results are final — no need to evaluate higher-indexed bins for those contexts.
+
 **Where to change:**
-- `wave_batch_evaluator.py` — `_process_wave_true_batch()`, Phase 3 (lines ~258-300) and Phase 4 (lines ~303-309). The Phase 3 collection loop already iterates `for bin_idx, bin_state in enumerate(ctx.open_bins)` — split this into two collection passes.
+- `wave_batch_evaluator.py` — `_process_wave_true_batch()`, Phase 3 (lines ~258-300) and Phase 4 (lines ~303-309). Restructure the Phase 3 collection loop: for each context, identify the first valid bin and add its tests to `pass1_tests`; add all remaining bins' tests to `pass2_tests`.
 
-**Key detail:** The scoring already encodes `bin_idx` as the most significant component (`-bin_idx * 1e9`), so bin 0 always wins over bin 1+ when valid. This means pass 1 results are final for any context that got a hit — no need to re-evaluate.
+**When this helps most:** When most contexts can place into their first valid bin (early waves, lightly packed bins). Pass 2 then runs on a much smaller set of tests.
 
-**When this helps most:** When bins are relatively empty (early waves) and most parts fit in bin 0. As bins fill up, more contexts need bin 1+, and the savings decrease. The first ~50% of waves typically have high bin-0 success rates.
+**When this hurts:** If most contexts fail their first valid bin geometrically (heavily packed instances), Pass 2 is nearly as large as the original single pass, but you've paid for two `_batch_fft_all_tests` calls (two GPU syncs, two CPU transfers). Consider making this adaptive: track first-valid-bin success rate per wave and fall back to single-pass when it drops below ~50%.
 
-**When this hurts:** If almost all contexts need bin 1+ anyway (heavily packed instances), you pay the overhead of two `_batch_fft_all_tests` calls (two GPU syncs, two CPU transfers, two sets of tensor allocations) instead of one. Consider making this adaptive: if the previous wave had >80% bin-0 success, use two-pass; otherwise use single-pass.
-
-**Important risk:** Late waves (where bins are fuller and Phase 4 time is highest) are exactly the waves where bin-0 success rate is lowest — so the savings are smallest when they'd matter most.
+**Important risk:** Late waves (bins fuller, Phase 4 time highest) are exactly when first-valid-bin success rate is lowest — savings are smallest when they'd matter most.
 
 ---
 
