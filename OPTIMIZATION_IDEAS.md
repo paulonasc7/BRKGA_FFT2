@@ -12,37 +12,22 @@
 
 ---
 
-## Idea 1: Half-precision FFT (fp16)
+## ~~Idea 1: Half-precision FFT (fp16)~~ — PREVIOUSLY TESTED, REJECTED
 
-**Target:** Phase 4 (66.1%)
-**Expected savings:** 0.3-0.5s/gen
-**Effort:** Medium
-**Priority:** HIGH
+**Status:** Already tested and rejected. See `PROJECT_DEEP_ANALYSIS.md` line 478 and `FFT_OPTIMIZATION_OPTIONS.md` line 142.
 
-**What:** The grids are binary (0/1) and the IFFT result is rounded to check for exact zeros. float16 can represent integers exactly up to 2048, which is far more than the max overlap value in a 300x250 grid with small parts. Switching from float32 to float16 halves GPU memory bandwidth — the main bottleneck for FFT on modern GPUs.
+**Why it doesn't work:** cuFFT only supports fp16 for power-of-2 dimensions. Our grids are 300x250, which would need padding to 512x256. The increased FFT size cancels out the bandwidth savings from halved precision. Benchmarked result: 0% improvement.
 
-**Where to change:**
-- `wave_batch_evaluator.py` — `_batch_fft_all_tests()`:
-  - Line ~430: `torch.stack(test_part_ffts[...])` — ensure part FFTs are stored as complex32 (half-precision complex = `torch.complex32`)
-  - Line ~433: `torch.fft.irfft2(batch_grid_ffts * batch_part_ffts, s=(H, W))` — this is the hot call
-  - Line ~253: `torch.fft.rfft2(batch_grids)` in Phase 2 should also output fp16
-- `collision_backend.py` — `prepare_part_fft()` (line ~75-83): Store part FFTs as complex32 instead of complex64
-- `wave_batch_evaluator.py` — `_process_machine_batch()`:
-  - Line ~130: `grid_ffts` tensor allocation should use `torch.complex32` instead of `torch.complex64`
-  - Line ~129: `grid_states` can stay float32 (used by the CUDA kernel) OR also go float16
-
-**Validation:** After implementing, compare placement results on 1-2 generations against the float32 version. The results should be bitwise identical since the rounding to 0/nonzero is the only check that matters.
-
-**Caveat:** `torch.complex32` support in cuFFT may require PyTorch >= 2.0. Check with a quick test: `torch.fft.rfft2(torch.zeros(4,4, dtype=torch.float16, device='cuda'))`. If unsupported, an alternative is to keep FFT in float32 but use fp16 for the post-IFFT masking/scoring operations (smaller win but still helps).
+**Possible revisit:** Only if a future PyTorch version adds non-power-of-2 fp16 cuFFT support, or if we find a way to make power-of-2 dimensions work naturally (e.g., if the problem instances change to have power-of-2 bin dimensions). Otherwise, skip.
 
 ---
 
 ## Idea 2: Speculative bin-0-first early exit
 
 **Target:** Phase 4 (66.1%)
-**Expected savings:** 0.3-0.8s/gen (instance-dependent)
+**Expected savings:** 0.3-0.8s/gen (instance-dependent, likely on the optimistic end)
 **Effort:** Medium
-**Priority:** HIGH
+**Priority:** MEDIUM (deprioritized below Ideas 3 and 5 due to two-sync-point overhead risk)
 
 **What:** Currently all (context x bin x rotation) tests are batched into one IFFT call. But the algorithm is first-fit: if bin 0 has a valid placement, bins 1+ are irrelevant for that context. By processing bin 0 first, we can skip IFFT work for contexts that succeed.
 
@@ -60,7 +45,9 @@ Phase 5 then merges results from both passes.
 
 **When this helps most:** When bins are relatively empty (early waves) and most parts fit in bin 0. As bins fill up, more contexts need bin 1+, and the savings decrease. The first ~50% of waves typically have high bin-0 success rates.
 
-**When this hurts:** If almost all contexts need bin 1+ anyway (heavily packed instances), you pay the overhead of two `_batch_fft_all_tests` calls instead of one. Consider making this adaptive: if the previous wave had >80% bin-0 success, use two-pass; otherwise use single-pass.
+**When this hurts:** If almost all contexts need bin 1+ anyway (heavily packed instances), you pay the overhead of two `_batch_fft_all_tests` calls (two GPU syncs, two CPU transfers, two sets of tensor allocations) instead of one. Consider making this adaptive: if the previous wave had >80% bin-0 success, use two-pass; otherwise use single-pass.
+
+**Important risk:** Late waves (where bins are fuller and Phase 4 time is highest) are exactly the waves where bin-0 success rate is lowest — so the savings are smallest when they'd matter most.
 
 ---
 
@@ -90,6 +77,8 @@ self._grid_idx_buf = torch.zeros(CHUNK_SIZE, dtype=torch.long, device=device)
 Then in the chunk loop, use `buf[:chunk_n].copy_(data)` instead of creating new tensors.
 
 **Also:** The `results_cpu` transfer (line ~460-461: `.cpu().numpy()`) creates a new CPU tensor each time. Pre-allocate a pinned-memory CPU buffer and use `.copy_()` with `non_blocking=True`.
+
+**Note on `torch.stack`:** Stacking a Python list of tensors is already somewhat optimized in PyTorch. The bigger win is likely the index tensors (`grid_indices`, `heights`, `widths`) which go through `torch.tensor(python_list)` — that's a CPU→GPU copy with implicit sync.
 
 ---
 
@@ -154,6 +143,10 @@ def _post_ifft_score(overlap_batch, part_heights, part_widths, row_idx, col_idx,
 
 **Caveat:** First call triggers compilation (~30s). Use `mode="reduce-overhead"` for CUDA graph capture. Test that results are identical. If `torch.compile` doesn't help, the manual CUDA kernel (Idea 4) is the fallback.
 
+**Dynamic shapes:** The last chunk is often smaller than `CHUNK_SIZE`, which would trigger a recompilation. Pad the last chunk to full `CHUNK_SIZE` and mask out padding to ensure a single compiled graph.
+
+**PyTorch version:** Update to PyTorch >= 2.4 on Paperspace for best `torch.compile` stability. 2.1.1 had rough edges.
+
 ---
 
 ## Idea 6: Eliminate CPU grid mirror
@@ -184,6 +177,8 @@ This eliminates the `bin_state.grid` array entirely. The GPU→CPU transfer of a
 
 **Risk:** The GPU grid is float32 and accumulates via addition. After many parts, values could be 2, 3, etc. The vacancy check only cares about zero vs nonzero, so `rows_cpu > 0` gives the correct binary grid for vacancy computation. However, `update_vacancy_vector_rows` currently counts consecutive zeros — it needs the grid values to be 0 where empty. As long as the GPU grid only ever gets part matrices added (which are 0/1), nonzero means occupied, which is correct.
 
+**Sync hazard:** The CUDA batch kernel updates GPU grids asynchronously. If you immediately read `grid_states[idx, y_start:row+1, :].cpu()`, you'll race with the kernel. You need a `torch.cuda.synchronize()` before the CPU transfer, which partially negates the savings.
+
 ---
 
 ## Idea 7: Batch Phase 3 vacancy checks
@@ -213,6 +208,8 @@ def batch_vacancy_check(vacancies, densities, vac_offsets, den_offsets, n_checks
 - `wave_batch_evaluator.py` — Phase 3 (lines ~275-300): collect all vacancy/density pairs first, call batch check, then build test arrays only for those that passed
 
 **Caveat:** The vacancy vectors are different lengths per bin (all are `H=300` but that's the same for all bins on a machine). The density arrays vary by part and rotation. Pre-packing into contiguous arrays has overhead. This is worth it only if the Python-level per-call overhead of Numba is significant vs the actual computation.
+
+**Math check:** Phase 3 total is 1.42s over 5 gens with ~3750 calls/wave x 360 waves = ~1.35M calls. That's ~1us/call. The Numba compute itself (scanning a 300-element array) is most of that time — Python call overhead is a small fraction. `prange` thread-pool overhead for individually-fast calls may not help. **Skip unless Phase 3 grows in relative share after other optimizations.**
 
 ---
 
@@ -248,19 +245,23 @@ This reuses the same pattern as Phase 5's batched updates.
 **Where to change:**
 - `wave_batch_evaluator.py` — Move lines ~128-131 from `_process_machine_batch` to `__init__`. Zero out at the start of each call instead of re-allocating.
 
+**Reality check:** PyTorch's CUDA caching allocator reuses memory blocks after the first generation, so re-allocation after gen 1 is effectively just a cache lookup. Savings are marginal (~0.01s). Not harmful, but don't expect measurable improvement.
+
 ---
 
 ## Implementation Order
 
-1. **Idea 3** (pre-allocate chunk tensors) — easiest, safest, do first
-2. **Idea 5** (`torch.compile`) — low effort, test if it works
-3. **Idea 1** (fp16 FFT) — biggest potential win, validate carefully
-4. **Idea 2** (bin-0-first) — significant win, moderate refactor
-5. **Idea 9** (pre-allocate grid_states) — trivial
-6. **Idea 8** (batch Phase 6) — straightforward reuse of existing kernel
-7. **Idea 6** (eliminate CPU grid) — medium refactor, modest win
-8. **Idea 7** (batch vacancy) — only if Phase 3 becomes a bottleneck after other optimizations
-9. **Idea 4** (fused CUDA kernel) — only if `torch.compile` doesn't deliver
+1. **Idea 3** (pre-allocate chunk tensors) — guaranteed win, low effort, do first
+2. **Idea 5** (`torch.compile`) — low effort, update PyTorch to >= 2.4 first, test if it fuses post-IFFT ops
+3. **Idea 2** (bin-0-first) — worth trying with adaptive toggle, measure carefully
+4. **Idea 8** (batch Phase 6) — straightforward reuse of existing CUDA kernel
+5. **Idea 4** (fused CUDA kernel) — only if Idea 5 fails to deliver
+6. **Idea 6** (eliminate CPU grid) — modest win, watch for sync hazard
+7. **Idea 9** (pre-allocate grid_states) — negligible due to CUDA caching allocator, skip unless touching that code anyway
+8. **Idea 7** (batch vacancy) — math doesn't strongly support it, skip unless Phase 3 share grows
+9. ~~**Idea 1**~~ (fp16 FFT) — already tested and rejected, skip
+
+**Note:** Idea 1 (fp16) was previously benchmarked and shown to give 0% improvement due to power-of-2 padding requirements in cuFFT. Do not re-implement without first verifying that the cuFFT restriction has been lifted in a newer PyTorch/CUDA version.
 
 After each change, run correctness checks as well as `profile_phases.py` on the remote GPU to measure impact:
 ```bash
