@@ -162,8 +162,10 @@ class WaveBatchEvaluator:
         sequences = self._decode_sequences(chromosomes, machine_idx)
         contexts = self._init_batch_contexts(sequences, machine_idx, num_solutions, mach_data)
         
-        # Allocate GPU tensors for grid states
-        max_bins_per_sol = 10
+        # Allocate GPU tensors for grid states.
+        # max_bins_per_sol must cover the worst case (all nbParts on one machine,
+        # packed at ~3 parts/bin).  10 was enough for P50 but not for P75+.
+        max_bins_per_sol = max(10, self.nbParts // 3)
         max_total_bins = num_solutions * max_bins_per_sol
         grid_states = torch.zeros((max_total_bins, H, W), dtype=torch.float32, device=self.device)
         grid_ffts = torch.zeros((max_total_bins, H, W // 2 + 1), dtype=torch.complex64, device=self.device)
@@ -217,7 +219,7 @@ class WaveBatchEvaluator:
     
     def _init_batch_contexts(self, sequences, machine_idx, num_solutions, mach_data):
         contexts = []
-        max_bins_per_sol = 10
+        max_bins_per_sol = max(10, self.nbParts // 3)
         
         for sol_idx in range(num_solutions):
             ctx = BatchPlacementContext(
