@@ -158,14 +158,33 @@ class WaveBatchEvaluator:
     def _process_machine_batch(self, chromosomes, machine_idx, num_solutions):
         mach_data = self.machines[machine_idx]
         H, W = mach_data.bin_length, mach_data.bin_width
-        
+
+        # When machine dimensions change between calls the caching allocator cannot
+        # reuse the previous machine's blocks (different shape), so they pile up.
+        # Only empty the cache in that case; same-dimension machines reuse blocks
+        # for free and don't need the OS round-trip cost of empty_cache().
+        bytes_per_bin = H * W * 4 + H * (W // 2 + 1) * 8  # float32 + complex64
+        if torch.cuda.is_available() and getattr(self, '_prev_machine_dims', None) != (H, W):
+            torch.cuda.empty_cache()
+        self._prev_machine_dims = (H, W)
+
+        # max_bins_per_sol: start from the empirical lower bound (nbParts // 3 covers
+        # ~3 parts/bin worst case), then cap so grid_states + grid_ffts together use
+        # at most 50% of total GPU VRAM.  The remaining 50% covers IFFT intermediates
+        # (~2 × CHUNK_SIZE × bytes_per_bin), part FFTs, and PyTorch runtime overhead.
+        # Minimum of 5; if even that doesn't fit the instance is too large for this GPU.
+        needed_bins = max(10, self.nbParts // 3)
+        if torch.cuda.is_available():
+            total_vram = torch.cuda.get_device_properties(self.device).total_memory
+            vram_cap = max(5, int(total_vram * 0.50) // (bytes_per_bin * num_solutions))
+        else:
+            vram_cap = needed_bins
+        max_bins_per_sol = min(needed_bins, vram_cap)
+
         sequences = self._decode_sequences(chromosomes, machine_idx)
-        contexts = self._init_batch_contexts(sequences, machine_idx, num_solutions, mach_data)
-        
-        # Allocate GPU tensors for grid states.
-        # max_bins_per_sol must cover the worst case (all nbParts on one machine,
-        # packed at ~3 parts/bin).  10 was enough for P50 but not for P75+.
-        max_bins_per_sol = max(10, self.nbParts // 3)
+        contexts = self._init_batch_contexts(sequences, machine_idx, num_solutions,
+                                             mach_data, max_bins_per_sol)
+
         max_total_bins = num_solutions * max_bins_per_sol
         grid_states = torch.zeros((max_total_bins, H, W), dtype=torch.float32, device=self.device)
         grid_ffts = torch.zeros((max_total_bins, H, W // 2 + 1), dtype=torch.complex64, device=self.device)
@@ -217,9 +236,9 @@ class WaveBatchEvaluator:
         
         return sequences
     
-    def _init_batch_contexts(self, sequences, machine_idx, num_solutions, mach_data):
+    def _init_batch_contexts(self, sequences, machine_idx, num_solutions, mach_data,
+                             max_bins_per_sol):
         contexts = []
-        max_bins_per_sol = max(10, self.nbParts // 3)
         
         for sol_idx in range(num_solutions):
             ctx = BatchPlacementContext(
