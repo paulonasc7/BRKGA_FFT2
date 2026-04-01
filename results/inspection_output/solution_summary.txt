@@ -1,0 +1,204 @@
+Instance: P50M2-0
+Chromosome index in population: 462
+Makespan (wave_batch, batch run):  448166.8336s
+Makespan (wave_batch, single rerun): 448166.8336s
+Makespan (placementProcedure):       448166.8336s
+wave_batch match (batch vs single): YES
+wave_batch vs placementProcedure:    MATCH (diff=0.000000s)
+
+============================================================
+WAVE_BATCH DECODER
+============================================================
+
+Machine 0  (bin size: 250×250, setup_time: 3600.0s)
+Bins used: 5
+Part processing order: [50, 0, 55, 23, 56, 37, 97, 33, 78, 12, 38, 55, 80, 81, 67, 17, 66, 85, 57, 97, 37, 90, 65, 7]
+
+  Bin 0:
+    Parts (placement order): [50, 0, 37, 33, 78, 12, 38, 80, 81, 67, 66, 37, 7]
+    Number of parts : 13
+    Area used       : 41383.9 / 62500 (66.2%)
+    proc_time       : 105423.34s
+    proc_time_height: 28179.40s
+    Makespan contrib: 137202.73s
+    Grid file       : wb_bin_m0_b0.txt
+
+  Bin 1:
+    Parts (placement order): [55, 23, 85, 65]
+    Number of parts : 4
+    Area used       : 14659.8 / 62500 (23.5%)
+    proc_time       : 69109.87s
+    proc_time_height: 30136.93s
+    Makespan contrib: 102846.80s
+    Grid file       : wb_bin_m0_b1.txt
+
+  Bin 2:
+    Parts (placement order): [56, 97, 17]
+    Number of parts : 3
+    Area used       : 19160.1 / 62500 (30.7%)
+    proc_time       : 39398.24s
+    proc_time_height: 31752.00s
+    Makespan contrib: 74750.24s
+    Grid file       : wb_bin_m0_b2.txt
+
+  Bin 3:
+    Parts (placement order): [55, 57, 97]
+    Number of parts : 3
+    Area used       : 18686.2 / 62500 (29.9%)
+    proc_time       : 72617.48s
+    proc_time_height: 30136.93s
+    Makespan contrib: 106354.41s
+    Grid file       : wb_bin_m0_b3.txt
+
+  Bin 4:
+    Parts (placement order): [90]
+    Number of parts : 1
+    Area used       : 10643.1 / 62500 (17.0%)
+    proc_time       : 9810.94s
+    proc_time_height: 13601.70s
+    Makespan contrib: 27012.64s
+    Grid file       : wb_bin_m0_b4.txt
+
+  Machine 0 total makespan: 448166.8336s
+
+Machine 1  (bin size: 300×300, setup_time: 4320.0s)
+Bins used: 3
+Part processing order: [6, 12, 19, 23, 21, 85, 76, 42, 91, 78, 45, 87, 25, 11, 81, 97, 78, 87, 84, 11, 40, 46, 40, 38, 37, 53]
+
+  Bin 0:
+    Parts (placement order): [6, 12, 19, 23, 85, 76, 42, 91, 78, 45, 87, 25, 11, 81, 78, 87, 84, 11, 40, 46, 40, 38, 37]
+    Number of parts : 23
+    Area used       : 44007.7 / 90000 (48.9%)
+    proc_time       : 50752.37s
+    proc_time_height: 31330.53s
+    Makespan contrib: 86402.90s
+    Grid file       : wb_bin_m1_b0.txt
+
+  Bin 1:
+    Parts (placement order): [21, 53]
+    Number of parts : 2
+    Area used       : 40590.0 / 90000 (45.1%)
+    proc_time       : 15330.59s
+    proc_time_height: 3240.00s
+    Makespan contrib: 22890.59s
+    Grid file       : wb_bin_m1_b1.txt
+
+  Bin 2:
+    Parts (placement order): [97]
+    Number of parts : 1
+    Area used       : 6596.7 / 90000 (7.3%)
+    proc_time       : 3000.81s
+    proc_time_height: 6164.83s
+    Makespan contrib: 13485.64s
+    Grid file       : wb_bin_m1_b2.txt
+
+  Machine 1 total makespan: 122779.1289s
+
+Overall makespan (worst machine): 448166.8336s
+
+============================================================
+PLACEMENTPROCEDURE DECODER
+============================================================
+
+Machine 0  (bin size: 250×250, setup_time: 3600.0s)
+Bins used: 5
+
+  Bin 0:
+    Parts (placement order): [50, 0, 37, 33, 78, 12, 38, 80, 81, 67, 66, 37, 7]
+    Number of parts : 13
+    Area used       : 41383.9 / 62500 (66.2%)
+    proc_time       : 105423.34s
+    proc_time_height: 28179.40s
+    Makespan contrib: 137202.73s
+    Grid file       : pp_bin_m0_b0.txt
+
+  Bin 1:
+    Parts (placement order): [55, 23, 85, 65]
+    Number of parts : 4
+    Area used       : 14659.8 / 62500 (23.5%)
+    proc_time       : 69109.87s
+    proc_time_height: 30136.93s
+    Makespan contrib: 102846.80s
+    Grid file       : pp_bin_m0_b1.txt
+
+  Bin 2:
+    Parts (placement order): [56, 97, 17]
+    Number of parts : 3
+    Area used       : 19160.1 / 62500 (30.7%)
+    proc_time       : 39398.24s
+    proc_time_height: 31752.00s
+    Makespan contrib: 74750.24s
+    Grid file       : pp_bin_m0_b2.txt
+
+  Bin 3:
+    Parts (placement order): [55, 57, 97]
+    Number of parts : 3
+    Area used       : 18686.2 / 62500 (29.9%)
+    proc_time       : 72617.48s
+    proc_time_height: 30136.93s
+    Makespan contrib: 106354.41s
+    Grid file       : pp_bin_m0_b3.txt
+
+  Bin 4:
+    Parts (placement order): [90]
+    Number of parts : 1
+    Area used       : 10643.1 / 62500 (17.0%)
+    proc_time       : 9810.94s
+    proc_time_height: 13601.70s
+    Makespan contrib: 27012.64s
+    Grid file       : pp_bin_m0_b4.txt
+
+  Machine 0 total makespan: 448166.8336s
+
+Machine 1  (bin size: 300×300, setup_time: 4320.0s)
+Bins used: 3
+
+  Bin 0:
+    Parts (placement order): [6, 12, 19, 23, 85, 76, 42, 91, 78, 45, 87, 25, 11, 81, 78, 87, 84, 11, 40, 46, 40, 38, 37]
+    Number of parts : 23
+    Area used       : 44007.7 / 90000 (48.9%)
+    proc_time       : 50752.37s
+    proc_time_height: 31330.53s
+    Makespan contrib: 86402.90s
+    Grid file       : pp_bin_m1_b0.txt
+
+  Bin 1:
+    Parts (placement order): [21, 53]
+    Number of parts : 2
+    Area used       : 40590.0 / 90000 (45.1%)
+    proc_time       : 15330.59s
+    proc_time_height: 3240.00s
+    Makespan contrib: 22890.59s
+    Grid file       : pp_bin_m1_b1.txt
+
+  Bin 2:
+    Parts (placement order): [97]
+    Number of parts : 1
+    Area used       : 6596.7 / 90000 (7.3%)
+    proc_time       : 3000.81s
+    proc_time_height: 6164.83s
+    Makespan contrib: 13485.64s
+    Grid file       : pp_bin_m1_b2.txt
+
+  Machine 1 total makespan: 122779.1289s
+
+Overall makespan (worst machine): 448166.8336s
+
+============================================================
+BIN-BY-BIN COMPARISON
+============================================================
+
+Machine 0:
+  wave_batch bins: 5   placementProcedure bins: 5
+  Bin 0: WB=[50, 0, 37, 33, 78, 12, 38, 80, 81, 67, 66, 37, 7]  PP=[50, 0, 37, 33, 78, 12, 38, 80, 81, 67, 66, 37, 7]  MATCH
+  Bin 1: WB=[55, 23, 85, 65]  PP=[55, 23, 85, 65]  MATCH
+  Bin 2: WB=[56, 97, 17]  PP=[56, 97, 17]  MATCH
+  Bin 3: WB=[55, 57, 97]  PP=[55, 57, 97]  MATCH
+  Bin 4: WB=[90]  PP=[90]  MATCH
+
+Machine 1:
+  wave_batch bins: 3   placementProcedure bins: 3
+  Bin 0: WB=[6, 12, 19, 23, 85, 76, 42, 91, 78, 45, 87, 25, 11, 81, 78, 87, 84, 11, 40, 46, 40, 38, 37]  PP=[6, 12, 19, 23, 85, 76, 42, 91, 78, 45, 87, 25, 11, 81, 78, 87, 84, 11, 40, 46, 40, 38, 37]  MATCH
+  Bin 1: WB=[21, 53]  PP=[21, 53]  MATCH
+  Bin 2: WB=[97]  PP=[97]  MATCH
+

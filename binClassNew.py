@@ -125,6 +125,10 @@ class BuildingPlate:
             self.insert(best_pixel[0], best_pixel[1], uint8_matrix, part_shapes[best_rotation], part.area, gpu_tensor=gpu_tensor)
             self.calculate_enclosure_box_length()  # Update box length
 
+            # Store last placement position for diagnostic comparison
+            self._last_placement = (part.id, best_pixel[0], best_pixel[1],
+                                    best_rotation, part_shapes[best_rotation])
+
             self.partsAssigned.append(part.id)
             
             self.processingTime += machPart.proc_time

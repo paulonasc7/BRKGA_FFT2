@@ -192,19 +192,24 @@ class TimedEvaluator(WaveBatchEvaluator):
         # ── Phase 4a  IFFT for Pass 1 ─────────────────────────────────────────
         t = self._s()
         if p1_n_tests:
-            p1_placement_results, p1_all_scores = self._batch_fft_all_tests(
+            p1_placement_results, p1_score_comp = self._batch_fft_all_tests(
                 p1_n_tests, p1_grid_indices, p1_part_ffts, p1_heights, p1_widths,
                 p1_bin_indices, p1_enclosure_lengths, p1_bin_areas, p1_part_areas,
                 grid_ffts, H, W, row_idx, col_idx, neg_inf)
         else:
-            p1_placement_results, p1_all_scores = [], np.array([], dtype=np.float32)
+            _empty_sc = {'bin_indices': np.array([], dtype=np.float64),
+                         'densities': np.array([], dtype=np.float64),
+                         'rows': np.array([], dtype=np.float64),
+                         'cols': np.array([], dtype=np.float64),
+                         'valid': np.array([], dtype=bool)}
+            p1_placement_results, p1_score_comp = [], _empty_sc
         self._pt['4a'] += self._s() - t
 
         # ── Phase 3b  Pass-2 collection (remaining bins for misses) ──────────
         t = self._s()
         ctx_p1_hit = [False] * n_contexts
         for ti, ctx_idx in enumerate(p1_ctx_indices):
-            if p1_all_scores[ti] > -1e18:
+            if p1_placement_results[ti] is not None:
                 ctx_p1_hit[ctx_idx] = True
         p2_grid_indices, p2_part_ffts = [], []
         p2_heights, p2_widths = [], []
@@ -243,12 +248,17 @@ class TimedEvaluator(WaveBatchEvaluator):
         # ── Phase 4b  IFFT for Pass 2 ─────────────────────────────────────────
         t = self._s()
         if p2_n_tests:
-            p2_placement_results, p2_all_scores = self._batch_fft_all_tests(
+            p2_placement_results, p2_score_comp = self._batch_fft_all_tests(
                 p2_n_tests, p2_grid_indices, p2_part_ffts, p2_heights, p2_widths,
                 p2_bin_indices, p2_enclosure_lengths, p2_bin_areas, p2_part_areas,
                 grid_ffts, H, W, row_idx, col_idx, neg_inf)
         else:
-            p2_placement_results, p2_all_scores = [], np.array([], dtype=np.float32)
+            _empty_sc = {'bin_indices': np.array([], dtype=np.float64),
+                         'densities': np.array([], dtype=np.float64),
+                         'rows': np.array([], dtype=np.float64),
+                         'cols': np.array([], dtype=np.float64),
+                         'valid': np.array([], dtype=bool)}
+            p2_placement_results, p2_score_comp = [], _empty_sc
         self._pt['4b'] += self._s() - t
 
         # Merge for Phase 5
@@ -257,18 +267,31 @@ class TimedEvaluator(WaveBatchEvaluator):
         test_rotations    = p1_rotations    + p2_rotations
         test_shapes       = p1_shapes       + p2_shapes
         placement_results = p1_placement_results + p2_placement_results
-        all_scores        = (np.concatenate([p1_all_scores, p2_all_scores])
-                             if p2_n_tests else p1_all_scores)
+        if p2_n_tests:
+            sc_bin_indices = np.concatenate([p1_score_comp['bin_indices'], p2_score_comp['bin_indices']])
+            sc_densities   = np.concatenate([p1_score_comp['densities'],  p2_score_comp['densities']])
+            sc_rows        = np.concatenate([p1_score_comp['rows'],       p2_score_comp['rows']])
+            sc_cols        = np.concatenate([p1_score_comp['cols'],       p2_score_comp['cols']])
+            sc_valid       = np.concatenate([p1_score_comp['valid'],      p2_score_comp['valid']])
+        else:
+            sc_bin_indices = p1_score_comp['bin_indices']
+            sc_densities   = p1_score_comp['densities']
+            sc_rows        = p1_score_comp['rows']
+            sc_cols        = p1_score_comp['cols']
+            sc_valid       = p1_score_comp['valid']
 
         # ── Phase 5 ──────────────────────────────────────────────────────────
         t = self._s()
         n_contexts = len(context_info)
         best_ti_per_ctx = [-1] * n_contexts
-        best_sc_per_ctx = np.full(n_contexts, -np.inf, dtype=np.float32)
+        best_key_per_ctx = [None] * n_contexts
         for ti, ctx_idx in enumerate(test_ctx_indices):
-            sc = all_scores[ti]
-            if sc > best_sc_per_ctx[ctx_idx]:
-                best_sc_per_ctx[ctx_idx] = sc
+            if not sc_valid[ti]:
+                continue
+            key = (-sc_bin_indices[ti], sc_densities[ti], sc_rows[ti], -sc_cols[ti])
+            prev = best_key_per_ctx[ctx_idx]
+            if prev is None or key > prev:
+                best_key_per_ctx[ctx_idx] = key
                 best_ti_per_ctx[ctx_idx] = ti
         contexts_needing_new_bin = []
         _placements = []

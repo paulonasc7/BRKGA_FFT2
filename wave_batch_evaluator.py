@@ -117,6 +117,20 @@ class WaveBatchEvaluator:
         self.machines = problem_data.machines
         self.parts = problem_data.parts
 
+        # Opt-in context collection for inspection (default off — zero overhead on normal runs).
+        # Set _collect_contexts = True before evaluate_batch to populate _last_contexts.
+        self._collect_contexts = False
+        self._last_contexts = {}
+
+        # Debug tracing: set _debug_part_ids to a set of part IDs to trace.
+        # When the current wave processes any of these parts, detailed diagnostics
+        # are printed (vacancy, IFFT results, scoring) for every bin tested.
+        self._debug_part_ids = set()
+
+        # Placement log: when _collect_contexts is True, records every placement
+        # as (part_id, bin_idx, col, row, rot, shape) per machine.
+        self._placement_log = {}  # machine_idx -> list of tuples
+
         # Pre-build flat GPU tensor of all part rotation matrices for the batch kernel.
         # part_update_meta: (part_id, rot) -> (flat_offset, height, width)
         self.flat_parts_gpu = None
@@ -213,8 +227,11 @@ class WaveBatchEvaluator:
                            for b in ctx.open_bins if b.area > 0)
                 makespans[ctx.solution_idx] = total
         
+        if self._collect_contexts:
+            self._last_contexts[machine_idx] = contexts
+
         return makespans
-    
+
     def _decode_sequences(self, chromosomes, machine_idx):
         sequences = []
         for sol_idx in range(len(chromosomes)):
@@ -346,19 +363,38 @@ class WaveBatchEvaluator:
         p1_n_tests = 0
 
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
+            _dbg = part_data.id in self._debug_part_ids
+            if _dbg:
+                print(f"\n[DEBUG] Part {part_data.id} | Machine {ctx.machine_idx} | "
+                      f"Open bins: {len(ctx.open_bins)} | Area: {part_data.area:.1f} | "
+                      f"Shapes: {part_data.shapes[:part_data.nrot]}")
             for bin_idx, bin_state in enumerate(ctx.open_bins):
                 if bin_state.area + part_data.area > ctx.bin_area:
+                    if _dbg:
+                        print(f"  Bin {bin_idx}: SKIP area ({bin_state.area:.1f} + "
+                              f"{part_data.area:.1f} > {ctx.bin_area:.1f})")
                     continue
                 rots_passing = []
                 for rot in range(part_data.nrot):
                     shape = part_data.shapes[rot]
                     if shape[0] > H or shape[1] > W:
+                        if _dbg:
+                            print(f"  Bin {bin_idx} rot {rot}: SKIP dims "
+                                  f"({shape[0]}x{shape[1]} vs {H}x{W})")
                         continue
-                    if check_vacancy_fit_simple(bin_state.vacancy_vector,
-                                               part_data.densities[rot]):
+                    vac_pass = check_vacancy_fit_simple(bin_state.vacancy_vector,
+                                               part_data.densities[rot])
+                    if _dbg:
+                        print(f"  Bin {bin_idx} rot {rot}: vacancy={'PASS' if vac_pass else 'FAIL'} "
+                              f"(shape {shape[0]}x{shape[1]}, "
+                              f"enc_box={bin_state.enclosure_box_length})")
+                    if vac_pass:
                         rots_passing.append((rot, shape))
                 if rots_passing:
                     ctx_first_valid_bin[ctx_idx] = bin_idx
+                    if _dbg:
+                        print(f"  → Pass 1 selects Bin {bin_idx} "
+                              f"({len(rots_passing)} rotations passing)")
                     for rot, shape in rots_passing:
                         p1_grid_indices.append(bin_state.grid_state_idx)
                         p1_part_ffts.append(mach_part_data.ffts[rot])
@@ -374,22 +410,50 @@ class WaveBatchEvaluator:
                         p1_part_areas.append(part_data.area)
                         p1_n_tests += 1
                     break  # only first valid bin goes into Pass 1
+                elif _dbg:
+                    print(f"  Bin {bin_idx}: no rotations pass vacancy")
 
         # ---- Phase 4a: IFFT for Pass 1 ------------------------------------------
         if p1_n_tests:
-            p1_placement_results, p1_all_scores = self._batch_fft_all_tests(
+            p1_placement_results, p1_score_comp = self._batch_fft_all_tests(
                 p1_n_tests, p1_grid_indices, p1_part_ffts, p1_heights, p1_widths,
                 p1_bin_indices, p1_enclosure_lengths, p1_bin_areas, p1_part_areas,
                 grid_ffts, H, W, row_idx, col_idx, neg_inf)
         else:
-            p1_placement_results, p1_all_scores = [], np.array([], dtype=np.float32)
+            _empty_sc = {'bin_indices': np.array([], dtype=np.float64),
+                         'densities': np.array([], dtype=np.float64),
+                         'rows': np.array([], dtype=np.float64),
+                         'cols': np.array([], dtype=np.float64),
+                         'valid': np.array([], dtype=bool)}
+            p1_placement_results, p1_score_comp = [], _empty_sc
 
         # Determine which contexts already have a valid geometric placement from Pass 1.
         # Valid = score strictly above -1e18 (the sentinel for "no zero-overlap position").
         ctx_p1_hit = [False] * n_contexts
         for ti, ctx_idx in enumerate(p1_ctx_indices):
-            if p1_all_scores[ti] > -1e18:
+            if p1_placement_results[ti] is not None:
                 ctx_p1_hit[ctx_idx] = True
+
+        # Debug: report Pass 1 IFFT results for traced parts
+        if self._debug_part_ids:
+            for ti, ctx_idx in enumerate(p1_ctx_indices):
+                _pd = context_info[ctx_idx][1]
+                if _pd.id in self._debug_part_ids:
+                    _sc_info = ""
+                    if p1_score_comp['valid'][ti]:
+                        _sc_info = (f"density={p1_score_comp['densities'][ti]:.4f} "
+                                    f"row={p1_score_comp['rows'][ti]:.0f} "
+                                    f"col={p1_score_comp['cols'][ti]:.0f}")
+                    print(f"[DEBUG] Part {_pd.id} Pass1 test {ti}: "
+                          f"bin={p1_bin_indices[ti]} rot={p1_rotations[ti]} "
+                          f"shape={p1_shapes[ti]} "
+                          f"result={p1_placement_results[ti]} "
+                          f"{_sc_info} "
+                          f"geom={'HIT' if p1_placement_results[ti] is not None else 'MISS'}")
+                    if ctx_p1_hit[ctx_idx]:
+                        print(f"  → Pass 1 HIT for ctx {ctx_idx}")
+                    else:
+                        print(f"  → Pass 1 MISS — will go to Pass 2")
 
         # ---- Pass 2 collection: remaining bins for Pass-1 misses ----------------
         p2_grid_indices      = []
@@ -409,18 +473,31 @@ class WaveBatchEvaluator:
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             if ctx_p1_hit[ctx_idx]:
                 continue  # Pass 1 already found a valid placement
+            _dbg2 = part_data.id in self._debug_part_ids
             first_valid = ctx_first_valid_bin[ctx_idx]  # skip this bin (already tested)
+            if _dbg2:
+                print(f"[DEBUG] Part {part_data.id} Pass2: first_valid={first_valid}, "
+                      f"open_bins={len(ctx.open_bins)}")
             for bin_idx, bin_state in enumerate(ctx.open_bins):
                 if bin_idx == first_valid:
+                    if _dbg2:
+                        print(f"  Bin {bin_idx}: SKIP (already tested in Pass 1)")
                     continue  # already in Pass 1 (and found no geometric fit)
                 if bin_state.area + part_data.area > ctx.bin_area:
+                    if _dbg2:
+                        print(f"  Bin {bin_idx}: SKIP area ({bin_state.area:.1f} + "
+                              f"{part_data.area:.1f} > {ctx.bin_area:.1f})")
                     continue
                 for rot in range(part_data.nrot):
                     shape = part_data.shapes[rot]
                     if shape[0] > H or shape[1] > W:
                         continue
-                    if check_vacancy_fit_simple(bin_state.vacancy_vector,
-                                               part_data.densities[rot]):
+                    vac_pass = check_vacancy_fit_simple(bin_state.vacancy_vector,
+                                               part_data.densities[rot])
+                    if _dbg2:
+                        print(f"  Bin {bin_idx} rot {rot}: vacancy={'PASS' if vac_pass else 'FAIL'} "
+                              f"(shape {shape[0]}x{shape[1]})")
+                    if vac_pass:
                         p2_grid_indices.append(bin_state.grid_state_idx)
                         p2_part_ffts.append(mach_part_data.ffts[rot])
                         p2_heights.append(shape[0])
@@ -435,14 +512,22 @@ class WaveBatchEvaluator:
                         p2_part_areas.append(part_data.area)
                         p2_n_tests += 1
 
+        if self._debug_part_ids and p2_n_tests:
+            print(f"[DEBUG] Pass 2: {p2_n_tests} tests collected")
+
         # ---- Phase 4b: IFFT for Pass 2 ------------------------------------------
         if p2_n_tests:
-            p2_placement_results, p2_all_scores = self._batch_fft_all_tests(
+            p2_placement_results, p2_score_comp = self._batch_fft_all_tests(
                 p2_n_tests, p2_grid_indices, p2_part_ffts, p2_heights, p2_widths,
                 p2_bin_indices, p2_enclosure_lengths, p2_bin_areas, p2_part_areas,
                 grid_ffts, H, W, row_idx, col_idx, neg_inf)
         else:
-            p2_placement_results, p2_all_scores = [], np.array([], dtype=np.float32)
+            _empty_sc = {'bin_indices': np.array([], dtype=np.float64),
+                         'densities': np.array([], dtype=np.float64),
+                         'rows': np.array([], dtype=np.float64),
+                         'cols': np.array([], dtype=np.float64),
+                         'valid': np.array([], dtype=bool)}
+            p2_placement_results, p2_score_comp = [], _empty_sc
 
         # Merge Pass 1 + Pass 2 into flat arrays that Phase 5 consumes unchanged.
         test_ctx_indices  = p1_ctx_indices  + p2_ctx_indices
@@ -450,20 +535,39 @@ class WaveBatchEvaluator:
         test_rotations    = p1_rotations    + p2_rotations
         test_shapes       = p1_shapes       + p2_shapes
         placement_results = p1_placement_results + p2_placement_results
-        all_scores        = (np.concatenate([p1_all_scores, p2_all_scores])
-                             if p2_n_tests else p1_all_scores)
-        
-        # Phase 5: Find best placement per context using GPU-computed scores.
-        # Scores encode the full tie-breaking hierarchy (bin_idx > density > row > col)
-        # so a single linear scan replaces the nested Python comparison loop.
+        # Merge score components
+        if p2_n_tests:
+            sc_bin_indices = np.concatenate([p1_score_comp['bin_indices'], p2_score_comp['bin_indices']])
+            sc_densities   = np.concatenate([p1_score_comp['densities'],  p2_score_comp['densities']])
+            sc_rows        = np.concatenate([p1_score_comp['rows'],       p2_score_comp['rows']])
+            sc_cols        = np.concatenate([p1_score_comp['cols'],       p2_score_comp['cols']])
+            sc_valid       = np.concatenate([p1_score_comp['valid'],      p2_score_comp['valid']])
+        else:
+            sc_bin_indices = p1_score_comp['bin_indices']
+            sc_densities   = p1_score_comp['densities']
+            sc_rows        = p1_score_comp['rows']
+            sc_cols        = p1_score_comp['cols']
+            sc_valid       = p1_score_comp['valid']
+
+        # Phase 5: Find best placement per context using proper lexicographic comparison.
+        # Matches PP's tie-breaking exactly:
+        #   1. Lower bin_idx wins (fewer bins is better)
+        #   2. Higher packing density wins (any nonzero difference decides)
+        #   3. Larger row wins (bottom-left heuristic)
+        #   4. Smaller col wins (bottom-left heuristic)
         n_contexts = len(context_info)
         best_ti_per_ctx = [-1] * n_contexts          # winning test index per context
-        best_sc_per_ctx = np.full(n_contexts, -np.inf, dtype=np.float32)
+        # Store best score tuple per context: (bin_idx, density, row, col)
+        best_key_per_ctx = [None] * n_contexts
 
         for ti, ctx_idx in enumerate(test_ctx_indices):
-            sc = all_scores[ti]
-            if sc > best_sc_per_ctx[ctx_idx]:
-                best_sc_per_ctx[ctx_idx] = sc
+            if not sc_valid[ti]:
+                continue
+            # Key: (-bin_idx, density, row, -col) — higher is better for all components
+            key = (-sc_bin_indices[ti], sc_densities[ti], sc_rows[ti], -sc_cols[ti])
+            prev = best_key_per_ctx[ctx_idx]
+            if prev is None or key > prev:
+                best_key_per_ctx[ctx_idx] = key
                 best_ti_per_ctx[ctx_idx] = ti
 
         # Collect placements; separate GPU and CPU work so the GPU kernel
@@ -474,6 +578,19 @@ class WaveBatchEvaluator:
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             ti = best_ti_per_ctx[ctx_idx]
 
+            if part_data.id in self._debug_part_ids:
+                if ti == -1:
+                    print(f"[DEBUG] Part {part_data.id} Phase5: NO test found → new bin")
+                elif placement_results[ti] is None:
+                    print(f"[DEBUG] Part {part_data.id} Phase5: best test {ti} has None result → new bin")
+                else:
+                    print(f"[DEBUG] Part {part_data.id} Phase5: best test {ti}, "
+                          f"bin={test_bin_states[ti].bin_idx}, "
+                          f"rot={test_rotations[ti]}, "
+                          f"pos={placement_results[ti]}, "
+                          f"density={sc_densities[ti]:.4f} "
+                          f"row={sc_rows[ti]:.0f} col={sc_cols[ti]:.0f}")
+
             if ti == -1 or placement_results[ti] is None:
                 contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
                 continue
@@ -482,6 +599,10 @@ class WaveBatchEvaluator:
             bin_state = test_bin_states[ti]
             rot       = test_rotations[ti]
             shape     = test_shapes[ti]
+
+            if self._collect_contexts:
+                mlog = self._placement_log.setdefault(ctx.machine_idx, [])
+                mlog.append((part_data.id, bin_state.bin_idx, col, row, rot, shape))
 
             bin_state.grid_fft_valid = False
             _placements.append((bin_state, col, row, rot, shape, part_data, mach_part_data))
@@ -514,6 +635,7 @@ class WaveBatchEvaluator:
                 bin_state.grid[y_start:row+1, col:col+shape[1]] += pd_.rotations_uint8[rot]
                 update_vacancy_vector_rows(
                     bin_state.vacancy_vector, bin_state.grid[y_start:row+1, :], y_start)
+                bin_state.parts_assigned.append(pd_.id)
                 bin_state.area += pd_.area
                 bin_state.min_occupied_row = min(bin_state.min_occupied_row, y_start)
                 bin_state.max_occupied_row = max(bin_state.max_occupied_row, row)
@@ -550,6 +672,12 @@ class WaveBatchEvaluator:
                 _new_placements.append((new_bin, part_data, mach_part_data, best_rot, shape))
                 _new_grid_indices.append(grid_idx)
 
+                if self._collect_contexts:
+                    y_start = ctx.bin_length - shape[0]
+                    mlog = self._placement_log.setdefault(ctx.machine_idx, [])
+                    mlog.append((part_data.id, new_bin.bin_idx, 0,
+                                 ctx.bin_length - 1, best_rot, shape))
+
             # Step 2: Zero all new GPU grids in one op
             _new_idx_t = torch.tensor(_new_grid_indices, device=self.device, dtype=torch.long)
             grid_states.index_fill_(0, _new_idx_t, 0.0)
@@ -577,6 +705,7 @@ class WaveBatchEvaluator:
                 new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] += part_data.rotations_uint8[best_rot]
                 update_vacancy_vector_rows(
                     new_bin.vacancy_vector, new_bin.grid[y_start:new_bin.bin_length, :], y_start)
+                new_bin.parts_assigned.append(part_data.id)
                 new_bin.area += part_data.area
                 new_bin.min_occupied_row = y_start
                 new_bin.max_occupied_row = new_bin.bin_length - 1
@@ -594,21 +723,26 @@ class WaveBatchEvaluator:
         Perform batched IFFT for ALL tests across ALL contexts.
         Chunks to avoid OOM with large batches.
 
-        Computes a composite placement score on the GPU encoding the full
-        tie-breaking hierarchy: bin_idx > density > row > col.
-        Returns (all_results, all_scores) so Phase 5 only needs a linear scan.
+        Returns (all_results, score_components) where score_components is a dict
+        with arrays for bin_indices, densities, rows, cols, and valid mask.
+        Phase 5 uses these for proper lexicographic comparison matching PP's
+        tie-breaking: bin_idx (lower wins) > density (higher) > row (larger) > col (smaller).
         """
         if n_tests == 0:
-            return [], np.array([], dtype=np.float32)
+            return [], {'bin_indices': np.array([], dtype=np.float64),
+                        'densities': np.array([], dtype=np.float64),
+                        'rows': np.array([], dtype=np.float64),
+                        'cols': np.array([], dtype=np.float64),
+                        'valid': np.array([], dtype=bool)}
 
         # Chunk to avoid OOM - empirically tuned for RTX A4000 (16GB)
         # Benchmarked: 250=6.05s, 500=5.90s, 750=5.88s (best), 1000=5.89s, 1500=5.88s, 2000+=OOM risk
         # 750-1500 all within noise; 750 chosen as sweet spot with safe VRAM headroom
         CHUNK_SIZE = 750
         all_results = [None] * n_tests
-        all_scores  = np.full(n_tests, -1e18, dtype=np.float32)
-        rows_np  = np.zeros(n_tests, dtype=np.float32)
-        cols_np  = np.zeros(n_tests, dtype=np.float32)
+        all_scores  = np.full(n_tests, -1e18, dtype=np.float64)
+        rows_np  = np.zeros(n_tests, dtype=np.float64)
+        cols_np  = np.zeros(n_tests, dtype=np.float64)
         valid_np = np.zeros(n_tests, dtype=bool)
 
         # Pre-build GPU index tensors once; per-chunk slices are zero-cost views.
@@ -653,25 +787,28 @@ class WaveBatchEvaluator:
                     rows_np[chunk_start + i] = r
                     valid_np[chunk_start + i] = True
 
-        # Compute composite placement scores on CPU with numpy.
-        # ~2000-element vectorized ops are sub-millisecond; avoids ~13 CUDA kernel
-        # launches per chunk that would be needed to do this on the GPU.
-        # Score encodes tie-breaking hierarchy: bin_idx > density > row > col.
-        # Multipliers chosen so each level dominates the next for actual value ranges:
-        #   bin_idx 0-10, density 0-1, row 0-H (~300), col 0-W (~200).
-        enc_np = np.asarray(test_enclosure_lengths, dtype=np.float32)
-        ba_np  = np.asarray(test_bin_areas,          dtype=np.float32)
-        pa_np  = np.asarray(test_part_areas,         dtype=np.float32)
-        bi_np  = np.asarray(test_bin_indices,        dtype=np.float32)
-        ht_np  = np.asarray(test_heights,            dtype=np.float32)
+        # Compute score components on CPU with numpy (float64).
+        # Phase 5 uses proper lexicographic comparison matching PP's tie-breaking:
+        #   bin_idx (lower wins) > density (higher wins) > row (larger wins) > col (smaller wins)
+        enc_np = np.asarray(test_enclosure_lengths, dtype=np.float64)
+        ba_np  = np.asarray(test_bin_areas,          dtype=np.float64)
+        pa_np  = np.asarray(test_part_areas,         dtype=np.float64)
+        bi_np  = np.asarray(test_bin_indices,        dtype=np.float64)
+        ht_np  = np.asarray(test_heights,            dtype=np.float64)
 
         y_starts  = rows_np - ht_np + 1
         new_lens  = np.maximum(enc_np, H - y_starts)
         densities = (ba_np + pa_np) / (new_lens * W)
-        all_scores = -bi_np * 1e9 + densities * 1e6 + rows_np * 1e3 - cols_np
-        all_scores[~valid_np] = -1e18
 
-        return all_results, all_scores
+        score_components = {
+            'bin_indices': bi_np,
+            'densities': densities,
+            'rows': rows_np,
+            'cols': cols_np,
+            'valid': valid_np,
+        }
+
+        return all_results, score_components
     
     def _place_part_in_bin(self, bin_state, x, y, part_matrix, shape, area, mach_part_data, grid_states,
                            part_gpu_tensor=None):
