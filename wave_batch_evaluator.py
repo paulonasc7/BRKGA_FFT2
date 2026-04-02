@@ -13,6 +13,7 @@ TRUE BATCHING: Instead of sequential per-context FFTs, we:
 This turns 500 contexts × 3 bins × 4 rotations = 6000 FFTs into ONE batched call!
 """
 
+import os
 import numpy as np
 import torch
 from typing import List, Tuple, Dict, Optional
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 from numba_utils import check_vacancy_fit_simple, update_vacancy_vector_rows
 from phase5_selector import select_best_per_context as _select_best_per_context_cpp
 from phase3_collector import collect_phase3_tests_batch as _collect_phase3_tests_batch_cpp
-from phase56_planner import partition_phase56 as _partition_phase56_cpp
+from phase56_planner import plan_phase56 as _plan_phase56_cpp
 
 # Lazy-load custom CUDA kernel for batched grid updates (compiles on first use)
 try:
@@ -133,6 +134,13 @@ class WaveBatchEvaluator:
         # Placement log: when _collect_contexts is True, records every placement
         # as (part_id, bin_idx, col, row, rot, shape) per machine.
         self._placement_log = {}  # machine_idx -> list of tuples
+
+        # Structured Phase 6 CPU path (enabled by default, can disable with
+        # ABRKGA_PHASE6_STRUCTURED=0 for A/B validation).
+        self._phase6_structured = os.getenv("ABRKGA_PHASE6_STRUCTURED", "1").strip() not in {
+            "0", "false", "False"
+        }
+        self._phase6_row_vacancy_cache = {}
 
         # Pre-build flat GPU tensor of all part rotation matrices for the batch kernel.
         # part_update_meta: (part_id, rot) -> (flat_offset, height, width)
@@ -410,22 +418,48 @@ class WaveBatchEvaluator:
             np.asarray(out_rot_local, dtype=np.int32),
         )
 
-    def _partition_phase56_contexts(self, best_ti_per_ctx):
-        native = _partition_phase56_cpp(best_ti_per_ctx)
+    def _plan_phase56_contexts(self, best_ti_per_ctx, sc_valid, sc_rows, sc_cols):
+        native = _plan_phase56_cpp(best_ti_per_ctx, sc_valid, sc_rows, sc_cols)
         if native is not None:
-            place_ctx, place_ti, newbin_ctx = native
+            place_ctx, place_ti, place_rows, place_cols, newbin_ctx = native
             return (
                 np.asarray(place_ctx, dtype=np.int64),
                 np.asarray(place_ti, dtype=np.int64),
+                np.asarray(place_rows, dtype=np.int64),
+                np.asarray(place_cols, dtype=np.int64),
                 np.asarray(newbin_ctx, dtype=np.int64),
             )
 
         best = np.asarray(best_ti_per_ctx, dtype=np.int64)
-        place_mask = best >= 0
+        valid = np.asarray(sc_valid, dtype=bool)
+        in_range = (best >= 0) & (best < len(valid))
+        place_mask = np.zeros_like(in_range, dtype=bool)
+        if len(valid) > 0:
+            idx = best[in_range]
+            place_mask[in_range] = valid[idx]
         place_ctx = np.nonzero(place_mask)[0].astype(np.int64, copy=False)
         place_ti = best[place_ctx].astype(np.int64, copy=False)
+        rows = np.asarray(sc_rows, dtype=np.float64)
+        cols = np.asarray(sc_cols, dtype=np.float64)
+        place_rows = rows[place_ti].astype(np.int64, copy=False)
+        place_cols = cols[place_ti].astype(np.int64, copy=False)
         newbin_ctx = np.nonzero(~place_mask)[0].astype(np.int64, copy=False)
-        return place_ctx, place_ti, newbin_ctx
+        return place_ctx, place_ti, place_rows, place_cols, newbin_ctx
+
+    def _phase6_cached_row_vacancy(self, part_data, rot, bin_width):
+        key = (int(part_data.id), int(rot), int(bin_width))
+        cached = self._phase6_row_vacancy_cache.get(key)
+        if cached is not None:
+            return cached
+
+        part_matrix = part_data.rotations_uint8[rot]
+        h, w = part_matrix.shape
+        probe = np.zeros((h, bin_width), dtype=np.uint8)
+        probe[:, :w] = part_matrix
+        row_vacancy = np.empty(h, dtype=np.int32)
+        update_vacancy_vector_rows(row_vacancy, probe, 0)
+        self._phase6_row_vacancy_cache[key] = row_vacancy
+        return row_vacancy
     
     def _process_wave_true_batch(self, contexts, mach_data, grid_states, grid_ffts,
                                  row_idx, col_idx, neg_inf):
@@ -853,15 +887,24 @@ class WaveBatchEvaluator:
                 _placements.append((bin_state, col, row, rot, shape, part_data, mach_part_data))
                 ctx.current_part_idx += 1
         else:
-            place_ctx, place_ti, newbin_ctx = self._partition_phase56_contexts(best_ti_per_ctx)
+            place_ctx, place_ti, place_rows, place_cols, newbin_ctx = self._plan_phase56_contexts(
+                best_ti_per_ctx=best_ti_per_ctx,
+                sc_valid=sc_valid,
+                sc_rows=sc_rows,
+                sc_cols=sc_cols,
+            )
 
             for ctx_idx in newbin_ctx.tolist():
                 ctx, part_data, mach_part_data = context_info[int(ctx_idx)]
                 contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
 
-            for ctx_idx, ti in zip(place_ctx.tolist(), place_ti.tolist()):
+            for ctx_idx, ti, row, col in zip(
+                place_ctx.tolist(),
+                place_ti.tolist(),
+                place_rows.tolist(),
+                place_cols.tolist(),
+            ):
                 ctx, part_data, mach_part_data = context_info[int(ctx_idx)]
-                col, row = placement_results[int(ti)]
                 bin_state = test_bin_states[int(ti)]
                 rot = test_rotations[int(ti)]
                 shape = test_shapes[int(ti)]
@@ -923,7 +966,7 @@ class WaveBatchEvaluator:
                 new_bin = BinState(
                     bin_idx=len(ctx.open_bins),
                     grid=np.zeros((ctx.bin_length, ctx.bin_width), dtype=np.uint8),
-                    vacancy_vector=np.zeros(ctx.bin_length, dtype=np.int32) + ctx.bin_width,
+                    vacancy_vector=np.full(ctx.bin_length, ctx.bin_width, dtype=np.int32),
                     grid_state_idx=grid_idx,
                     area=0.0, enclosure_box_length=0,
                     min_occupied_row=ctx.bin_length, max_occupied_row=-1,
@@ -966,19 +1009,35 @@ class WaveBatchEvaluator:
                     grid_states[new_bin.grid_state_idx, y_start:new_bin.bin_length, 0:shape[1]] += part_gpu
 
             # Step 4: CPU updates — run while GPU kernel executes (async)
-            for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
-                y_start = new_bin.bin_length - shape[0]
-                new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] += part_data.rotations_uint8[best_rot]
-                update_vacancy_vector_rows(
-                    new_bin.vacancy_vector, new_bin.grid[y_start:new_bin.bin_length, :], y_start)
-                new_bin.parts_assigned.append(part_data.id)
-                new_bin.area += part_data.area
-                new_bin.min_occupied_row = y_start
-                new_bin.max_occupied_row = new_bin.bin_length - 1
-                new_bin.enclosure_box_length = shape[0]
-                new_bin.proc_time += mach_part_data.proc_time
-                new_bin.proc_time_height = mach_part_data.proc_time_height
-                new_bin.grid_fft_valid = False
+            if self._phase6_structured:
+                for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
+                    y_start = new_bin.bin_length - shape[0]
+                    new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] = part_data.rotations_uint8[best_rot]
+                    new_bin.vacancy_vector[y_start:new_bin.bin_length] = self._phase6_cached_row_vacancy(
+                        part_data, best_rot, new_bin.bin_width
+                    )
+                    new_bin.parts_assigned.append(part_data.id)
+                    new_bin.area += part_data.area
+                    new_bin.min_occupied_row = y_start
+                    new_bin.max_occupied_row = new_bin.bin_length - 1
+                    new_bin.enclosure_box_length = shape[0]
+                    new_bin.proc_time += mach_part_data.proc_time
+                    new_bin.proc_time_height = mach_part_data.proc_time_height
+                    new_bin.grid_fft_valid = False
+            else:
+                for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
+                    y_start = new_bin.bin_length - shape[0]
+                    new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] += part_data.rotations_uint8[best_rot]
+                    update_vacancy_vector_rows(
+                        new_bin.vacancy_vector, new_bin.grid[y_start:new_bin.bin_length, :], y_start)
+                    new_bin.parts_assigned.append(part_data.id)
+                    new_bin.area += part_data.area
+                    new_bin.min_occupied_row = y_start
+                    new_bin.max_occupied_row = new_bin.bin_length - 1
+                    new_bin.enclosure_box_length = shape[0]
+                    new_bin.proc_time += mach_part_data.proc_time
+                    new_bin.proc_time_height = mach_part_data.proc_time_height
+                    new_bin.grid_fft_valid = False
     
     def _batch_fft_all_tests(self, n_tests, test_grid_indices, test_part_ffts,
                               test_heights, test_widths,
@@ -1104,7 +1163,7 @@ class WaveBatchEvaluator:
         new_bin = BinState(
             bin_idx=len(ctx.open_bins),
             grid=np.zeros((ctx.bin_length, ctx.bin_width), dtype=np.uint8),
-            vacancy_vector=np.zeros(ctx.bin_length, dtype=np.int32) + ctx.bin_width,
+            vacancy_vector=np.full(ctx.bin_length, ctx.bin_width, dtype=np.int32),
             grid_state_idx=grid_idx,
             area=0.0, enclosure_box_length=0,
             min_occupied_row=ctx.bin_length, max_occupied_row=-1,
