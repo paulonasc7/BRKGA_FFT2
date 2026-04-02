@@ -386,14 +386,16 @@ class TimedEvaluator(WaveBatchEvaluator):
         )
         contexts_needing_new_bin = []
         _placements = []
-        for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
-            ti = int(best_ti_per_ctx[ctx_idx])
-            if ti == -1 or placement_results[ti] is None:
-                contexts_needing_new_bin.append((ctx, part_data, mach_part_data)); continue
-            col, row  = placement_results[ti]
-            bin_state = test_bin_states[ti]
-            rot       = test_rotations[ti]
-            shape     = test_shapes[ti]
+        place_ctx, place_ti, newbin_ctx = self._partition_phase56_contexts(best_ti_per_ctx)
+        for ctx_idx in newbin_ctx.tolist():
+            ctx, part_data, mach_part_data = context_info[int(ctx_idx)]
+            contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
+        for ctx_idx, ti in zip(place_ctx.tolist(), place_ti.tolist()):
+            ctx, part_data, mach_part_data = context_info[int(ctx_idx)]
+            col, row = placement_results[int(ti)]
+            bin_state = test_bin_states[int(ti)]
+            rot = test_rotations[int(ti)]
+            shape = test_shapes[int(ti)]
             bin_state.grid_fft_valid = False
             _placements.append((bin_state, col, row, rot, shape, part_data, mach_part_data))
             ctx.current_part_idx += 1

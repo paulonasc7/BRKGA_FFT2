@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from numba_utils import check_vacancy_fit_simple, update_vacancy_vector_rows
 from phase5_selector import select_best_per_context as _select_best_per_context_cpp
 from phase3_collector import collect_phase3_tests_batch as _collect_phase3_tests_batch_cpp
+from phase56_planner import partition_phase56 as _partition_phase56_cpp
 
 # Lazy-load custom CUDA kernel for batched grid updates (compiles on first use)
 try:
@@ -408,6 +409,23 @@ class WaveBatchEvaluator:
             np.asarray(out_bin_local, dtype=np.int32),
             np.asarray(out_rot_local, dtype=np.int32),
         )
+
+    def _partition_phase56_contexts(self, best_ti_per_ctx):
+        native = _partition_phase56_cpp(best_ti_per_ctx)
+        if native is not None:
+            place_ctx, place_ti, newbin_ctx = native
+            return (
+                np.asarray(place_ctx, dtype=np.int64),
+                np.asarray(place_ti, dtype=np.int64),
+                np.asarray(newbin_ctx, dtype=np.int64),
+            )
+
+        best = np.asarray(best_ti_per_ctx, dtype=np.int64)
+        place_mask = best >= 0
+        place_ctx = np.nonzero(place_mask)[0].astype(np.int64, copy=False)
+        place_ti = best[place_ctx].astype(np.int64, copy=False)
+        newbin_ctx = np.nonzero(~place_mask)[0].astype(np.int64, copy=False)
+        return place_ctx, place_ti, newbin_ctx
     
     def _process_wave_true_batch(self, contexts, mach_data, grid_states, grid_ffts,
                                  row_idx, col_idx, neg_inf):
@@ -802,38 +820,59 @@ class WaveBatchEvaluator:
         contexts_needing_new_bin = []
         _placements = []  # (bin_state, col, row, rot, shape, part_data, mach_part_data)
 
-        for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
-            ti = int(best_ti_per_ctx[ctx_idx])
+        if self._debug_part_ids:
+            for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
+                ti = int(best_ti_per_ctx[ctx_idx])
+                if part_data.id in self._debug_part_ids:
+                    if ti == -1:
+                        print(f"[DEBUG] Part {part_data.id} Phase5: NO test found → new bin")
+                    elif placement_results[ti] is None:
+                        print(f"[DEBUG] Part {part_data.id} Phase5: best test {ti} has None result → new bin")
+                    else:
+                        print(f"[DEBUG] Part {part_data.id} Phase5: best test {ti}, "
+                              f"bin={test_bin_states[ti].bin_idx}, "
+                              f"rot={test_rotations[ti]}, "
+                              f"pos={placement_results[ti]}, "
+                              f"density={sc_densities[ti]:.4f} "
+                              f"row={sc_rows[ti]:.0f} col={sc_cols[ti]:.0f}")
 
-            if part_data.id in self._debug_part_ids:
-                if ti == -1:
-                    print(f"[DEBUG] Part {part_data.id} Phase5: NO test found → new bin")
-                elif placement_results[ti] is None:
-                    print(f"[DEBUG] Part {part_data.id} Phase5: best test {ti} has None result → new bin")
-                else:
-                    print(f"[DEBUG] Part {part_data.id} Phase5: best test {ti}, "
-                          f"bin={test_bin_states[ti].bin_idx}, "
-                          f"rot={test_rotations[ti]}, "
-                          f"pos={placement_results[ti]}, "
-                          f"density={sc_densities[ti]:.4f} "
-                          f"row={sc_rows[ti]:.0f} col={sc_cols[ti]:.0f}")
+                if ti == -1 or placement_results[ti] is None:
+                    contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
+                    continue
 
-            if ti == -1 or placement_results[ti] is None:
+                col, row = placement_results[ti]
+                bin_state = test_bin_states[ti]
+                rot = test_rotations[ti]
+                shape = test_shapes[ti]
+
+                if self._collect_contexts:
+                    mlog = self._placement_log.setdefault(ctx.machine_idx, [])
+                    mlog.append((part_data.id, bin_state.bin_idx, col, row, rot, shape))
+
+                bin_state.grid_fft_valid = False
+                _placements.append((bin_state, col, row, rot, shape, part_data, mach_part_data))
+                ctx.current_part_idx += 1
+        else:
+            place_ctx, place_ti, newbin_ctx = self._partition_phase56_contexts(best_ti_per_ctx)
+
+            for ctx_idx in newbin_ctx.tolist():
+                ctx, part_data, mach_part_data = context_info[int(ctx_idx)]
                 contexts_needing_new_bin.append((ctx, part_data, mach_part_data))
-                continue
 
-            col, row  = placement_results[ti]
-            bin_state = test_bin_states[ti]
-            rot       = test_rotations[ti]
-            shape     = test_shapes[ti]
+            for ctx_idx, ti in zip(place_ctx.tolist(), place_ti.tolist()):
+                ctx, part_data, mach_part_data = context_info[int(ctx_idx)]
+                col, row = placement_results[int(ti)]
+                bin_state = test_bin_states[int(ti)]
+                rot = test_rotations[int(ti)]
+                shape = test_shapes[int(ti)]
 
-            if self._collect_contexts:
-                mlog = self._placement_log.setdefault(ctx.machine_idx, [])
-                mlog.append((part_data.id, bin_state.bin_idx, col, row, rot, shape))
+                if self._collect_contexts:
+                    mlog = self._placement_log.setdefault(ctx.machine_idx, [])
+                    mlog.append((part_data.id, bin_state.bin_idx, col, row, rot, shape))
 
-            bin_state.grid_fft_valid = False
-            _placements.append((bin_state, col, row, rot, shape, part_data, mach_part_data))
-            ctx.current_part_idx += 1
+                bin_state.grid_fft_valid = False
+                _placements.append((bin_state, col, row, rot, shape, part_data, mach_part_data))
+                ctx.current_part_idx += 1
 
         if _placements:
             if self.flat_parts_gpu is not None:
