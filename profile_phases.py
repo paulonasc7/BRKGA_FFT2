@@ -163,7 +163,54 @@ class TimedEvaluator(WaveBatchEvaluator):
         p1_ctx_indices, p1_enclosure_lengths = [], []
         p1_bin_areas, p1_part_areas = [], []
         p1_n_tests = 0
+
+        p1_native_candidates = [
+            ctx_idx
+            for ctx_idx, (ctx, part_data, _) in enumerate(context_info)
+            if part_data.densities_flat is not None
+            and part_data.shapes_heights is not None
+            and part_data.shapes_widths is not None
+            and part_data.density_offsets is not None
+            and ctx.open_bins
+        ]
+        p1_native_handled = set()
+        p1_native = self._collect_phase3_tests_native_batch(
+            context_info=context_info,
+            ctx_indices=p1_native_candidates,
+            H=H,
+            W=W,
+            mode=0,
+            ctx_first_valid_bin=ctx_first_valid_bin,
+        )
+        if p1_native is not None:
+            p1_native_handled = set(p1_native_candidates)
+            first_valid_global, out_ctx_global, out_bin_local, out_rot_local = p1_native
+            for ctx_idx in p1_native_candidates:
+                if first_valid_global[ctx_idx] != -1:
+                    ctx_first_valid_bin[ctx_idx] = int(first_valid_global[ctx_idx])
+
+            for ctx_idx_i, b_local_i, rot_i in zip(out_ctx_global, out_bin_local, out_rot_local):
+                ctx_idx = int(ctx_idx_i)
+                b_local = int(b_local_i)
+                rot = int(rot_i)
+                ctx, part_data, mach_part_data = context_info[ctx_idx]
+                bin_state = ctx.open_bins[b_local]
+                shape = part_data.shapes[rot]
+                p1_grid_indices.append(bin_state.grid_state_idx)
+                p1_part_ffts.append(mach_part_data.ffts[rot])
+                p1_heights.append(shape[0]); p1_widths.append(shape[1])
+                p1_bin_indices.append(b_local); p1_shapes.append(shape)
+                p1_bin_states.append(bin_state); p1_rotations.append(rot)
+                p1_ctx_indices.append(ctx_idx)
+                p1_enclosure_lengths.append(bin_state.enclosure_box_length)
+                p1_bin_areas.append(bin_state.area)
+                p1_part_areas.append(part_data.area)
+                p1_n_tests += 1
+
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
+            if ctx_idx in p1_native_handled:
+                continue
+
             for bin_idx, bin_state in enumerate(ctx.open_bins):
                 if bin_state.area + part_data.area > ctx.bin_area:
                     continue
@@ -219,10 +266,54 @@ class TimedEvaluator(WaveBatchEvaluator):
         p2_ctx_indices, p2_enclosure_lengths = [], []
         p2_bin_areas, p2_part_areas = [], []
         p2_n_tests = 0
+
+        p2_native_candidates = [
+            ctx_idx
+            for ctx_idx, (ctx, part_data, _) in enumerate(context_info)
+            if not ctx_p1_hit[ctx_idx]
+            and part_data.densities_flat is not None
+            and part_data.shapes_heights is not None
+            and part_data.shapes_widths is not None
+            and part_data.density_offsets is not None
+            and ctx.open_bins
+        ]
+        p2_native_handled = set()
+        p2_native = self._collect_phase3_tests_native_batch(
+            context_info=context_info,
+            ctx_indices=p2_native_candidates,
+            H=H,
+            W=W,
+            mode=1,
+            ctx_first_valid_bin=ctx_first_valid_bin,
+        )
+        if p2_native is not None:
+            p2_native_handled = set(p2_native_candidates)
+            _, out_ctx_global, out_bin_local, out_rot_local = p2_native
+            for ctx_idx_i, b_local_i, rot_i in zip(out_ctx_global, out_bin_local, out_rot_local):
+                ctx_idx = int(ctx_idx_i)
+                b_local = int(b_local_i)
+                rot = int(rot_i)
+                ctx, part_data, mach_part_data = context_info[ctx_idx]
+                bin_state = ctx.open_bins[b_local]
+                shape = part_data.shapes[rot]
+                p2_grid_indices.append(bin_state.grid_state_idx)
+                p2_part_ffts.append(mach_part_data.ffts[rot])
+                p2_heights.append(shape[0]); p2_widths.append(shape[1])
+                p2_bin_indices.append(b_local); p2_shapes.append(shape)
+                p2_bin_states.append(bin_state); p2_rotations.append(rot)
+                p2_ctx_indices.append(ctx_idx)
+                p2_enclosure_lengths.append(bin_state.enclosure_box_length)
+                p2_bin_areas.append(bin_state.area)
+                p2_part_areas.append(part_data.area)
+                p2_n_tests += 1
+
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             if ctx_p1_hit[ctx_idx]:
                 continue
+            if ctx_idx in p2_native_handled:
+                continue
             first_valid = ctx_first_valid_bin[ctx_idx]
+
             for bin_idx, bin_state in enumerate(ctx.open_bins):
                 if bin_idx == first_valid:
                     continue
@@ -284,20 +375,19 @@ class TimedEvaluator(WaveBatchEvaluator):
         # ── Phase 5 ──────────────────────────────────────────────────────────
         t = self._s()
         n_contexts = len(context_info)
-        best_ti_per_ctx = [-1] * n_contexts
-        best_key_per_ctx = [None] * n_contexts
-        for ti, ctx_idx in enumerate(test_ctx_indices):
-            if not sc_valid[ti]:
-                continue
-            key = (-sc_bin_indices[ti], sc_densities[ti], sc_rows[ti], -sc_cols[ti])
-            prev = best_key_per_ctx[ctx_idx]
-            if prev is None or key > prev:
-                best_key_per_ctx[ctx_idx] = key
-                best_ti_per_ctx[ctx_idx] = ti
+        best_ti_per_ctx = self._select_best_tests_per_context(
+            test_ctx_indices=test_ctx_indices,
+            sc_bin_indices=sc_bin_indices,
+            sc_densities=sc_densities,
+            sc_rows=sc_rows,
+            sc_cols=sc_cols,
+            sc_valid=sc_valid,
+            n_contexts=n_contexts,
+        )
         contexts_needing_new_bin = []
         _placements = []
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
-            ti = best_ti_per_ctx[ctx_idx]
+            ti = int(best_ti_per_ctx[ctx_idx])
             if ti == -1 or placement_results[ti] is None:
                 contexts_needing_new_bin.append((ctx, part_data, mach_part_data)); continue
             col, row  = placement_results[ti]

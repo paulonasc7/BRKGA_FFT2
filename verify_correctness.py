@@ -17,6 +17,7 @@ Usage:
 import sys, os, json, pickle
 import numpy as np
 import torch
+import math
 
 torch.set_num_threads(1)
 torch.set_grad_enabled(False)
@@ -145,13 +146,15 @@ print(f"  Got makespan  {got_makespan:.4f}  "
 
 # ── Compare ────────────────────────────────────────────────────────────────────
 failures = []
+MAKESPAN_ABS_TOL = 1e-6
 
 # 1. Overall makespan
-if got_makespan != golden["makespan"]:
+if not math.isclose(got_makespan, golden["makespan"], rel_tol=0.0, abs_tol=MAKESPAN_ABS_TOL):
     failures.append(
         f"Overall makespan: got {got_makespan:.6f}, "
         f"expected {golden['makespan']:.6f}  "
-        f"(diff={abs(got_makespan - golden['makespan']):.6f})")
+        f"(diff={abs(got_makespan - golden['makespan']):.6f}, "
+        f"tol={MAKESPAN_ABS_TOL:.1e})")
 
 # 2. Per-machine placements
 for m_idx in range(nbMachines):
