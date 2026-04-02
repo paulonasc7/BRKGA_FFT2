@@ -7,11 +7,12 @@ included in the measured interval — no cProfile distortion.
 Run: python profile_phases.py 50 2 0 torch_gpu 3
      (nbParts nbMachines instNumber backend n_generations)
 """
-import sys, time, math, os, pickle
+import sys, time, math, os, pickle, json
 import numpy as np
 import torch
 import pandas as pd
 from collections import defaultdict
+from datetime import datetime
 
 from collision_backend import create_collision_backend
 from data_structures import PartData, MachinePartData, MachineData, ProblemData
@@ -27,7 +28,7 @@ nbMachines   = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 instNumber   = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 backend_name = sys.argv[4]      if len(sys.argv) > 4 else 'torch_gpu'
 n_gen        = int(sys.argv[5]) if len(sys.argv) > 5 else 3
-NUM_INDIVIDUALS = 500
+NUM_INDIVIDUALS = nbParts * 10
 
 # ── Problem setup (mirrors BRKGA_alg3.py) ────────────────────────────────────
 collision_backend = create_collision_backend(backend_name)
@@ -399,6 +400,57 @@ for g in range(n_gen):
     gen_times.append(time.perf_counter() - t0)
     print(f"  gen {g}: {gen_times[-1]:.2f}s")
 
-print(f"\nMean gen time: {np.mean(gen_times):.3f}s  "
-      f"(std {np.std(gen_times):.3f}s)")
+mean_gen = float(np.mean(gen_times))
+std_gen  = float(np.std(gen_times))
+print(f"\nMean gen time: {mean_gen:.3f}s  (std {std_gen:.3f}s)")
 evaluator.report()
+
+# ── Save structured JSON ───────────────────────────────────────────────────────
+total_phase = sum(evaluator._pt.values())
+n_waves     = max(evaluator._n_waves, 1)
+phase_keys  = ['1', '2', '3a', '4a', '3b', '4b', '5', '6']
+
+def _phase_entry(key):
+    t = evaluator._pt[key]
+    return {"time_s": round(t, 4),
+            "pct":    round(100 * t / total_phase, 2),
+            "ms_per_wave": round(1000 * t / n_waves, 3)}
+
+result = {
+    "meta": {
+        "instance":     f"P{nbParts}M{nbMachines}-{instNumber}",
+        "nbParts":      nbParts,
+        "nbMachines":   nbMachines,
+        "instNumber":   instNumber,
+        "backend":      backend_name,
+        "n_gen":        n_gen,
+        "n_individuals": NUM_INDIVIDUALS,
+        "timestamp":    datetime.now().isoformat(timespec='seconds'),
+    },
+    "gen_times_s":    [round(t, 4) for t in gen_times],
+    "mean_gen_time_s": round(mean_gen, 4),
+    "std_gen_time_s":  round(std_gen, 4),
+    "n_waves":         evaluator._n_waves,
+    "n_tests":         evaluator._n_tests,
+    "tests_per_wave":  round(evaluator._n_tests / n_waves, 1),
+    "phases": {k: _phase_entry(k) for k in phase_keys},
+    "subtotals": {
+        "p1_3a4a": {
+            "time_s": round(evaluator._pt['3a'] + evaluator._pt['4a'], 4),
+            "pct":    round(100 * (evaluator._pt['3a'] + evaluator._pt['4a']) / total_phase, 2),
+        },
+        "p2_3b4b": {
+            "time_s": round(evaluator._pt['3b'] + evaluator._pt['4b'], 4),
+            "pct":    round(100 * (evaluator._pt['3b'] + evaluator._pt['4b']) / total_phase, 2),
+        },
+    },
+}
+
+out_dir  = "results/benchmarks"
+os.makedirs(out_dir, exist_ok=True)
+ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+out_path = os.path.join(out_dir,
+           f"profile_P{nbParts}M{nbMachines}-{instNumber}_{ts}.json")
+with open(out_path, 'w') as f:
+    json.dump(result, f, indent=2)
+print(f"\nJSON saved → {out_path}")

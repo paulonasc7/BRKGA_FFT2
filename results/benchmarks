@@ -1,0 +1,76 @@
+{
+  "meta": {
+    "instance": "P75M2-0",
+    "nbParts": 75,
+    "nbMachines": 2,
+    "instNumber": 0,
+    "backend": "torch_gpu",
+    "n_gen": 5,
+    "n_individuals": 750,
+    "timestamp": "2026-04-02T09:19:11"
+  },
+  "gen_times_s": [
+    6.547,
+    5.0807,
+    5.138,
+    5.1429,
+    5.3073
+  ],
+  "mean_gen_time_s": 5.4432,
+  "std_gen_time_s": 0.5571,
+  "n_waves": 489,
+  "n_tests": 793085,
+  "tests_per_wave": 1621.9,
+  "phases": {
+    "1": {
+      "time_s": 0.0,
+      "pct": 0.0,
+      "ms_per_wave": 0.0
+    },
+    "2": {
+      "time_s": 0.0,
+      "pct": 0.0,
+      "ms_per_wave": 0.0
+    },
+    "3a": {
+      "time_s": 2.1831,
+      "pct": 8.66,
+      "ms_per_wave": 4.464
+    },
+    "4a": {
+      "time_s": 11.1183,
+      "pct": 44.08,
+      "ms_per_wave": 22.737
+    },
+    "3b": {
+      "time_s": 0.7753,
+      "pct": 3.07,
+      "ms_per_wave": 1.585
+    },
+    "4b": {
+      "time_s": 2.9468,
+      "pct": 11.68,
+      "ms_per_wave": 6.026
+    },
+    "5": {
+      "time_s": 0.0,
+      "pct": 0.0,
+      "ms_per_wave": 0.0
+    },
+    "6": {
+      "time_s": 0.0,
+      "pct": 0.0,
+      "ms_per_wave": 0.0
+    }
+  },
+  "subtotals": {
+    "p1_3a4a": {
+      "time_s": 13.3014,
+      "pct": 52.74
+    },
+    "p2_3b4b": {
+      "time_s": 3.7221,
+      "pct": 14.76
+    }
+  }
+}
