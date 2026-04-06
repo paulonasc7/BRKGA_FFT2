@@ -428,6 +428,7 @@ class TimedEvaluator(WaveBatchEvaluator):
                     grid_states[bin_state.grid_state_idx, y_start:row+1,
                                 col:col+shape[1]] += part_gpu
             for bin_state, col, row, rot, shape, pd_, mpd in _placements:
+                self._ensure_bin_grid_materialized(bin_state)
                 y_start = row - shape[0] + 1
                 bin_state.grid[y_start:row+1, col:col+shape[1]] += pd_.rotations_uint8[rot]
                 update_vacancy_vector_rows(
@@ -470,7 +471,42 @@ class TimedEvaluator(WaveBatchEvaluator):
             _new_idx_t = torch.tensor(_new_grid_indices, device=self.device, dtype=torch.long)
             grid_states.index_fill_(0, _new_idx_t, 0.0)
 
-            if self.flat_parts_gpu is not None:
+            _used_phase6_fused = False
+            if self._phase6_gpu_fused and self.flat_parts_gpu is not None:
+                from wave_batch_evaluator import _cuda_batch_phase6_fused
+                _kernel_args = []
+                for new_bin, part_data, _, best_rot, shape in _new_placements:
+                    y_start = new_bin.bin_length - shape[0]
+                    flat_offset, ph, pw = self.part_update_meta[(part_data.id, best_rot)]
+                    _kernel_args.append((new_bin.grid_state_idx, y_start, flat_offset, ph, pw))
+                try:
+                    row_offsets, row_vacancy_flat = _cuda_batch_phase6_fused(
+                        grid_states, self.flat_parts_gpu, _kernel_args, H, W
+                    )
+                    _used_phase6_fused = True
+                except Exception:
+                    _used_phase6_fused = False
+
+                if _used_phase6_fused:
+                    for i, (new_bin, part_data, mach_part_data, best_rot, shape) in enumerate(_new_placements):
+                        y_start = new_bin.bin_length - shape[0]
+                        r0 = row_offsets[i]
+                        r1 = row_offsets[i + 1]
+                        new_bin.vacancy_vector[y_start:new_bin.bin_length] = row_vacancy_flat[r0:r1]
+                        new_bin.parts_assigned.append(part_data.id)
+                        new_bin.area += part_data.area
+                        new_bin.min_occupied_row = y_start
+                        new_bin.max_occupied_row = new_bin.bin_length - 1
+                        new_bin.enclosure_box_length = shape[0]
+                        new_bin.proc_time += mach_part_data.proc_time
+                        new_bin.proc_time_height = mach_part_data.proc_time_height
+                        new_bin.grid_fft_valid = False
+                        new_bin.grid_materialized = False
+                        new_bin.pending_part_matrix = part_data.rotations_uint8[best_rot]
+                        new_bin.pending_y_start = y_start
+                        new_bin.pending_width = shape[1]
+
+            if (not _used_phase6_fused) and self.flat_parts_gpu is not None:
                 from wave_batch_evaluator import _cuda_batch_update
                 _kernel_args = []
                 for new_bin, part_data, _, best_rot, shape in _new_placements:
@@ -478,7 +514,7 @@ class TimedEvaluator(WaveBatchEvaluator):
                     flat_offset, ph, pw = self.part_update_meta[(part_data.id, best_rot)]
                     _kernel_args.append((new_bin.grid_state_idx, y_start, 0, flat_offset, ph, pw))
                 _cuda_batch_update(grid_states, self.flat_parts_gpu, _kernel_args, H, W)
-            else:
+            elif not _used_phase6_fused:
                 for new_bin, part_data, _, best_rot, shape in _new_placements:
                     y_start = new_bin.bin_length - shape[0]
                     part_gpu = (part_data.rotations_gpu[best_rot]
@@ -487,35 +523,67 @@ class TimedEvaluator(WaveBatchEvaluator):
                                                      dtype=torch.float32, device=self.device))
                     grid_states[new_bin.grid_state_idx, y_start:new_bin.bin_length, 0:shape[1]] += part_gpu
 
-            if self._phase6_structured:
-                for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
-                    y_start = new_bin.bin_length - shape[0]
-                    new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] = part_data.rotations_uint8[best_rot]
-                    new_bin.vacancy_vector[y_start:new_bin.bin_length] = self._phase6_cached_row_vacancy(
-                        part_data, best_rot, new_bin.bin_width
-                    )
-                    new_bin.parts_assigned.append(part_data.id)
-                    new_bin.area += part_data.area
-                    new_bin.min_occupied_row = y_start
-                    new_bin.max_occupied_row = new_bin.bin_length - 1
-                    new_bin.enclosure_box_length = shape[0]
-                    new_bin.proc_time += mach_part_data.proc_time
-                    new_bin.proc_time_height = mach_part_data.proc_time_height
-                    new_bin.grid_fft_valid = False
+            if _used_phase6_fused:
+                pass
             else:
-                for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
-                    y_start = new_bin.bin_length - shape[0]
-                    new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] += part_data.rotations_uint8[best_rot]
-                    update_vacancy_vector_rows(
-                        new_bin.vacancy_vector, new_bin.grid[y_start:new_bin.bin_length, :], y_start)
-                    new_bin.parts_assigned.append(part_data.id)
-                    new_bin.area += part_data.area
-                    new_bin.min_occupied_row = y_start
-                    new_bin.max_occupied_row = new_bin.bin_length - 1
-                    new_bin.enclosure_box_length = shape[0]
-                    new_bin.proc_time += mach_part_data.proc_time
-                    new_bin.proc_time_height = mach_part_data.proc_time_height
-                    new_bin.grid_fft_valid = False
+                used_cpp = False
+                if self._phase6_cpu_cpp:
+                    from wave_batch_evaluator import _phase6_cpu_update_batch_cpp
+                    grids = []
+                    vacancies = []
+                    part_mats = []
+                    y_starts = []
+                    for new_bin, part_data, _, best_rot, shape in _new_placements:
+                        y_start = new_bin.bin_length - shape[0]
+                        grids.append(new_bin.grid)
+                        vacancies.append(new_bin.vacancy_vector)
+                        part_mats.append(part_data.rotations_uint8[best_rot])
+                        y_starts.append(y_start)
+
+                    used_cpp = _phase6_cpu_update_batch_cpp(
+                        grids, vacancies, part_mats, np.asarray(y_starts, dtype=np.int32)
+                    )
+                    if used_cpp:
+                        for new_bin, part_data, mach_part_data, _, shape in _new_placements:
+                            y_start = new_bin.bin_length - shape[0]
+                            new_bin.parts_assigned.append(part_data.id)
+                            new_bin.area += part_data.area
+                            new_bin.min_occupied_row = y_start
+                            new_bin.max_occupied_row = new_bin.bin_length - 1
+                            new_bin.enclosure_box_length = shape[0]
+                            new_bin.proc_time += mach_part_data.proc_time
+                            new_bin.proc_time_height = mach_part_data.proc_time_height
+                            new_bin.grid_fft_valid = False
+
+                if (not used_cpp) and self._phase6_structured:
+                    for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
+                        y_start = new_bin.bin_length - shape[0]
+                        new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] = part_data.rotations_uint8[best_rot]
+                        new_bin.vacancy_vector[y_start:new_bin.bin_length] = self._phase6_cached_row_vacancy(
+                            part_data, best_rot, new_bin.bin_width
+                        )
+                        new_bin.parts_assigned.append(part_data.id)
+                        new_bin.area += part_data.area
+                        new_bin.min_occupied_row = y_start
+                        new_bin.max_occupied_row = new_bin.bin_length - 1
+                        new_bin.enclosure_box_length = shape[0]
+                        new_bin.proc_time += mach_part_data.proc_time
+                        new_bin.proc_time_height = mach_part_data.proc_time_height
+                        new_bin.grid_fft_valid = False
+                elif not used_cpp:
+                    for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
+                        y_start = new_bin.bin_length - shape[0]
+                        new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] += part_data.rotations_uint8[best_rot]
+                        update_vacancy_vector_rows(
+                            new_bin.vacancy_vector, new_bin.grid[y_start:new_bin.bin_length, :], y_start)
+                        new_bin.parts_assigned.append(part_data.id)
+                        new_bin.area += part_data.area
+                        new_bin.min_occupied_row = y_start
+                        new_bin.max_occupied_row = new_bin.bin_length - 1
+                        new_bin.enclosure_box_length = shape[0]
+                        new_bin.proc_time += mach_part_data.proc_time
+                        new_bin.proc_time_height = mach_part_data.proc_time_height
+                        new_bin.grid_fft_valid = False
         self._pt[6] += self._s() - t
 
     def report(self):
