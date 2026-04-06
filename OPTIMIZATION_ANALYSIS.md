@@ -6,6 +6,109 @@
 
 ---
 
+## Update (2026-04-06): Experiments Run and Conclusions
+
+This section summarizes what was actually tested after the initial analysis, using remote GPU runs with fixed seeds and explicit correctness checks.
+
+### A. Correctness status (golden-reference validated)
+
+`verify_correctness.py` was run on both available golden instances with the current local code:
+
+- `P50M2-0`
+- `P75M2-0`
+
+And under both Phase-3 flag settings:
+
+- `ABRKGA_PHASE3_CPP=1`
+- `ABRKGA_PHASE3_CPP=0`
+
+Result: **PASS in all cases** (exact makespan match and exact per-placement log match: `part_id, bin_idx, col, row, rot`).
+
+Conclusion: current behavior is still aligned with golden reference for tested instances.
+
+### B. Phase 3 rollback experiment (strict fair A/B)
+
+Question tested: should we keep current Phase 3 or revert to the older Phase 3 logic from commit `5a70d85` ("Add golden reference creation and verification scripts")?
+
+Method:
+
+- Baseline: current pushed code (`c2c3827`)
+- Variant: same code, but Phase 3 collector path reverted to old two-pass Python collection
+- Same seeds: `123, 321, 777`
+- Same command/flags in both runs:
+  - `ABRKGA_PHASE3_CPP=1 ABRKGA_PHASE5_CPP=1 ABRKGA_PHASE56_CPP=1 ABRKGA_PHASE6_STRUCTURED=1 ABRKGA_PHASE6_GPU_FUSED=0 ABRKGA_PHASE6_CPU_CPP=0`
+- Instance: `P75M2-0`, profiler: `profile_phases.py`, 5 generations
+
+Aggregate results (mean across seeds):
+
+| Metric | Baseline (`c2c3827`) | Phase3-reverted | Delta |
+|---|---:|---:|---:|
+| Mean gen time (s) | 5.281 | 5.174 | **-2.03%** |
+| Total wave fn time (s) | 24.622 | 24.087 | **-2.17%** |
+| Phase 3a time (s) | 3.016 | 2.303 | **-23.64%** |
+| Phase 3b time (s) | 0.908 | 0.834 | **-8.19%** |
+| Phase 5 time (s) | 4.257 | 4.414 | +3.69% |
+| Phase 6 time (s) | 0.668 | 0.719 | +7.58% |
+
+Conclusion:
+
+- Reverting Phase 3 is currently the fastest tested variant overall.
+- Phase 5/6 became slightly slower, but the Phase 3 gain is larger, so net runtime improves.
+
+### B2. Phase 3 indirect slowdown investigation
+
+Phase 3 code is **byte-for-byte identical** between current-best and 5a70d85. Yet current-best shows slower Phase 3 times (P75M2-0):
+
+| Metric | Current-best | 5a70d85 | Delta |
+|--------|---:|---:|---:|
+| Phase 3a (ms/wave) | 4.943 | 4.590 | **+7.7%** |
+| Phase 3b (ms/wave) | 1.797 | 1.657 | **+8.4%** |
+
+Since Phase 3 is pure CPU with `torch.cuda.synchronize()` on both boundaries, this is a real code-level difference caused by indirect effects from other phase changes. Five hypotheses, ranked by likelihood:
+
+**1. BinState object size (4 extra fields).**
+Current-best's BinState has 20 fields vs 16 in 5a70d85 (`grid_materialized`, `pending_part_matrix`, `pending_y_start`, `pending_width`). Without `__slots__`, each instance uses a `__dict__` with a larger hash table (32-slot vs 24-slot). Phase 3 does ~9,000 attribute lookups per wave (`bin_state.area`, `.vacancy_vector`, `.enclosure_box_length`, `.grid_state_idx`). Per-lookup overhead is small (~1-2ns) but sums to ~10-20ms/gen.
+
+**2. `_ensure_bin_grid_materialized` method call in Phase 5.**
+Called per placement (always returns immediately with `GPU_FUSED=0`). Costs ~500ns per call. Charged to Phase 5 timer, but shifts Phase 5/6 timing which affects when Phase 3's BinState objects are created — potentially worsening memory locality for Phase 3's iteration.
+
+**3. Phase 6 code path branching and GPU/CPU interleaving.**
+Old Phase 6 was 3 lines calling `_start_new_bin` (individual GPU ops interleaved with CPU). Current Phase 6 is ~140 lines with multiple branches, batched GPU ops (`index_fill_` + `_cuda_batch_update`), then all CPU updates. This changes when BinState objects are finalized in memory, potentially affecting cache behavior when Phase 3 iterates over them in the next wave.
+
+**4. Module-level C++ extension imports.**
+Current-best imports 4 compiled `.so` modules at startup (`phase3_collector`, `phase5_selector`, `phase56_planner`, `phase6_cpu_update`). These consume process memory and may affect CPU instruction/data cache globally. The `phase3_collector` import is unused since Phase 3 was reverted.
+
+**5. GC timing redistribution.**
+Current Phase 5 returns numpy arrays from C++ functions; old Phase 5 used Python lists. Different allocation patterns shift when Python's garbage collector runs. GC cycles that previously fell in Phase 5/6 may now fall in Phase 3.
+
+**Quick tests to quantify:**
+- Add `__slots__` to BinState → eliminates `__dict__` overhead, tests hypothesis 1
+- Remove the unused `from phase3_collector import ...` → tests hypothesis 4
+- Both are low-risk, non-functional changes
+
+### C. Phase 6 deep-native attempts (status)
+
+Two higher-risk Phase 6 acceleration attempts were implemented/tested during this optimization cycle:
+
+1. Fully fused GPU placement + vacancy metadata updates
+2. Batched CPU-side bin/vacancy updates via C++ extension
+
+Observed outcome: no consistent end-to-end win versus the structured baseline; in multiple runs these were neutral-to-worse.
+
+Current practical recommendation:
+
+- Keep `ABRKGA_PHASE6_STRUCTURED=1`
+- Keep `ABRKGA_PHASE6_GPU_FUSED=0`
+- Keep `ABRKGA_PHASE6_CPU_CPP=0`
+
+### D. Flag overhead vs maintainability
+
+Runtime overhead from checking env flags is negligible in practice (micro-benchmark on local machine: ~0.48 microseconds per `os.getenv(...).strip()` check). The real concern with flags is maintainability and testing matrix size, not raw speed.
+
+Note: after the Phase 3 rollback, `ABRKGA_PHASE3_CPP` is effectively non-impacting in the main evaluator path unless Phase 3 native collection is reintroduced.
+
+---
+
 ## Current Performance Profile
 
 ### P50M2-0 (500 individuals, 2 machines)
@@ -350,13 +453,13 @@ CUDA streams were previously tested and showed 23-29% slowdown due to GPU satura
 | 10 | CUDA streams cross-machine | Unclear | Med | Multi-machine |
 
 ### For P50M2 (your primary benchmark):
-Focus on **6** (Phase 4 reduction) and **9** (Cython hot loops). These are the highest-impact optimizations for 2-machine instances where parallel machines doesn't apply.
+Focus on **6** (Phase 4 reduction) and **9** (C++/pybind11 hot loops). These are the highest-impact optimizations for 2-machine instances where parallel machines doesn't apply.
 
 ### For P100M4 and larger:
 Focus on **1** (parallel machines) and **4** (sparse grid allocation). These are transformative for multi-machine instances — potentially cutting gen time from 12.8s to 4-5s by running machines concurrently.
 
 ### For very large instances (P200+, future):
-**4** (sparse grid) is mandatory to even fit in VRAM. **1** (parallel machines) + **9** (Cython) become critical at this scale.
+**4** (sparse grid) is mandatory to even fit in VRAM. **1** (parallel machines) + **9** (C++/pybind11) become critical at this scale.
 
 ---
 

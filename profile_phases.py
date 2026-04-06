@@ -164,53 +164,7 @@ class TimedEvaluator(WaveBatchEvaluator):
         p1_bin_areas, p1_part_areas = [], []
         p1_n_tests = 0
 
-        p1_native_candidates = [
-            ctx_idx
-            for ctx_idx, (ctx, part_data, _) in enumerate(context_info)
-            if part_data.densities_flat is not None
-            and part_data.shapes_heights is not None
-            and part_data.shapes_widths is not None
-            and part_data.density_offsets is not None
-            and ctx.open_bins
-        ]
-        p1_native_handled = set()
-        p1_native = self._collect_phase3_tests_native_batch(
-            context_info=context_info,
-            ctx_indices=p1_native_candidates,
-            H=H,
-            W=W,
-            mode=0,
-            ctx_first_valid_bin=ctx_first_valid_bin,
-        )
-        if p1_native is not None:
-            p1_native_handled = set(p1_native_candidates)
-            first_valid_global, out_ctx_global, out_bin_local, out_rot_local = p1_native
-            for ctx_idx in p1_native_candidates:
-                if first_valid_global[ctx_idx] != -1:
-                    ctx_first_valid_bin[ctx_idx] = int(first_valid_global[ctx_idx])
-
-            for ctx_idx_i, b_local_i, rot_i in zip(out_ctx_global, out_bin_local, out_rot_local):
-                ctx_idx = int(ctx_idx_i)
-                b_local = int(b_local_i)
-                rot = int(rot_i)
-                ctx, part_data, mach_part_data = context_info[ctx_idx]
-                bin_state = ctx.open_bins[b_local]
-                shape = part_data.shapes[rot]
-                p1_grid_indices.append(bin_state.grid_state_idx)
-                p1_part_ffts.append(mach_part_data.ffts[rot])
-                p1_heights.append(shape[0]); p1_widths.append(shape[1])
-                p1_bin_indices.append(b_local); p1_shapes.append(shape)
-                p1_bin_states.append(bin_state); p1_rotations.append(rot)
-                p1_ctx_indices.append(ctx_idx)
-                p1_enclosure_lengths.append(bin_state.enclosure_box_length)
-                p1_bin_areas.append(bin_state.area)
-                p1_part_areas.append(part_data.area)
-                p1_n_tests += 1
-
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
-            if ctx_idx in p1_native_handled:
-                continue
-
             for bin_idx, bin_state in enumerate(ctx.open_bins):
                 if bin_state.area + part_data.area > ctx.bin_area:
                     continue
@@ -267,50 +221,8 @@ class TimedEvaluator(WaveBatchEvaluator):
         p2_bin_areas, p2_part_areas = [], []
         p2_n_tests = 0
 
-        p2_native_candidates = [
-            ctx_idx
-            for ctx_idx, (ctx, part_data, _) in enumerate(context_info)
-            if not ctx_p1_hit[ctx_idx]
-            and part_data.densities_flat is not None
-            and part_data.shapes_heights is not None
-            and part_data.shapes_widths is not None
-            and part_data.density_offsets is not None
-            and ctx.open_bins
-        ]
-        p2_native_handled = set()
-        p2_native = self._collect_phase3_tests_native_batch(
-            context_info=context_info,
-            ctx_indices=p2_native_candidates,
-            H=H,
-            W=W,
-            mode=1,
-            ctx_first_valid_bin=ctx_first_valid_bin,
-        )
-        if p2_native is not None:
-            p2_native_handled = set(p2_native_candidates)
-            _, out_ctx_global, out_bin_local, out_rot_local = p2_native
-            for ctx_idx_i, b_local_i, rot_i in zip(out_ctx_global, out_bin_local, out_rot_local):
-                ctx_idx = int(ctx_idx_i)
-                b_local = int(b_local_i)
-                rot = int(rot_i)
-                ctx, part_data, mach_part_data = context_info[ctx_idx]
-                bin_state = ctx.open_bins[b_local]
-                shape = part_data.shapes[rot]
-                p2_grid_indices.append(bin_state.grid_state_idx)
-                p2_part_ffts.append(mach_part_data.ffts[rot])
-                p2_heights.append(shape[0]); p2_widths.append(shape[1])
-                p2_bin_indices.append(b_local); p2_shapes.append(shape)
-                p2_bin_states.append(bin_state); p2_rotations.append(rot)
-                p2_ctx_indices.append(ctx_idx)
-                p2_enclosure_lengths.append(bin_state.enclosure_box_length)
-                p2_bin_areas.append(bin_state.area)
-                p2_part_areas.append(part_data.area)
-                p2_n_tests += 1
-
         for ctx_idx, (ctx, part_data, mach_part_data) in enumerate(context_info):
             if ctx_p1_hit[ctx_idx]:
-                continue
-            if ctx_idx in p2_native_handled:
                 continue
             first_valid = ctx_first_valid_bin[ctx_idx]
 
@@ -428,7 +340,6 @@ class TimedEvaluator(WaveBatchEvaluator):
                     grid_states[bin_state.grid_state_idx, y_start:row+1,
                                 col:col+shape[1]] += part_gpu
             for bin_state, col, row, rot, shape, pd_, mpd in _placements:
-                self._ensure_bin_grid_materialized(bin_state)
                 y_start = row - shape[0] + 1
                 bin_state.grid[y_start:row+1, col:col+shape[1]] += pd_.rotations_uint8[rot]
                 update_vacancy_vector_rows(
@@ -471,42 +382,7 @@ class TimedEvaluator(WaveBatchEvaluator):
             _new_idx_t = torch.tensor(_new_grid_indices, device=self.device, dtype=torch.long)
             grid_states.index_fill_(0, _new_idx_t, 0.0)
 
-            _used_phase6_fused = False
-            if self._phase6_gpu_fused and self.flat_parts_gpu is not None:
-                from wave_batch_evaluator import _cuda_batch_phase6_fused
-                _kernel_args = []
-                for new_bin, part_data, _, best_rot, shape in _new_placements:
-                    y_start = new_bin.bin_length - shape[0]
-                    flat_offset, ph, pw = self.part_update_meta[(part_data.id, best_rot)]
-                    _kernel_args.append((new_bin.grid_state_idx, y_start, flat_offset, ph, pw))
-                try:
-                    row_offsets, row_vacancy_flat = _cuda_batch_phase6_fused(
-                        grid_states, self.flat_parts_gpu, _kernel_args, H, W
-                    )
-                    _used_phase6_fused = True
-                except Exception:
-                    _used_phase6_fused = False
-
-                if _used_phase6_fused:
-                    for i, (new_bin, part_data, mach_part_data, best_rot, shape) in enumerate(_new_placements):
-                        y_start = new_bin.bin_length - shape[0]
-                        r0 = row_offsets[i]
-                        r1 = row_offsets[i + 1]
-                        new_bin.vacancy_vector[y_start:new_bin.bin_length] = row_vacancy_flat[r0:r1]
-                        new_bin.parts_assigned.append(part_data.id)
-                        new_bin.area += part_data.area
-                        new_bin.min_occupied_row = y_start
-                        new_bin.max_occupied_row = new_bin.bin_length - 1
-                        new_bin.enclosure_box_length = shape[0]
-                        new_bin.proc_time += mach_part_data.proc_time
-                        new_bin.proc_time_height = mach_part_data.proc_time_height
-                        new_bin.grid_fft_valid = False
-                        new_bin.grid_materialized = False
-                        new_bin.pending_part_matrix = part_data.rotations_uint8[best_rot]
-                        new_bin.pending_y_start = y_start
-                        new_bin.pending_width = shape[1]
-
-            if (not _used_phase6_fused) and self.flat_parts_gpu is not None:
+            if self.flat_parts_gpu is not None:
                 from wave_batch_evaluator import _cuda_batch_update
                 _kernel_args = []
                 for new_bin, part_data, _, best_rot, shape in _new_placements:
@@ -514,7 +390,7 @@ class TimedEvaluator(WaveBatchEvaluator):
                     flat_offset, ph, pw = self.part_update_meta[(part_data.id, best_rot)]
                     _kernel_args.append((new_bin.grid_state_idx, y_start, 0, flat_offset, ph, pw))
                 _cuda_batch_update(grid_states, self.flat_parts_gpu, _kernel_args, H, W)
-            elif not _used_phase6_fused:
+            else:
                 for new_bin, part_data, _, best_rot, shape in _new_placements:
                     y_start = new_bin.bin_length - shape[0]
                     part_gpu = (part_data.rotations_gpu[best_rot]
@@ -523,9 +399,7 @@ class TimedEvaluator(WaveBatchEvaluator):
                                                      dtype=torch.float32, device=self.device))
                     grid_states[new_bin.grid_state_idx, y_start:new_bin.bin_length, 0:shape[1]] += part_gpu
 
-            if _used_phase6_fused:
-                pass
-            else:
+            if self._phase6_benchmark_mode:
                 used_cpp = False
                 if self._phase6_cpu_cpp:
                     from wave_batch_evaluator import _phase6_cpu_update_batch_cpp
@@ -584,6 +458,21 @@ class TimedEvaluator(WaveBatchEvaluator):
                         new_bin.proc_time += mach_part_data.proc_time
                         new_bin.proc_time_height = mach_part_data.proc_time_height
                         new_bin.grid_fft_valid = False
+            else:
+                for new_bin, part_data, mach_part_data, best_rot, shape in _new_placements:
+                    y_start = new_bin.bin_length - shape[0]
+                    new_bin.grid[y_start:new_bin.bin_length, 0:shape[1]] = part_data.rotations_uint8[best_rot]
+                    new_bin.vacancy_vector[y_start:new_bin.bin_length] = self._phase6_cached_row_vacancy(
+                        part_data, best_rot, new_bin.bin_width
+                    )
+                    new_bin.parts_assigned.append(part_data.id)
+                    new_bin.area += part_data.area
+                    new_bin.min_occupied_row = y_start
+                    new_bin.max_occupied_row = new_bin.bin_length - 1
+                    new_bin.enclosure_box_length = shape[0]
+                    new_bin.proc_time += mach_part_data.proc_time
+                    new_bin.proc_time_height = mach_part_data.proc_time_height
+                    new_bin.grid_fft_valid = False
         self._pt[6] += self._s() - t
 
     def report(self):
