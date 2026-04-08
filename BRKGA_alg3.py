@@ -13,6 +13,7 @@ import pandas as pd
 import pickle
 from collision_backend import create_collision_backend
 from data_structures import PartData, MachinePartData, MachineData, ProblemData
+from full_native_decoder import FullNativeDecoderEvaluator
 import os
 
 # Optimize PyTorch settings for inference workloads
@@ -69,8 +70,18 @@ class BRKGA():
         # Create executor once at initialization (avoid recreating per generation)
         self._executor = None
         self._wave_evaluator = None
+        self._native_decoder = None
+
+        force_native = os.getenv("ABRKGA_FULL_NATIVE_DECODER", "0").strip() not in {"0", "false", "False"}
+        if self.eval_mode == "wave_batch" and force_native:
+            self.eval_mode = "native_full"
         
-        if self.eval_mode == "wave_batch":
+        if self.eval_mode == "native_full":
+            self._native_decoder = FullNativeDecoderEvaluator(
+                problem_data, nbParts, nbMachines, thresholds,
+                instanceParts, collision_backend
+            )
+        elif self.eval_mode == "wave_batch":
             # Initialize wave batch evaluator for GPU batching
             self._wave_evaluator = WaveBatchEvaluator(
                 problem_data, nbParts, nbMachines, thresholds,
@@ -80,9 +91,9 @@ class BRKGA():
             max_workers = self.eval_workers if self.eval_workers > 0 else min(32, (os.cpu_count() or 4))
             self._executor = ThreadPoolExecutor(max_workers=max_workers)
         
-        # Fitness memoization cache (only for serial/thread/process — wave_batch chromosomes
+        # Fitness memoization cache (only for serial/thread/process — native/wave batch chromosomes
         # are continuous floats that never repeat, so the cache would have 0% hit rate)
-        if self.eval_mode != "wave_batch":
+        if self.eval_mode not in {"wave_batch", "native_full"}:
             self._fitness_cache = {}
             self._cache_hits = 0
             self._cache_misses = 0
@@ -106,6 +117,8 @@ class BRKGA():
         return tuple(np.round(solution, 4))
     
     def cal_fitness(self, population):
+        if self.eval_mode == "native_full":
+            return self._native_decoder.evaluate_batch(np.array(population))
         if self.eval_mode == "wave_batch":
             return self._wave_evaluator.evaluate_batch(np.array(population))
 
@@ -156,7 +169,7 @@ class BRKGA():
             self._executor = None
         
         # Report cache effectiveness (only when cache is active)
-        if self.eval_mode != "wave_batch":
+        if self.eval_mode not in {"wave_batch", "native_full"}:
             total = self._cache_hits + self._cache_misses
             if total > 0:
                 hit_rate = 100.0 * self._cache_hits / total
@@ -606,4 +619,3 @@ if __name__ == "__main__":
 
         # Save the Excel file
         writer.close()
-
