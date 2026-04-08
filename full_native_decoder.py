@@ -145,6 +145,30 @@ void native_select_best_positions_cuda(
     torch::Tensor out_col_start
 );
 
+void native_fused_gather_multiply_cuda(
+    torch::Tensor grid_ffts,
+    torch::Tensor part_ffts,
+    torch::Tensor grid_idx,
+    torch::Tensor rot_idx,
+    torch::Tensor out,
+    int chunk_n,
+    int fft_size
+);
+
+inline void native_fused_gather_multiply(
+    torch::Tensor grid_ffts,
+    torch::Tensor part_ffts,
+    torch::Tensor grid_idx,
+    torch::Tensor rot_idx,
+    torch::Tensor out,
+    int chunk_n,
+    int fft_size
+) {
+    native_fused_gather_multiply_cuda(
+        grid_ffts, part_ffts, grid_idx, rot_idx, out, chunk_n, fft_size
+    );
+}
+
 inline void native_batch_grid_update(
     torch::Tensor grid_flat,
     torch::Tensor parts_flat,
@@ -445,6 +469,9 @@ private:
     torch::Tensor ws_x_starts_i32_;
     torch::Tensor ws_part_widths_i32_;
     torch::Tensor ws_part_offsets_i32_;
+    // Pre-allocated complex64 buffer for fused gather-multiply output.
+    // Shape: (CHUNK_SIZE * fft_size,) viewed as (chunk_n, H, W/2+1) per chunk.
+    torch::Tensor ws_fused_product_;
     // Output buffers for the CUDA selector kernel — pre-allocated once and
     // reused every chunk so we avoid repeated GPU alloc + fill_(0) per chunk.
     torch::Tensor ws_sel_has_i32_;
@@ -490,6 +517,14 @@ private:
     torch::Tensor ensure_workspace_i32(torch::Tensor& ws, int64_t n) {
         auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device_);
         if (!ws.defined() || ws.scalar_type() != torch::kInt32 || ws.device() != device_ || ws.numel() < n) {
+            ws = torch::empty({std::max<int64_t>(n, 1)}, opts);
+        }
+        return ws.narrow(0, 0, n);
+    }
+
+    torch::Tensor ensure_workspace_cfloat(torch::Tensor& ws, int64_t n) {
+        auto opts = torch::TensorOptions().dtype(torch::kComplexFloat).device(device_);
+        if (!ws.defined() || ws.scalar_type() != torch::kComplexFloat || ws.device() != device_ || ws.numel() < n) {
             ws = torch::empty({std::max<int64_t>(n, 1)}, opts);
         }
         return ws.narrow(0, 0, n);
@@ -837,9 +872,20 @@ private:
             auto part_h_t = all_h_t.narrow(0, chunk_start, chunk_n);
             auto part_w_t = all_w_t.narrow(0, chunk_start, chunk_n);
 
-            auto batch_grid_ffts = grid_ffts.index_select(0, grid_idx_t);
-            auto batch_part_ffts = machine_ffts_dense_[static_cast<size_t>(machine_idx)].index_select(0, rot_idx_t);
-            auto overlap_batch = torch::fft::irfft2(batch_grid_ffts * batch_part_ffts, {H, W});
+            const int fft_size = H * ((W / 2) + 1);
+            auto product_flat = ensure_workspace_cfloat(ws_fused_product_, static_cast<int64_t>(chunk_n) * fft_size);
+            auto product = product_flat.view({chunk_n, H, (W / 2) + 1});
+            if (grid_ffts.is_cuda()) {
+                native_fused_gather_multiply(
+                    grid_ffts, machine_ffts_dense_[static_cast<size_t>(machine_idx)],
+                    grid_idx_t, rot_idx_t, product, chunk_n, fft_size
+                );
+            } else {
+                auto batch_grid_ffts = grid_ffts.index_select(0, grid_idx_t);
+                auto batch_part_ffts = machine_ffts_dense_[static_cast<size_t>(machine_idx)].index_select(0, rot_idx_t);
+                product.copy_(batch_grid_ffts * batch_part_ffts);
+            }
+            auto overlap_batch = torch::fft::irfft2(product, {H, W}, {-2, -1}, "forward");
 
             // Compute the valid-placement boolean mask lazily.  When the CUDA
             // selector kernel is active it performs round/eq/ge masking
@@ -1810,6 +1856,60 @@ void native_select_best_positions_cuda(
         out_col_start.data_ptr<int>()
     );
 }
+
+// ── Fused gather-multiply kernel ─────────────────────────────────────────────
+// Replaces: index_select(grid_ffts, grid_idx) * index_select(part_ffts, rot_idx)
+// Reads directly from the source tensors, multiplies complex values in-register,
+// writes the product once.  Eliminates 2 intermediate tensor allocations and
+// reduces memory traffic from ~7 passes to 3.
+
+__global__ void _fused_gather_multiply_kernel(
+    const float2* __restrict__ grid_ffts,   // (N_grid, fft_size)
+    const float2* __restrict__ part_ffts,   // (N_part, fft_size)
+    const int64_t* __restrict__ grid_idx,   // (chunk_n,)
+    const int64_t* __restrict__ rot_idx,    // (chunk_n,)
+    float2* __restrict__ out,               // (chunk_n, fft_size)
+    int fft_size
+) {
+    int test = blockIdx.y;
+    int elem = blockIdx.x * blockDim.x + threadIdx.x;
+    if (elem >= fft_size) return;
+
+    long long g_off = (long long)grid_idx[test] * fft_size + elem;
+    long long p_off = (long long)rot_idx[test]  * fft_size + elem;
+
+    float2 g = __ldg(&grid_ffts[g_off]);
+    float2 p = __ldg(&part_ffts[p_off]);
+
+    // Complex multiply: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+    float2 r;
+    r.x = g.x * p.x - g.y * p.y;
+    r.y = g.x * p.y + g.y * p.x;
+
+    out[(long long)test * fft_size + elem] = r;
+}
+
+void native_fused_gather_multiply_cuda(
+    torch::Tensor grid_ffts,
+    torch::Tensor part_ffts,
+    torch::Tensor grid_idx,
+    torch::Tensor rot_idx,
+    torch::Tensor out,
+    int chunk_n,
+    int fft_size
+) {
+    if (chunk_n <= 0 || fft_size <= 0) return;
+    const int threads = 256;
+    dim3 blocks((fft_size + threads - 1) / threads, chunk_n);
+    _fused_gather_multiply_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const float2*>(grid_ffts.data_ptr()),
+        reinterpret_cast<const float2*>(part_ffts.data_ptr()),
+        grid_idx.data_ptr<int64_t>(),
+        rot_idx.data_ptr<int64_t>(),
+        reinterpret_cast<float2*>(out.data_ptr()),
+        fft_size
+    );
+}
 """
 
 _module = None
@@ -1911,7 +2011,9 @@ def _pack_problem_data(problem_data, nb_machines, thresholds, instance_parts, de
                 if device.startswith("cuda") and (not fft.is_cuda or str(fft.device) != device):
                     fft = fft.to(device)
                 machine_fft_rot.append(fft.contiguous())
-        machine_fft_dense.append(torch.stack(machine_fft_rot, dim=0).contiguous())
+        fft_dense = torch.stack(machine_fft_rot, dim=0).contiguous()
+        fft_dense = fft_dense / float(mach.bin_length * mach.bin_width)
+        machine_fft_dense.append(fft_dense)
 
     if rot_gpu_tensors:
         flat_parts_gpu = torch.cat([t.reshape(-1) for t in rot_gpu_tensors], dim=0).contiguous()
