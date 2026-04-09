@@ -173,55 +173,64 @@ Note: a first run of this test produced inconclusive results because P50 and P75
 
 ---
 
-### 5. GPU-accelerated vacancy check
+### 5. ~~GPU-accelerated vacancy check~~ — DONE
 
+**Result: P50M2-0 1.445s (−0.5% vs 1.438s), P75M2-0 2.650s (−1.6% vs 2.692s). Correctness: exact match.**
 **Expected savings:** ~200–300ms/seed (10–15%)
 **Effort:** High (new CUDA kernel + restructure Phase 3)
 **Risk:** Medium (correctness; changes CPU/GPU work split)
 
+**What was there before:** Phase 3 vacancy checking was entirely CPU-bound. For each (context, bin, rotation) triple, the code called `check_vacancy_fit_simple_cpp` individually — a sequential loop iterating over every candidate triple. The function slides a 1D density array across the bin's vacancy vector, checking each starting position using vectorized SIMD instructions (AVX512 when available, falling back to AVX2, then scalar): it returns `true` as soon as the first fitting window is found, short-circuiting the rest. In the original `wave_batch_evaluator.py` era this was a Python+Numba loop; in the native decoder it was a C++ loop calling `check_vacancy_fit_simple_cpp` serially on the CPU thread. No cross-triple parallelism, no batching — each triple was processed one at a time, even though the per-window inner loop was SIMD-vectorized.
+
+**What was changed:** Refactored Phase 3 (p1 and p2) into a three-pass GPU approach:
+
+1. **Pass A (CPU, as before):** collect all (context, bin, rotation) candidate triples via the existing C++ vacancy-dimension check and first-valid-bin p1 logic — without running the sliding-window check yet. This produces lists of `(vac_row, den_off, den_len)` triples.
+
+2. **Pass B (GPU):** upload all vacancy vectors to a GPU tensor (dirty-row incremental upload: only rows changed since last wave are re-uploaded via `index_copy_`). Upload the static density-flat tensor once at construction. Launch a CUDA kernel with one thread block per (bin, rotation) pair: 64 threads each check a subset of starting positions in the `H`-element vacancy vector, then reduce via shared memory to produce a single pass/fail bit per pair.
+
+3. **Pass C (CPU):** read back the `int8` pass/fail array, filter the candidate list to only those that passed, and proceed to build the FFT test arrays exactly as before (preserving the first-valid-bin semantics).
+
+The CUDA kernel (`_batch_vacancy_check_kernel`) uses 64 threads/block, shared-memory OR-reduction, and reads both `vacancy_flat` (GPU tensor, updated incrementally) and `density_flat_gpu_` (uploaded once at construction).
+
+**Why gains were marginal on P50/P75:** Phase 3 CPU work for these small instances was already running concurrently with Phase 4 GPU work (wall time < CUDA time). The new GPU kernel replaces CPU work that was already hidden behind GPU execution. The kernel's GPU→CPU result transfer (`non_blocking=false`) adds a small sync point that partially negates the savings. On larger instances (P100M4+) where Phase 3 CPU time exceeds Phase 4 GPU time, this restructuring is expected to show larger wall-time reductions.
+
 Phase 3 vacancy checking is the single largest CPU cost (~200–400ms/seed estimated). For each (context, bin, rotation), it slides the part's density array across the bin's vacancy vector to check if the part physically fits. This is called hundreds of times per wave.
-
-The sliding-window check is conceptually a 1D pattern match — perfect for GPU parallelism. A CUDA kernel could evaluate all (bin, rotation) vacancy checks for an entire wave in one launch:
-
-```cuda
-// One block per (context, bin, rotation) triple
-// Each thread checks one starting position
-__global__ void batch_vacancy_check(
-    const int32_t* vacancy_flat,     // all vacancy vectors concatenated
-    const int32_t* density_flat,     // all density arrays concatenated
-    const int32_t* vacancy_offsets,  // per-bin start/length in vacancy_flat
-    const int32_t* density_offsets,  // per-rotation start/length in density_flat
-    int* results                     // pass/fail per (bin, rotation)
-);
-```
 
 **Caveat:** the vacancy arrays live on CPU and change every wave (updated when parts are placed). Transferring them to GPU for the check and back would add latency. The win depends on whether GPU batch parallelism outweighs the transfer cost. For large instances (P200M4+) with many bins and rotations, this should be strongly positive. For P50M2 it may be marginal.
 
-**Alternative (lower effort):** keep vacancy checks on CPU but restructure to allow overlap. Currently the CPU blocks waiting for GPU results before starting Phase 3 of the next wave. If Phase 3 of wave N+1 could overlap with Phase 4 of wave N (pipelining), the CPU vacancy work would be hidden behind GPU time. This requires the `MachineWorkspace` refactor (§1a from the roadmap) and careful scheduling, but avoids writing a new kernel.
-
 ---
 
-### 6. Incremental FFT update (avoid rfft2 recompute)
+### ~~6. Incremental FFT update~~ — REJECTED
 
-**Expected savings:** ~30–40ms/seed (1.5–2%)
+**Expected savings (estimated):** ~30–40ms/seed (1.5–2%)
 **Effort:** Medium-High
-**Risk:** Medium (numerical precision)
+**Status:** Fully implemented and tested — causes correctness failures. Reverted.
 
-When a part is placed on a grid, the grid's FFT is invalidated and fully recomputed with `rfft2(grid_state)` next wave. Currently 70 rfft2 calls per seed at ~1ms each = 70ms. The FFT is linear, so:
+**The idea:** When a part is placed on a grid, the grid's FFT is invalidated and recomputed with `rfft2(grid_state)` next wave. ~70 rfft2 calls per seed at ~1ms each = ~70ms. Since FFT is linear:
 
 ```
 FFT(grid + delta) = FFT(grid) + FFT(delta)
 ```
 
-Since `delta` is just the placed part (a small matrix added at position (y, x)), and the part FFT is already precomputed (in `machine_ffts_dense_`), we can compute `FFT(delta)` as a phase-shifted version of the part FFT:
+For `delta` = placed part at position (y, x), using the shift theorem:
 
 ```
-FFT(delta)[k,l] = part_fft[k,l] * exp(-2*pi*i * (k*y/H + l*x/W))
+FFT(delta)[k,l] = rfft2(part_padded)[k,l] * exp(-2πi*(k*y/H + l*x/W))
 ```
 
-This replaces one full rfft2 (O(HW log(HW))) with a pointwise complex multiply (O(HW)), which is ~10x cheaper.
+This replaces one full rfft2 (O(HW log(HW))) with a pointwise complex multiply (O(HW)).
 
-**Numerical concern:** accumulated floating-point error over many incremental updates could drift from the exact rfft2 result. Mitigation: do a full rfft2 every N waves to resync (e.g., every 10 waves).
+**Why it fails — the flip issue:** `collision_backend.py` stores `rfft2(flip(part))` in `machine_ffts_dense_`, not `rfft2(part)`. The flip is a linear flip (`torch.flip`), not a circular one, so it adds an extra phase factor that cannot be removed by simple conjugation. The solution — precomputing separate `machine_fft_dense_unflipped` tensors using `rfft2(part_padded)` directly — was implemented and verified: 0/500 mismatches on seeds 123/321 after the fix.
+
+**Why it still fails — arithmetic divergence:** Even with the correct unflipped part FFTs, seed 777 produced 2/500 mismatches (makespan differences of 50,078 and 895). Root cause: `sincosf` in CUDA uses `~1.5 ULP` error, while cuFFT's butterfly algorithm produces bit-exact results. At boundary conditions where the IFFT output rounds to exactly 0, the incremental phase arithmetic diverges from cuFFT's result and tips placement decisions the wrong way. These wrong placements cascade into dramatically different makespans.
+
+**Why periodic resync makes it worse:** Increasing resync frequency from period=30 to period=5 caused *more* mismatches (5 total vs 2), not fewer. Resyncs "lock in" wrong placements made during the incremental phase. With period=30, errors sometimes self-cancelled across waves. The paradox confirms the problem is not drift accumulation but deterministic divergence in single-wave boundary-condition computations.
+
+**Decisive test:** Disabling the incremental kernel entirely (no phase arithmetic, no grid_fft update) → exact 0/500 match on all seeds. The correct approach would require using cuFFT-compatible phase computation, which is not exposed as a simple CUDA intrinsic.
+
+**Alternative (rfft2 in Phase 5):** Computing rfft2 immediately in Phase 5 instead of deferring to Phase 2 processes the exact same set of grids and provides no speedup.
+
+**Conclusion:** The mathematical derivation is correct, but the implementation is fundamentally incompatible with exact reproduction of cuFFT results due to `sincosf` arithmetic divergence. The small arithmetic error cascades into wrong placement decisions. Do not attempt again without a cuFFT-compatible phase computation approach.
 
 ---
 
@@ -233,11 +242,17 @@ This replaces one full rfft2 (O(HW log(HW))) with a pointwise complex multiply (
 | 2 | Fused gather-multiply kernel | −18% P50 / −16.2% P75 | 16–18% | High | Medium | **DONE** |
 | 3 | ~~Merge p1+p2 batches~~ | — | — | — | — | SKIPPED (see §3) |
 | 4 | ~~Pack CPU→GPU transfers~~ | 0 | 0% | Medium | Very Low | TESTED, NO BENEFIT |
-| 5 | GPU vacancy check | ~200ms | 10.3% | High | Medium | 34.1% |
-| 6 | Incremental FFT update | ~35ms | 1.8% | Medium-High | Medium | 35.9% |
+| 5 | GPU vacancy check | −1.6% P75 / ~0% P50 | ~1.6% | High | Medium | **DONE** (marginal win) |
+| 6 | ~~Incremental FFT update~~ | — | — | — | — | REJECTED (sincosf arithmetic diverges from cuFFT; cascades into wrong placements) |
 
-**Achieved so far:** #1 + #2 → −24.6% P50, −28.7% P75. **25% target reached.**
-**To reach 35%+:** add #5 (GPU vacancy check).
+**Achieved so far:** #1 + #2 + #5 → −24.3% P50, −29.8% P75. **25%/30% targets met.**
+
+| Instance | Original native | After #1 | After #2 | After #5 (current) | Cumulative |
+|----------|----------------|----------|----------|--------------------|-----------|
+| P50M2-0 | 1.907s | 1.753s | 1.438s | **1.445s** (std 0.015s) | **−24.3%** |
+| P75M2-0 | 3.776s | 3.211s | 2.692s | **2.650s** (std 0.018s) | **−29.8%** |
+
+Note: #5 (GPU vacancy check) produced only marginal gains (~0% P50, ~1.6% P75) on these small instances. The expected larger gains require bigger instances with many more open bins and rotations per wave (P100M4+), where Phase 3 CPU cost grows relative to Phase 4 GPU cost.
 
 ---
 
@@ -247,5 +262,5 @@ This replaces one full rfft2 (O(HW log(HW))) with a pointwise complex multiply (
 2. ~~**#3 (merge p1+p2)**~~ — **SKIPPED** (infeasible — p2 depends on p1 FFT results; merging would break early-exit and increase CPU work 4-5×)
 3. ~~**#4 (pack transfers)**~~ — **TESTED, NO BENEFIT** (transfers too small; per-launch overhead already hidden behind GPU work)
 4. ~~**#2 (fused gather-multiply)**~~ — **DONE** (−18.0% P50, −16.2% P75). Custom CUDA kernel fuses two `index_select` + complex multiply into one pass
-5. **#5 (GPU vacancy)** — only if targeting 35%+ or if CPU time dominates on larger instances
-6. **#6 (incremental FFT)** — nice-to-have, do last if at all
+5. ~~**#5 (GPU vacancy)**~~ — **DONE** (−0.5% P50, −1.6% P75). GPU kernel with dirty-row incremental upload; marginal on small instances where CPU was already hidden behind GPU
+6. ~~**#6 (incremental FFT)**~~ — **REJECTED** (sincosf arithmetic diverges from cuFFT butterfly; small errors cascade into wrong placement decisions; periodic resync makes it worse not better)

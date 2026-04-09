@@ -47,6 +47,7 @@ struct BinStateNative {
     double proc_time = 0.0;
     double proc_time_height = 0.0;
     bool grid_fft_valid = false;
+    bool vacancy_gpu_dirty = true;  // true when vacancy vector not yet uploaded to GPU
     int bin_length = 0;
     int bin_width = 0;
 };
@@ -154,6 +155,30 @@ void native_fused_gather_multiply_cuda(
     int chunk_n,
     int fft_size
 );
+
+void native_batch_vacancy_check_cuda(
+    torch::Tensor vacancy_flat,   // (max_bins, H) int32
+    torch::Tensor density_flat,   // (total_density_len,) int32
+    torch::Tensor pair_vac_row,   // (n_pairs,) int32
+    torch::Tensor pair_den_off,   // (n_pairs,) int32
+    torch::Tensor pair_den_len,   // (n_pairs,) int32
+    torch::Tensor out_pass,       // (n_pairs,) int8
+    int H
+);
+
+inline void native_batch_vacancy_check(
+    torch::Tensor vacancy_flat,
+    torch::Tensor density_flat,
+    torch::Tensor pair_vac_row,
+    torch::Tensor pair_den_off,
+    torch::Tensor pair_den_len,
+    torch::Tensor out_pass,
+    int H
+) {
+    native_batch_vacancy_check_cuda(
+        vacancy_flat, density_flat, pair_vac_row, pair_den_off, pair_den_len, out_pass, H
+    );
+}
 
 inline void native_fused_gather_multiply(
     torch::Tensor grid_ffts,
@@ -328,6 +353,16 @@ public:
             }
             machine_ffts_dense_[m] = dense.contiguous();
         }
+
+        // Upload density_flat to GPU once — rotation densities never change.
+        if (device_.is_cuda() && !density_flat_.empty()) {
+            auto cpu_t = torch::from_blob(
+                const_cast<int32_t*>(density_flat_.data()),
+                {static_cast<int64_t>(density_flat_.size())},
+                torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU)
+            );
+            density_flat_gpu_ = cpu_t.to(device_);
+        }
     }
 
     py::array_t<double> evaluate_batch(
@@ -400,6 +435,7 @@ private:
     std::vector<torch::Tensor> machine_ffts_dense_;
     std::vector<int32_t> rot_flat_offsets_;
     torch::Tensor flat_parts_gpu_;
+    torch::Tensor density_flat_gpu_;   // GPU copy of density_flat_, uploaded once in constructor
 
     struct GpuPlacement {
         int grid_idx;
@@ -448,6 +484,10 @@ private:
     std::vector<int32_t> scratch_place_cols_;
     std::vector<int32_t> scratch_newbin_ctx_local_;
 
+    // Vacancy dirty-flush scratch.
+    std::vector<int32_t> scratch_dirty_grid_rows_;
+    std::vector<BinStateNative*> scratch_dirty_bins_ptr_;
+
     std::vector<GpuPlacement> scratch_gpu_updates_;
     std::vector<GpuPlacement> scratch_phase6_gpu_updates_;
     std::vector<int64_t> scratch_phase6_grid_indices_;
@@ -469,6 +509,24 @@ private:
     torch::Tensor ws_x_starts_i32_;
     torch::Tensor ws_part_widths_i32_;
     torch::Tensor ws_part_offsets_i32_;
+    // GPU vacancy buffer: (max_total_bins, H) int32.
+    // Allocated once per process_machine_batch call; rows updated lazily via dirty flags.
+    torch::Tensor ws_vacancy_gpu_;
+    // Temporary GPU buffer for uploading dirty vacancy rows (separate from pair buffer).
+    torch::Tensor ws_vac_upload_gpu_;     // (n_dirty * H,) int32 — staging for index_copy_
+    // GPU scratch for vacancy-check pair inputs/output (packed: 3*n_pairs int32).
+    torch::Tensor ws_vac_pairs_gpu_;      // (3*n_pairs,) int32: vac_row | den_off | den_len
+    torch::Tensor ws_vac_out_pass_;       // (n_pairs,) int8
+    // Pinned CPU backing for vacancy upload and pair data.
+    torch::Tensor ws_cpu_vac_upload_;     // pinned, int32 — batched vacancy rows
+    torch::Tensor ws_cpu_vac_row_ids_;    // pinned, int32 — which GPU rows to write
+    torch::Tensor ws_cpu_pair_buf_;       // pinned, int32 — packed [vac_row | den_off | den_len]
+    torch::Tensor ws_cpu_pass_buf_;       // pinned, int8  — result readback
+    // CPU-side scratch for pair building.
+    std::vector<int32_t> scratch_pair_vac_row_;
+    std::vector<int32_t> scratch_pair_den_off_;
+    std::vector<int32_t> scratch_pair_den_len_;
+    std::vector<int8_t>  scratch_pass_;
     // Pre-allocated complex64 buffer for fused gather-multiply output.
     // Shape: (CHUNK_SIZE * fft_size,) viewed as (chunk_n, H, W/2+1) per chunk.
     torch::Tensor ws_fused_product_;
@@ -526,6 +584,22 @@ private:
         auto opts = torch::TensorOptions().dtype(torch::kComplexFloat).device(device_);
         if (!ws.defined() || ws.scalar_type() != torch::kComplexFloat || ws.device() != device_ || ws.numel() < n) {
             ws = torch::empty({std::max<int64_t>(n, 1)}, opts);
+        }
+        return ws.narrow(0, 0, n);
+    }
+
+    torch::Tensor ensure_workspace_i8(torch::Tensor& ws, int64_t n) {
+        auto opts = torch::TensorOptions().dtype(torch::kInt8).device(device_);
+        if (!ws.defined() || ws.scalar_type() != torch::kInt8 || ws.device() != device_ || ws.numel() < n) {
+            ws = torch::empty({std::max<int64_t>(n, 1)}, opts);
+        }
+        return ws.narrow(0, 0, n);
+    }
+
+    torch::Tensor ensure_cpu_pinned_i8(torch::Tensor& ws, int64_t n) {
+        auto opts = torch::TensorOptions().dtype(torch::kInt8).device(torch::kCPU).pinned_memory(true);
+        if (!ws.defined() || ws.numel() < n) {
+            ws = torch::empty({std::max<int64_t>(n, 64)}, opts);
         }
         return ws.narrow(0, 0, n);
     }
@@ -1067,6 +1141,7 @@ private:
         }
 
         update_vacancy_rows_cpp(bin.vacancy, bin.grid, y_start, ph, machine_width);
+        bin.vacancy_gpu_dirty = true;
         bin.area += part_area_[static_cast<size_t>(part_idx)];
         bin.min_occupied_row = std::min(bin.min_occupied_row, y_start);
         bin.max_occupied_row = std::max(bin.max_occupied_row, y);
@@ -1133,6 +1208,12 @@ private:
             {max_total_bins, H, (W / 2) + 1},
             torch::TensorOptions().dtype(torch::kComplexFloat).device(device_)
         );
+        // Vacancy GPU buffer: one row per open bin slot, length H each.
+        // Filled lazily via dirty flags before Phase 3 each wave.
+        ws_vacancy_gpu_ = torch::empty(
+            {max_total_bins, H},
+            torch::TensorOptions().dtype(torch::kInt32).device(device_)
+        );
         auto row_idx = torch::arange(H, torch::TensorOptions().dtype(torch::kLong).device(device_)).view({1, H, 1});
         auto col_idx = torch::arange(W, torch::TensorOptions().dtype(torch::kLong).device(device_)).view({1, 1, W});
         auto row_idx_f = row_idx.to(torch::kFloat);
@@ -1172,6 +1253,99 @@ private:
             makespans[static_cast<size_t>(i)] = total;
         }
         return makespans;
+    }
+
+    // Upload all dirty vacancy vectors to GPU in one batched copy.
+    void flush_dirty_vacancies(
+        const std::vector<ContextNative>& contexts,
+        const std::vector<int>& active_indices,
+        int H
+    ) {
+        // Collect dirty bins.
+        scratch_dirty_grid_rows_.clear();
+        scratch_dirty_bins_ptr_.clear();
+        for (int gidx : active_indices) {
+            const auto& ctx = contexts[static_cast<size_t>(gidx)];
+            for (const auto& b : ctx.open_bins) {
+                if (b.vacancy_gpu_dirty) {
+                    scratch_dirty_grid_rows_.push_back(b.grid_state_idx);
+                    scratch_dirty_bins_ptr_.push_back(const_cast<BinStateNative*>(&b));
+                }
+            }
+        }
+        const int n_dirty = static_cast<int>(scratch_dirty_grid_rows_.size());
+        if (n_dirty == 0) return;
+
+        // Pack vacancy rows into one pinned buffer: shape (n_dirty * H,)
+        const int64_t total_elems = static_cast<int64_t>(n_dirty) * H;
+        auto cpu_vac = ensure_cpu_pinned_i32(ws_cpu_vac_upload_, total_elems);
+        int32_t* dst = cpu_vac.data_ptr<int32_t>();
+        for (int i = 0; i < n_dirty; ++i) {
+            const auto* b = scratch_dirty_bins_ptr_[static_cast<size_t>(i)];
+            std::memcpy(dst + i * H, b->vacancy.data(), static_cast<size_t>(H) * sizeof(int32_t));
+        }
+        // Transfer to GPU: one copy_ call.
+        auto gpu_vac_flat = ws_vacancy_gpu_.view({-1});  // (max_total_bins * H,)
+        auto cpu_vac_flat = cpu_vac;                     // (n_dirty * H,)
+        // Use index_copy_ via a row index tensor to write only the dirty rows.
+        auto cpu_rows = ensure_cpu_pinned_i32(ws_cpu_vac_row_ids_, static_cast<int64_t>(n_dirty));
+        int32_t* row_ptr = cpu_rows.data_ptr<int32_t>();
+        for (int i = 0; i < n_dirty; ++i) {
+            row_ptr[i] = scratch_dirty_grid_rows_[static_cast<size_t>(i)];
+        }
+        // Build GPU row-index tensor and use index_copy_.
+        auto gpu_row_idx_long = ensure_workspace_long(ws_wave_idx_long_, static_cast<int64_t>(n_dirty));
+        {
+            auto cpu_long = ensure_cpu_pinned_long(ws_cpu_wave_idx_, static_cast<int64_t>(n_dirty));
+            int64_t* lp = cpu_long.data_ptr<int64_t>();
+            for (int i = 0; i < n_dirty; ++i) lp[i] = static_cast<int64_t>(row_ptr[i]);
+            gpu_row_idx_long.copy_(cpu_long, /*non_blocking=*/true);
+        }
+        // Upload dirty rows: select dirty rows from packed buffer, index_copy_ into ws_vacancy_gpu_.
+        auto gpu_src = ensure_workspace_i32(ws_vac_upload_gpu_, total_elems);
+        gpu_src.copy_(cpu_vac_flat, /*non_blocking=*/true);
+        auto gpu_src_2d = gpu_src.view({n_dirty, H});
+        ws_vacancy_gpu_.index_copy_(0, gpu_row_idx_long, gpu_src_2d);
+
+        // Clear dirty flags.
+        for (auto* b : scratch_dirty_bins_ptr_) {
+            b->vacancy_gpu_dirty = false;
+        }
+    }
+
+    // Evaluate vacancy checks for all (bin, rotation) pairs on GPU.
+    // Returns a bool pass/fail for each pair via scratch_pass_.
+    void run_gpu_vacancy_check(int n_pairs, int H) {
+        scratch_pass_.assign(static_cast<size_t>(n_pairs), 0);
+        if (n_pairs == 0) return;
+        const int64_t np = static_cast<int64_t>(n_pairs);
+
+        // Transfer pair arrays CPU→GPU in one packed buffer.
+        // Layout: vac_row[n] | den_off[n] | den_len[n]
+        auto cpu_pairs = ensure_cpu_pinned_i32(ws_cpu_pair_buf_, 3 * np);
+        int32_t* pp = cpu_pairs.data_ptr<int32_t>();
+        std::memcpy(pp,           scratch_pair_vac_row_.data(), static_cast<size_t>(np) * sizeof(int32_t));
+        std::memcpy(pp + np,      scratch_pair_den_off_.data(), static_cast<size_t>(np) * sizeof(int32_t));
+        std::memcpy(pp + 2 * np,  scratch_pair_den_len_.data(), static_cast<size_t>(np) * sizeof(int32_t));
+
+        auto gpu_pairs = ensure_workspace_i32(ws_vac_pairs_gpu_, 3 * np);
+        gpu_pairs.copy_(cpu_pairs, /*non_blocking=*/false);  // sync: kernel needs data immediately
+        auto gpu_vac_row = gpu_pairs.narrow(0, 0,       np);
+        auto gpu_den_off = gpu_pairs.narrow(0, np,      np);
+        auto gpu_den_len = gpu_pairs.narrow(0, 2 * np,  np);
+
+        auto gpu_out = ensure_workspace_i8(ws_vac_out_pass_, np);
+        native_batch_vacancy_check(
+            ws_vacancy_gpu_, density_flat_gpu_,
+            gpu_vac_row, gpu_den_off, gpu_den_len,
+            gpu_out, H
+        );
+
+        // Readback result (small: one int8 per pair).
+        auto cpu_pass = ensure_cpu_pinned_i8(ws_cpu_pass_buf_, np);
+        cpu_pass.copy_(gpu_out, /*non_blocking=*/false);  // sync
+        const int8_t* pass_ptr = cpu_pass.data_ptr<int8_t>();
+        scratch_pass_.assign(pass_ptr, pass_ptr + n_pairs);
     }
 
     void process_wave(
@@ -1242,6 +1416,9 @@ private:
             }
         }
 
+        // Upload any dirty vacancy vectors to GPU before Phase 3.
+        flush_dirty_vacancies(contexts, active_indices, H);
+
         scratch_ctx_first_valid_bin_.assign(static_cast<size_t>(n_contexts), -1);
         auto& p1 = scratch_p1_;
         p1.grid_indices.clear();
@@ -1254,6 +1431,23 @@ private:
         p1.enclosure_lengths.clear();
         p1.bin_areas.clear();
         p1.part_areas.clear();
+        // ── Phase 3 p1: GPU vacancy check ──────────────────────────────────────
+        // Pass A: collect all (bin, rotation) pairs that pass area+dimension
+        // filters, without vacancy check.  Record their bin grid_state_idx,
+        // density offset+length, and structural metadata for later FFT collection.
+        // Each pair is tagged with (lc, bidx, rg).
+
+        struct P1Pair {
+            int lc, bidx, rg;
+            double p_area;
+        };
+        std::vector<P1Pair> p1_pairs;
+        p1_pairs.reserve(static_cast<size_t>(n_contexts) * 4);
+
+        scratch_pair_vac_row_.clear();
+        scratch_pair_den_off_.clear();
+        scratch_pair_den_len_.clear();
+
         for (int lc = 0; lc < n_contexts; ++lc) {
             auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
             const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
@@ -1266,7 +1460,6 @@ private:
                 if (b.area + p_area > ctx.bin_area) {
                     continue;
                 }
-                bool has_passing = false;
                 for (int rot = 0; rot < nrot; ++rot) {
                     const int rg = r0 + rot;
                     const int ph = rot_h_[static_cast<size_t>(rg)];
@@ -1276,28 +1469,55 @@ private:
                     }
                     const int d0 = rot_density_offsets_[static_cast<size_t>(rg)];
                     const int d1 = rot_density_offsets_[static_cast<size_t>(rg + 1)];
-                    if (check_vacancy_fit_simple_cpp(
-                            b.vacancy,
-                            density_flat_.data() + d0,
-                            d1 - d0)) {
-                        has_passing = true;
-                        p1.grid_indices.push_back(static_cast<int64_t>(b.grid_state_idx));
-                        p1.heights.push_back(rot_h_[static_cast<size_t>(rg)]);
-                        p1.widths.push_back(rot_w_[static_cast<size_t>(rg)]);
-                        p1.bin_indices.push_back(static_cast<double>(bidx));
-                        p1.bin_local.push_back(bidx);
-                        p1.rot_global.push_back(rg);
-                        p1.ctx_local.push_back(lc);
-                        p1.enclosure_lengths.push_back(static_cast<double>(b.enclosure_box_length));
-                        p1.bin_areas.push_back(b.area);
-                        p1.part_areas.push_back(p_area);
-                    }
-                }
-                if (has_passing) {
-                    scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)] = bidx;
-                    break;
+                    p1_pairs.push_back({lc, bidx, rg, p_area});
+                    scratch_pair_vac_row_.push_back(static_cast<int32_t>(b.grid_state_idx));
+                    scratch_pair_den_off_.push_back(static_cast<int32_t>(d0));
+                    scratch_pair_den_len_.push_back(static_cast<int32_t>(d1 - d0));
                 }
             }
+        }
+
+        // Pass B: GPU vacancy check for all pairs.
+        const int n_p1_pairs = static_cast<int>(p1_pairs.size());
+        run_gpu_vacancy_check(n_p1_pairs, H);
+
+        // Pass C: reconstruct p1 test list using mask, preserving first-valid-bin semantics.
+        for (int lc = 0; lc < n_contexts; ++lc) {
+            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
+            const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
+            const double p_area = part_area_[static_cast<size_t>(part_idx)];
+            scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)] = -1;
+        }
+        for (int pi = 0; pi < n_p1_pairs; ++pi) {
+            if (!scratch_pass_[static_cast<size_t>(pi)]) continue;
+            const auto& pair = p1_pairs[static_cast<size_t>(pi)];
+            const int lc = pair.lc;
+            const int bidx = pair.bidx;
+            const int rg = pair.rg;
+            const double p_area = pair.p_area;
+            // Enforce first-valid-bin: only add tests for bidx <= current first_valid
+            const int first_valid = scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)];
+            if (first_valid >= 0 && bidx > first_valid) {
+                continue;  // already found a better bin
+            }
+            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
+            auto& b = ctx.open_bins[static_cast<size_t>(bidx)];
+            if (first_valid < 0 || bidx < first_valid) {
+                // New first-valid bin for this context: drop any p1 tests from later bins
+                // that may have slipped in from previous pairs (shouldn't happen since we
+                // iterate pairs in (lc, bidx, rot) order, but guard for safety).
+                scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)] = bidx;
+            }
+            p1.grid_indices.push_back(static_cast<int64_t>(b.grid_state_idx));
+            p1.heights.push_back(rot_h_[static_cast<size_t>(rg)]);
+            p1.widths.push_back(rot_w_[static_cast<size_t>(rg)]);
+            p1.bin_indices.push_back(static_cast<double>(bidx));
+            p1.bin_local.push_back(bidx);
+            p1.rot_global.push_back(rg);
+            p1.ctx_local.push_back(lc);
+            p1.enclosure_lengths.push_back(static_cast<double>(b.enclosure_box_length));
+            p1.bin_areas.push_back(b.area);
+            p1.part_areas.push_back(p_area);
         }
 
         batch_fft_all_tests(
@@ -1315,6 +1535,7 @@ private:
             }
         }
 
+        // ── Phase 3 p2: GPU vacancy check ──────────────────────────────────────
         auto& p2 = scratch_p2_;
         p2.grid_indices.clear();
         p2.heights.clear();
@@ -1326,6 +1547,18 @@ private:
         p2.enclosure_lengths.clear();
         p2.bin_areas.clear();
         p2.part_areas.clear();
+
+        struct P2Pair {
+            int lc, bidx, rg;
+            double p_area;
+        };
+        std::vector<P2Pair> p2_pairs;
+        p2_pairs.reserve(32);
+
+        scratch_pair_vac_row_.clear();
+        scratch_pair_den_off_.clear();
+        scratch_pair_den_len_.clear();
+
         for (int lc = 0; lc < n_contexts; ++lc) {
             if (scratch_ctx_p1_hit_[static_cast<size_t>(lc)]) {
                 continue;
@@ -1354,24 +1587,36 @@ private:
                     }
                     const int d0 = rot_density_offsets_[static_cast<size_t>(rg)];
                     const int d1 = rot_density_offsets_[static_cast<size_t>(rg + 1)];
-                    if (!check_vacancy_fit_simple_cpp(
-                            b.vacancy,
-                            density_flat_.data() + d0,
-                            d1 - d0)) {
-                        continue;
-                    }
-                    p2.grid_indices.push_back(static_cast<int64_t>(b.grid_state_idx));
-                    p2.heights.push_back(rot_h_[static_cast<size_t>(rg)]);
-                    p2.widths.push_back(rot_w_[static_cast<size_t>(rg)]);
-                    p2.bin_indices.push_back(static_cast<double>(bidx));
-                    p2.bin_local.push_back(bidx);
-                    p2.rot_global.push_back(rg);
-                    p2.ctx_local.push_back(lc);
-                    p2.enclosure_lengths.push_back(static_cast<double>(b.enclosure_box_length));
-                    p2.bin_areas.push_back(b.area);
-                    p2.part_areas.push_back(p_area);
+                    p2_pairs.push_back({lc, bidx, rg, p_area});
+                    scratch_pair_vac_row_.push_back(static_cast<int32_t>(b.grid_state_idx));
+                    scratch_pair_den_off_.push_back(static_cast<int32_t>(d0));
+                    scratch_pair_den_len_.push_back(static_cast<int32_t>(d1 - d0));
                 }
             }
+        }
+
+        const int n_p2_pairs = static_cast<int>(p2_pairs.size());
+        run_gpu_vacancy_check(n_p2_pairs, H);
+
+        for (int pi = 0; pi < n_p2_pairs; ++pi) {
+            if (!scratch_pass_[static_cast<size_t>(pi)]) continue;
+            const auto& pair = p2_pairs[static_cast<size_t>(pi)];
+            const int lc = pair.lc;
+            const int bidx = pair.bidx;
+            const int rg = pair.rg;
+            const double p_area = pair.p_area;
+            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
+            auto& b = ctx.open_bins[static_cast<size_t>(bidx)];
+            p2.grid_indices.push_back(static_cast<int64_t>(b.grid_state_idx));
+            p2.heights.push_back(rot_h_[static_cast<size_t>(rg)]);
+            p2.widths.push_back(rot_w_[static_cast<size_t>(rg)]);
+            p2.bin_indices.push_back(static_cast<double>(bidx));
+            p2.bin_local.push_back(bidx);
+            p2.rot_global.push_back(rg);
+            p2.ctx_local.push_back(lc);
+            p2.enclosure_lengths.push_back(static_cast<double>(b.enclosure_box_length));
+            p2.bin_areas.push_back(b.area);
+            p2.part_areas.push_back(p_area);
         }
 
         batch_fft_all_tests(
@@ -1523,7 +1768,6 @@ private:
             }
             auto& bin = ctx.open_bins[static_cast<size_t>(bidx)];
             const int y_start = row - rot_h_[static_cast<size_t>(rotg)] + 1;
-            bin.grid_fft_valid = false;
             add_part_to_bin_cpu(bin, col, row, rotg, part_idx, machine_idx, W, false);
             ctx.current_part_idx += 1;
             gpu_updates.push_back({
@@ -1910,6 +2154,95 @@ void native_fused_gather_multiply_cuda(
         fft_size
     );
 }
+
+// ── Batch vacancy check kernel ────────────────────────────────────────────────
+// One block per (bin, rotation) pair.
+// Each thread checks one starting position of the density array against the
+// vacancy vector.  Shared-memory OR-reduction: if any position passes, the
+// pair passes.
+//
+// vacancy_flat: (max_bins, H) row-major int32
+// density_flat: (total_density_len,) int32
+// pair_vac_row: (n_pairs,) int32 — row index into vacancy_flat
+// pair_den_off: (n_pairs,) int32 — offset into density_flat
+// pair_den_len: (n_pairs,) int32 — density array length (= part height)
+// out_pass:     (n_pairs,) int8  — 1 if any window fits, else 0
+
+__global__ void _batch_vacancy_check_kernel(
+    const int* __restrict__ vacancy_flat,
+    const int* __restrict__ density_flat,
+    const int* __restrict__ pair_vac_row,
+    const int* __restrict__ pair_den_off,
+    const int* __restrict__ pair_den_len,
+    int8_t* __restrict__ out_pass,
+    int H
+) {
+    const int pair_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const int vac_row = pair_vac_row[pair_idx];
+    const int den_off = pair_den_off[pair_idx];
+    const int den_len = pair_den_len[pair_idx];
+    const int max_start = H - den_len;
+
+    const int* vac = vacancy_flat + (long long)vac_row * H;
+    const int* den = density_flat + den_off;
+
+    // Each thread checks one or more starting positions.
+    int found = 0;
+    for (int start = tid; start <= max_start; start += stride) {
+        int ok = 1;
+        for (int i = 0; i < den_len; ++i) {
+            if (vac[start + i] < den[i]) { ok = 0; break; }
+        }
+        if (ok) { found = 1; break; }
+    }
+
+    // Shared memory OR-reduction across threads.
+    extern __shared__ int s_found[];
+    s_found[tid] = found;
+    __syncthreads();
+
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            if (s_found[tid + offset]) s_found[tid] = 1;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_pass[pair_idx] = (int8_t)s_found[0];
+    }
+}
+
+void native_batch_vacancy_check_cuda(
+    torch::Tensor vacancy_flat,
+    torch::Tensor density_flat,
+    torch::Tensor pair_vac_row,
+    torch::Tensor pair_den_off,
+    torch::Tensor pair_den_len,
+    torch::Tensor out_pass,
+    int H
+) {
+    const int n_pairs = (int)pair_vac_row.size(0);
+    if (n_pairs <= 0) return;
+    // Use 64 threads per block — density arrays are short (≤ H = 300),
+    // so max_start = H - den_len ≤ 298; 64 threads covers all windows
+    // in at most ceil(299/64) = 5 iterations.
+    const int threads = 64;
+    const size_t shmem = (size_t)threads * sizeof(int);
+    _batch_vacancy_check_kernel<<<n_pairs, threads, shmem>>>(
+        vacancy_flat.data_ptr<int>(),
+        density_flat.data_ptr<int>(),
+        pair_vac_row.data_ptr<int>(),
+        pair_den_off.data_ptr<int>(),
+        pair_den_len.data_ptr<int>(),
+        out_pass.data_ptr<int8_t>(),
+        H
+    );
+}
+
 """
 
 _module = None
@@ -2001,18 +2334,21 @@ def _pack_problem_data(problem_data, nb_machines, thresholds, instance_parts, de
     for m in range(nb_machines):
         mach = problem_data.machines[m]
         machine_fft_rot: List[torch.Tensor] = []
+        H_m, W_m = mach.bin_length, mach.bin_width
         for pidx, pid in enumerate(part_ids):
             mpd = mach.parts[pid]
+            pd_part = problem_data.parts[pid]
             machine_proc_time[m, pidx] = float(mpd.proc_time)
             machine_proc_time_height[m, pidx] = float(mpd.proc_time_height)
-            nrot = int(problem_data.parts[pid].nrot)
+            nrot = int(pd_part.nrot)
             for rot in range(nrot):
                 fft = mpd.ffts[rot]
                 if device.startswith("cuda") and (not fft.is_cuda or str(fft.device) != device):
                     fft = fft.to(device)
                 machine_fft_rot.append(fft.contiguous())
+
         fft_dense = torch.stack(machine_fft_rot, dim=0).contiguous()
-        fft_dense = fft_dense / float(mach.bin_length * mach.bin_width)
+        fft_dense = fft_dense / float(H_m * W_m)
         machine_fft_dense.append(fft_dense)
 
     if rot_gpu_tensors:
