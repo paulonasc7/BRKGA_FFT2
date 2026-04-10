@@ -567,13 +567,20 @@ private:
     std::vector<GpuPlacement> scratch_phase6_gpu_updates_;
     std::vector<int64_t> scratch_phase6_grid_indices_;
 
-    // Pool of recycled BinStateNative objects.  Reusing warm memory avoids
-    // OS page-fault cost on grid.assign() which dominates Phase 6 ctor time.
-    // Entries have pre-faulted grid/vacancy buffers; caller must reset them.
-    std::vector<BinStateNative> bin_pool_;
-    int bin_pool_H_ = 0;  // expected grid height for pooled entries
-    int bin_pool_W_ = 0;  // expected grid width for pooled entries
-    static constexpr int BIN_POOL_MAX = 4096;
+    // Pool of recycled BinStateNative objects keyed by (H,W).  Reusing warm
+    // memory avoids OS page-fault cost on grid.assign() for new bins.
+    // Total memory capped at BIN_POOL_MAX_BYTES to stay safe on large instances.
+    struct BinPoolKey {
+        int H, W;
+        bool operator==(const BinPoolKey& o) const { return H == o.H && W == o.W; }
+    };
+    struct BinPoolKeyHash {
+        std::size_t operator()(const BinPoolKey& k) const {
+            return std::hash<int64_t>{}((static_cast<int64_t>(k.H) << 32) | k.W);
+        }
+    };
+    std::unordered_map<BinPoolKey, std::vector<BinStateNative>, BinPoolKeyHash> bin_pool_map_;
+    static constexpr int64_t BIN_POOL_MAX_BYTES = 256LL * 1024 * 1024;  // 256 MB cap
 
     std::vector<int32_t> scratch_cell_offsets_;
     std::vector<int32_t> scratch_grid_idxs_;
@@ -1507,19 +1514,29 @@ private:
             makespans[static_cast<size_t>(i)] = total;
         }
 
-        // Harvest bins into the pool before contexts (and their bins) are destroyed.
-        // This pre-faults the grid/vacancy memory so future allocations avoid OS page faults.
-        if (bin_pool_H_ != H || bin_pool_W_ != W) {
-            bin_pool_.clear();
-            bin_pool_H_ = H;
-            bin_pool_W_ = W;
-        }
-        for (auto& ctx : contexts) {
-            for (auto& bin : ctx.open_bins) {
-                if (static_cast<int>(bin_pool_.size()) >= BIN_POOL_MAX) {
-                    break;
+        // Harvest bins into the per-(H,W) pool before contexts are destroyed.
+        // Total pool memory is capped at BIN_POOL_MAX_BYTES to stay safe on large instances.
+        {
+            const BinPoolKey key{H, W};
+            auto& slot = bin_pool_map_[key];
+            const int64_t bytes_per_bin = static_cast<int64_t>(H) * W;
+            // Count current pool memory across all (H,W) keys.
+            int64_t used_bytes = 0;
+            for (const auto& kv : bin_pool_map_) {
+                used_bytes += static_cast<int64_t>(kv.second.size()) *
+                              static_cast<int64_t>(kv.first.H) * kv.first.W;
+            }
+            bool cap_hit = false;
+            for (auto& ctx : contexts) {
+                if (cap_hit) break;
+                for (auto& bin : ctx.open_bins) {
+                    if (used_bytes + bytes_per_bin > BIN_POOL_MAX_BYTES) {
+                        cap_hit = true;
+                        break;
+                    }
+                    slot.push_back(std::move(bin));
+                    used_bytes += bytes_per_bin;
                 }
-                bin_pool_.push_back(std::move(bin));
             }
         }
 
@@ -2111,16 +2128,18 @@ private:
             auto _prof_ctor_t0 = PROF_NOW();
 #endif
             BinStateNative new_bin;
-            if (!bin_pool_.empty() && bin_pool_H_ == H && bin_pool_W_ == W) {
-                // Reuse a pre-faulted bin from the pool.  Warm memory: memset runs
-                // at full DRAM bandwidth without OS page-fault overhead.
-                new_bin = std::move(bin_pool_.back());
-                bin_pool_.pop_back();
-                std::memset(new_bin.grid.data(), 0, static_cast<size_t>(H * W));
-                std::fill(new_bin.vacancy.begin(), new_bin.vacancy.end(), static_cast<int32_t>(W));
-            } else {
-                new_bin.grid.assign(static_cast<size_t>(H * W), 0u);
-                new_bin.vacancy.assign(static_cast<size_t>(H), static_cast<int32_t>(W));
+            {
+                auto pit = bin_pool_map_.find(BinPoolKey{H, W});
+                if (pit != bin_pool_map_.end() && !pit->second.empty()) {
+                    // Reuse a pre-faulted bin from the pool.
+                    new_bin = std::move(pit->second.back());
+                    pit->second.pop_back();
+                    std::memset(new_bin.grid.data(), 0, static_cast<size_t>(H * W));
+                    std::fill(new_bin.vacancy.begin(), new_bin.vacancy.end(), static_cast<int32_t>(W));
+                } else {
+                    new_bin.grid.assign(static_cast<size_t>(H * W), 0u);
+                    new_bin.vacancy.assign(static_cast<size_t>(H), static_cast<int32_t>(W));
+                }
             }
             new_bin.bin_idx = static_cast<int>(ctx.open_bins.size());
             new_bin.grid_state_idx = grid_idx;

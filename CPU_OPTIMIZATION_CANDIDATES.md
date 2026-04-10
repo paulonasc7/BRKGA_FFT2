@@ -23,18 +23,20 @@ Replaced scalar row scan with runtime-dispatched AVX2 implementation using `_mm2
 Correctness verified: makespan fingerprints byte-identical between scalar and SIMD paths on 5-rep P50M2-0 run. The SIMD version shifts `update_vacancy_rows` out of the top slot.
 
 ### #4 Phase 6 bin pool — DONE 2026-04-10
-Added `bin_pool_` (up to 4096 `BinStateNative` entries). After each `process_machine_batch` call, bins are moved into the pool instead of being destroyed. Phase 6 new-bin creation pops from the pool (if H/W match) and calls `std::memset` + `std::fill` on warm memory instead of `grid.assign` (which triggers OS page faults on first-touch).
+Added `bin_pool_map_` keyed by `(H,W)` (up to 256 MB total). After each `process_machine_batch` call, bins are moved into the pool. Phase 6 new-bin creation pops from the matching `(H,W)` slot and calls `std::memset` + `std::fill` on warm memory instead of `grid.assign` (which triggers OS page faults on first-touch).
 
-Partial-zero variant (zero only dirty rows using `min_occupied_row`) was tested and was slightly slower — the conditional + potential cache miss on `min_occupied_row` outweighed the reduced memset volume. Kept full memset.
+**Key design decision:** pool is keyed by `(H,W)` not a single H/W pair. The original single-key design would clear the pool on every machine boundary in multi-machine instances (P50M2: only machine 1 benefits; P200M4: no machine benefits at all since each machine has different dimensions). The map-based design lets each machine accumulate its own warm pool simultaneously, capped at 256 MB total.
+
+Partial-zero variant (zero only dirty rows using `min_occupied_row`) was tested and was slightly slower — the conditional + potential cache miss outweighed the reduced memset volume. Kept full memset.
 
 | Metric | Before pool | After pool | Delta |
 |---|---|---|---|
-| BinState ctor ms/gen | 31.5 | 22.2 | −9.3 ms |
-| Phase 6 loop ms/gen | 46.7 | 37.9 | −8.8 ms |
-| wall clock ms/gen (P50) | 1119 | 1103 | −16 ms (−1.4%) |
-| wall clock ms/gen (P75) | 2.162s | 2.173s | within noise |
+| BinState ctor µs/call | 11.7 | 7.2 | −38% |
+| Phase 6 loop ms/gen | 51.6 | 36.9 | −14.7 ms |
+| wall clock ms/gen (P50) | 1119 | 1100 | −19 ms (−1.7%) |
+| wall clock ms/gen (P75) | 2162 | 2173 | within noise |
 
-The P50 saving is real but modest because page faults were not the only cost — warm memset of 221MB/gen still takes ~5-6ms at DRAM bandwidth. P75 sees no meaningful change. Pool is still worth keeping (eliminates allocator churn and smooths variance).
+The P50 saving is real but modest — warm memset of 221 MB/gen still takes ~5ms at DRAM bandwidth. P75 shows no change (within noise). Pool is worth keeping as it eliminates allocator churn, smooths variance, and should benefit larger multi-machine instances proportionally more (more bins created per gen).
 
 ### #3 Template + memcpy/AVX2-add grid write in `add_part_to_bin_cpu` — DONE 2026-04-10
 Replaced the `if (overwrite)` branch inside the inner `(rr, cc)` loop with a `template <bool Overwrite>` instantiation. For `Overwrite=true`, inner loop becomes `std::memcpy(dst, src, pw)` — glibc uses NT stores and prefetch. For `Overwrite=false`, a runtime-dispatched `grid_add_row_avx2` uses `_mm256_add_epi8` over 32 bytes/iteration with scalar tail.
