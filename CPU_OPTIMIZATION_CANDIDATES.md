@@ -4,8 +4,86 @@
 **Goal:** identify and rank CPU-bound optimization opportunities in `full_native_decoder.py` after ideas #1, #2, #5 from `NATIVE_OPTIMIZATION_IDEAS.md` are done and idea #6 was rejected.
 **Context:** Profiling data in `NATIVE_OPTIMIZATION_IDEAS.md` shows **~34.7% of wall time (~675ms/seed) is CPU-only** (invisible to the GPU profiler). This document drills into that 34.7% to find concrete, measurable targets.
 
-**Current baseline (P50M2-0, 500 ind.):** 1.445s/seed
-**Current baseline (P75M2-0, 750 ind.):** 2.650s/seed
+**Current baseline (P50M2-0, 500 ind.):** 1.119s/gen (after SIMD UVR + template grid write). Previous: 1.487s/gen.
+**Current baseline (P75M2-0, 750 ind.):** 2.162s/gen. Previous: 3.227s/gen (−33%). vs wave_batch: **2.21×** (up from 1.49× at session start).
+
+---
+
+## OPTIMIZATION HISTORY
+
+### #1 SIMD `update_vacancy_rows_cpp` — DONE 2026-04-09
+Replaced scalar row scan with runtime-dispatched AVX2 implementation using `_mm256_cmpeq_epi8` + `_mm256_movemask_epi8` + `__builtin_ctz` for branchless run-length-max over uint8 bytes. Kill-switch: `ABRKGA_NATIVE_UVR_SIMD=0`.
+
+| Metric | Scalar | AVX2 | Speedup |
+|---|---|---|---|
+| `update_vacancy_rows` ms/gen | 430.9 | 89.1 | **4.84×** |
+| per-row cost (ns) | 263 | 54 | 4.87× |
+| wall clock ms/gen | 1499 | 1212 | 1.24× (−287 ms) |
+
+Correctness verified: makespan fingerprints byte-identical between scalar and SIMD paths on 5-rep P50M2-0 run. The SIMD version shifts `update_vacancy_rows` out of the top slot.
+
+### #3 Template + memcpy/AVX2-add grid write in `add_part_to_bin_cpu` — DONE 2026-04-10
+Replaced the `if (overwrite)` branch inside the inner `(rr, cc)` loop with a `template <bool Overwrite>` instantiation. For `Overwrite=true`, inner loop becomes `std::memcpy(dst, src, pw)` — glibc uses NT stores and prefetch. For `Overwrite=false`, a runtime-dispatched `grid_add_row_avx2` uses `_mm256_add_epi8` over 32 bytes/iteration with scalar tail.
+
+| Metric | Before | After | Delta |
+|---|---|---|---|
+| `add_part_to_bin_cpu` ms/gen | 200 | 142 | −58 ms |
+| non-UVR grid write ms/gen | 111 | 53 | −58 ms (−52%) |
+| wall clock ms/gen | 1212 | 1119 | **−93 ms (−7.7%)** |
+
+Correctness verified: fingerprint unchanged on 5-rep P50M2-0 run.
+
+### #2 Vacancy upload sync — INVESTIGATED 2026-04-10, SKIPPED
+
+Measured: 97 ms/gen (8% of 1212ms wall clock). The sync at line 1534 of `run_gpu_vacancy_check` (`gpu_pairs.copy_(cpu_pairs, non_blocking=false)`) blocks CPU until the GPU drains. Per-call stats: 136.2 calls/gen, 0.71 ms per call.
+
+**Why there's nothing cheap to gain:**
+
+The 0.71ms per-call wait is mostly real GPU execution time, not preventable stall. The wave sequence is:
+1. Phase 2: rfft2 fires async on GPU (~0.7 ms GPU time per wave for that batch)
+2. Pass A: CPU loop builds pair list (~0.076 ms of CPU work)
+3. Sync: upload pairs + run vacancy kernel. CPU waits the remaining GPU time.
+
+When `batch_fft_all_tests` at the end of each wave reads results back (`.to(torch::kCPU)`), it fully drains the stream. So the stream is clean entering Phase 2 of the next wave. Pass A (0.076ms CPU) is too short to hide rfft2 (0.7ms GPU) — hence ~0.63ms of wait.
+
+Making the upload `non_blocking=True` + CUDA event deferred sync would shift the wait from upload to readback, but the total wait doesn't change — we'd still block for ~0.71ms per call at readback. Net saving: ~0 ms.
+
+**Reducing calls per wave** (merge p1+p2 into one check) is the only structural fix, but it's a significant algorithm restructure with ~48 ms/gen upside — bounded by the fact that p2 pairs are a subset of p1-miss contexts only.
+
+**Decision: skip.** Cost-to-benefit ratio is unfavorable. Moving on to `add_part_to_bin_cpu` non-UVR work (~111 ms/gen).
+
+---
+
+## MEASURED RESULTS (2026-04-09) — ground truth from instrumented run
+
+Ran `profile_cpu_hotspots.py` on P50M2-0 with 5 reps, seed 123. Instrumentation is a local uncommitted change using `std::chrono::steady_clock` around the hot spots; overhead is <5 ms/gen (well under noise floor).
+
+| Hot spot | Per-gen | % of wall | My pre-profile guess |
+|---|---|---|---|
+| `update_vacancy_rows_cpp` | **383.4 ms** | **25.8%** | 100–200 ms (**underestimated**) |
+| `add_part_to_bin_cpu` (total, incl. uvr) | 502.5 ms | 33.8% | — |
+| `add_part_to_bin_cpu` (excl. uvr) | ~119 ms | 8.0% | — |
+| Phase 6 new-bin loop | 106.3 ms | 7.1% | 100–300 ms (roughly right) |
+| └ BinState ctor (grid.assign + vacancy.assign) | 33.2 ms | 2.2% | 220 ms (**7× overestimate**) |
+| Vacancy upload sync (`non_blocking=false`) | 99.0 ms | 6.7% | — (this specific copy wasn't isolated) |
+| Phase 3 Pass B total wait | 104.6 ms | 7.0% | 50–120 ms (right ballpark) |
+| Vacancy readback sync | 6.9 ms | 0.5% | — |
+| Phase 3 Pass A | 4.8 ms | 0.3% | 50–100 ms (**dead target**) |
+| Phase 3 Pass C | 2.9 ms | 0.2% | 50–100 ms (**dead target**) |
+
+**Event counts (per gen):**
+- 2,944 new `BinStateNative` allocations (~10/wave), not 100/wave as estimated
+- 21,614 `add_part_to_bin_cpu` calls
+- 1.64M vacancy rows scanned at 234 ns/row
+- 136 vacancy-check invocations per gen (2 per wave × ~68 waves)
+
+### Key revisions to the initial plan
+
+1. **`update_vacancy_rows_cpp` is the #1 target by a wide margin.** Not Phase 6 bin allocation. Single function eats 25.8% of wall time.
+2. **Phase 3 Pass A/C merge is dead.** 8 ms/gen combined, not 100–200 ms. Don't touch.
+3. **Phase 6 bin pool is demoted to #3.** BinState ctor is 33 ms, not 220 ms. New-bin rate is 10/wave not 100/wave.
+4. **Vacancy upload sync (99 ms/gen) is the new #2.** The upload is the expensive sync, not the readback. Upload is `non_blocking=false` + the kernel is waiting on it, so CPU blocks until GPU drains.
+5. **Vacancy readback sync is 6.9 ms/gen.** Skip — near noise.
 
 ---
 
@@ -316,36 +394,32 @@ Not worth optimizing in isolation. Could be batched across solutions via SoA but
 
 ---
 
-## Summary ranking
+## Summary ranking (REVISED 2026-04-10)
 
-| # | Target | Expected saving | Effort | Risk | Confidence | Critical path? |
-|---|--------|----------------|--------|------|-----------|----------------|
-| 1 | Phase 6 bin allocation | 100–300 ms | Medium | Medium | High | Yes |
-| 2 | SIMD `update_vacancy_rows_cpp` | 100–200 ms | Low | Low | High | Partial (hidden behind GPU sometimes) |
-| 3 | Phase 3 Pass A/C merge + SoA | 50–100 ms | Low-Med | Low | Medium | Yes (after Pass B sync) |
-| 4 | Vacancy check async / double-buffer | 50–120 ms | Medium | Medium | Medium | Yes |
-| 5 | Python-C++ boundary | 0 ms | — | — | Confirmed | — |
+| # | Target | Measured cost | Status | Expected saving |
+|---|--------|---------------|--------|----------------|
+| ~~1~~ | ~~SIMD `update_vacancy_rows_cpp`~~ | 383 ms/gen (pre) → 89 ms/gen (post) | **DONE** −287 ms/gen | — |
+| ~~2~~ | ~~Vacancy upload sync~~ | 97 ms/gen | **SKIPPED** — mostly real GPU time, no cheap fix | — |
+| ~~3~~ | ~~Template + memcpy/AVX2-add grid write~~ | 111 ms/gen (pre) → 53 ms/gen (post) | **DONE** −58 ms/gen (−7.7%) | — |
+| **4** | **Phase 6 bin pool / lazy grid** | **106 ms/gen total (33 ms ctor)** | **Next candidate** | 20–60 ms/gen |
+| — | ~~Phase 3 Pass A/C merge~~ | 8 ms/gen | Dead target | — |
+| — | ~~Vacancy readback sync~~ | 7 ms/gen | Dead target | — |
+| — | ~~Python-C++ boundary~~ | <1 ms/gen | Dead target | — |
 
-**Total potential:** 300–720 ms/seed reducible. Cumulative wall-time saving depends heavily on which are on the critical path vs hidden behind GPU work — only instrumentation can tell.
+**Current baseline after #1:** 1.212s/gen on P50M2-0.
 
 ---
 
-## Recommended investigation order
+## Implementation order (current)
 
-1. **Profile first.** Before implementing anything, add `std::chrono` instrumentation around the candidate hot spots for one seed on the remote GPU. Report actual costs. This disambiguates which hypothesis is right.
-   - Phase 6 new-bin creation loop
-   - `BinStateNative` constructor
-   - `update_vacancy_rows_cpp` (total + avg per call)
-   - Phase 3 Pass A / Pass B wait / Pass C
-   - `run_gpu_vacancy_check` sync overhead (via CUDA events)
+1. ~~**Profile first**~~ — **DONE** (2026-04-09).
+2. ~~**SIMD `update_vacancy_rows_cpp`**~~ — **DONE** (2026-04-09). −287 ms/gen.
+3. ~~**Vacancy upload sync**~~ — **SKIPPED** (2026-04-10). See analysis above.
+4. ~~**Template + memcpy/AVX2-add grid write**~~ — **DONE** (2026-04-10). −58 ms/gen.
+5. **Phase 6 bin pool / lazy grid** — 106 ms/gen total (33 ms in ctor, 73 ms in add_part_to_bin_cpu for the first part). Evaluate whether BinStateNative ctor `grid.assign` is the bottleneck or if most time is in the first-part placement loop.
+6. **Re-profile after any change.** Verify fingerprint.
 
-2. **Implement #1 (Phase 6 bin allocation)** if measured >100ms/seed. Option A (object pool) first, then B (lazy grid) if still hot.
-
-3. **Implement #2 (SIMD vacancy update)** if measured >100ms/seed. Follow the existing AVX512/AVX2 pattern from `check_vacancy_fit_simple_cpp`.
-
-4. **Implement #4 (vacancy async)** before #3, because #4 reduces #3's wall-time impact. Start with option B (CUDA event deferred sync).
-
-5. **Implement #3 (Pass A/C merge + SoA)** only if #4 didn't fully close the gap, or if Pass C itself (after sync) is still measurably hot.
+All implementation work uses the local-only profiling instrumentation as the measurement harness. After #1+#2 are committed and validated, decide whether to commit or revert the instrumentation.
 
 ---
 

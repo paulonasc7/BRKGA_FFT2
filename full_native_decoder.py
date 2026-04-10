@@ -19,9 +19,11 @@ _CPP_SRC = r"""
 #include <pybind11/numpy.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -34,6 +36,79 @@ _CPP_SRC = r"""
 
 namespace py = pybind11;
 using torch::indexing::Slice;
+
+// ── Profiling instrumentation (LOCAL, UNCOMMITTED) ───────────────────────────
+// Accumulators for CPU hot spot profiling.  See CPU_OPTIMIZATION_CANDIDATES.md.
+// Turn off by commenting out PROFILE_CPU_HOTSPOTS.
+#define PROFILE_CPU_HOTSPOTS 1
+
+#if PROFILE_CPU_HOTSPOTS
+struct WaveProfile {
+    // Phase 6 new-bin creation
+    int64_t phase6_loop_ns = 0;         // whole Phase 6 new-bin loop (per wave)
+    int64_t binstate_ctor_ns = 0;       // sum of BinStateNative field init + grid.assign + vacancy.assign
+    int64_t binstate_count = 0;
+
+    // update_vacancy_rows_cpp
+    int64_t uvr_ns = 0;
+    int64_t uvr_call_count = 0;
+    int64_t uvr_total_rows = 0;
+
+    // add_part_to_bin_cpu (whole function, includes uvr)
+    int64_t aptb_ns = 0;
+    int64_t aptb_count = 0;
+
+    // Phase 3 p1
+    int64_t p3_pass_a_ns = 0;           // pair collection loop
+    int64_t p3_pass_b_wait_ns = 0;      // time blocked waiting for vacancy kernel result
+    int64_t p3_pass_c_ns = 0;           // mask → test-list build
+
+    // run_gpu_vacancy_check sync copy_ calls
+    int64_t vac_upload_sync_ns = 0;     // non_blocking=false upload
+    int64_t vac_readback_sync_ns = 0;   // non_blocking=false readback
+    int64_t vac_call_count = 0;
+
+    void reset() { *this = WaveProfile{}; }
+
+    std::string summary() const {
+        auto ms = [](int64_t ns) { return static_cast<double>(ns) / 1e6; };
+        std::ostringstream os;
+        os << "\n═══ CPU Hotspot Profile ═══\n";
+        os << "  Phase 6 new-bin loop  : " << ms(phase6_loop_ns) << " ms  ("
+           << binstate_count << " bins)\n";
+        os << "    └ BinState ctor    : " << ms(binstate_ctor_ns) << " ms  ("
+           << binstate_count << " calls, "
+           << (binstate_count ? ms(binstate_ctor_ns) / static_cast<double>(binstate_count) * 1e3 : 0.0)
+           << " µs/call)\n";
+        os << "  update_vacancy_rows  : " << ms(uvr_ns) << " ms  ("
+           << uvr_call_count << " calls, " << uvr_total_rows << " rows, "
+           << (uvr_call_count ? ms(uvr_ns) / static_cast<double>(uvr_call_count) * 1e3 : 0.0)
+           << " µs/call, "
+           << (uvr_total_rows ? ms(uvr_ns) / static_cast<double>(uvr_total_rows) * 1e3 : 0.0)
+           << " µs/row)\n";
+        os << "  add_part_to_bin_cpu  : " << ms(aptb_ns) << " ms  ("
+           << aptb_count << " calls, "
+           << (aptb_count ? ms(aptb_ns) / static_cast<double>(aptb_count) * 1e3 : 0.0)
+           << " µs/call)\n";
+        os << "  Phase 3 Pass A       : " << ms(p3_pass_a_ns) << " ms\n";
+        os << "  Phase 3 Pass B wait  : " << ms(p3_pass_b_wait_ns) << " ms\n";
+        os << "  Phase 3 Pass C       : " << ms(p3_pass_c_ns) << " ms\n";
+        os << "  Vacancy upload sync  : " << ms(vac_upload_sync_ns) << " ms\n";
+        os << "  Vacancy readback sync: " << ms(vac_readback_sync_ns) << " ms\n";
+        os << "  (" << vac_call_count << " vacancy-check invocations)\n";
+        return os.str();
+    }
+};
+static WaveProfile g_profile;
+
+#define PROF_NOW() std::chrono::steady_clock::now()
+#define PROF_NS_SINCE(t0) \
+    std::chrono::duration_cast<std::chrono::nanoseconds>(PROF_NOW() - (t0)).count()
+#else
+#define PROF_NOW() 0
+#define PROF_NS_SINCE(t0) 0
+#endif
+// ─────────────────────────────────────────────────────────────────────────────
 
 struct BinStateNative {
     int bin_idx = 0;
@@ -835,7 +910,7 @@ private:
     }
 #endif
 
-    static void update_vacancy_rows_cpp(
+    static void update_vacancy_rows_scalar_cpp(
         std::vector<int32_t>& vacancy_vector,
         const std::vector<uint8_t>& grid,
         int y_start,
@@ -859,6 +934,123 @@ private:
             }
             vacancy_vector[static_cast<size_t>(row_idx)] = max_zeros;
         }
+    }
+
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    // Process a 32-bit movemask (bit i = 1 iff byte i was zero in the chunk),
+    // updating the running carry (length of zero run ending at the end of the
+    // previously-seen bytes) and the running max-zeros value.
+    __attribute__((target("avx2")))
+    static inline void update_vacancy_process_mask32(uint32_t m, int& carry, int& mx) {
+        if (m == 0u) {
+            carry = 0;
+            return;
+        }
+        if (m == 0xFFFFFFFFu) {
+            carry += 32;
+            if (carry > mx) mx = carry;
+            return;
+        }
+        // Leading ones (from bit 0) extend the existing carry.
+        const int lead = __builtin_ctz(~m);
+        carry += lead;
+        if (carry > mx) mx = carry;
+        // Trailing ones (ending at bit 31) become the new carry for the next chunk.
+        const int trail = __builtin_clz(~m);
+        // Isolate the middle region (strip leading and trailing ones).
+        uint32_t mid = m & ~((1u << lead) - 1u);
+        mid &= (0xFFFFFFFFu >> trail);
+        // Scan internal ones-runs.
+        while (mid != 0u) {
+            const int s = __builtin_ctz(mid);
+            const uint32_t r = mid >> s;
+            const int len = __builtin_ctz(~r);  // r has LSB=1 and is not all-ones
+            if (len > mx) mx = len;
+            mid &= ~(((1u << len) - 1u) << s);
+        }
+        if (trail > mx) mx = trail;
+        carry = trail;
+    }
+
+    __attribute__((target("avx2")))
+    static void update_vacancy_rows_avx2_cpp(
+        std::vector<int32_t>& vacancy_vector,
+        const std::vector<uint8_t>& grid,
+        int y_start,
+        int num_rows,
+        int width
+    ) {
+        const __m256i zero = _mm256_setzero_si256();
+        const uint8_t* base = grid.data();
+        for (int i = 0; i < num_rows; ++i) {
+            const int row_idx = y_start + i;
+            const uint8_t* row = base + static_cast<size_t>(row_idx) * static_cast<size_t>(width);
+            int mx = 0;
+            int carry = 0;
+            int j = 0;
+            const int limit = width - 32;
+            for (; j <= limit; j += 32) {
+                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + j));
+                const __m256i eq = _mm256_cmpeq_epi8(v, zero);
+                const uint32_t m = static_cast<uint32_t>(_mm256_movemask_epi8(eq));
+                update_vacancy_process_mask32(m, carry, mx);
+            }
+            for (; j < width; ++j) {
+                if (row[j] == 0) {
+                    carry += 1;
+                    if (carry > mx) mx = carry;
+                } else {
+                    carry = 0;
+                }
+            }
+            vacancy_vector[static_cast<size_t>(row_idx)] = mx;
+        }
+    }
+#endif
+
+    static void update_vacancy_rows_cpp(
+        std::vector<int32_t>& vacancy_vector,
+        const std::vector<uint8_t>& grid,
+        int y_start,
+        int num_rows,
+        int width
+    ) {
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_t0 = PROF_NOW();
+#endif
+
+        const bool simd_enabled = []() {
+            const char* env = std::getenv("ABRKGA_NATIVE_UVR_SIMD");
+            if (env == nullptr) {
+                return true;
+            }
+            const std::string s(env);
+            return !(s == "0" || s == "false" || s == "False");
+        }();
+
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+        static int uvr_simd_level = -1;  // 0=scalar, 1=avx2
+        if (uvr_simd_level < 0) {
+            uvr_simd_level = 0;
+            if (__builtin_cpu_supports("avx2")) {
+                uvr_simd_level = 1;
+            }
+        }
+        if (simd_enabled && uvr_simd_level >= 1 && width >= 32) {
+            update_vacancy_rows_avx2_cpp(vacancy_vector, grid, y_start, num_rows, width);
+        } else {
+            update_vacancy_rows_scalar_cpp(vacancy_vector, grid, y_start, num_rows, width);
+        }
+#else
+        (void)simd_enabled;
+        update_vacancy_rows_scalar_cpp(vacancy_vector, grid, y_start, num_rows, width);
+#endif
+
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.uvr_ns += PROF_NS_SINCE(_prof_t0);
+        g_profile.uvr_call_count += 1;
+        g_profile.uvr_total_rows += num_rows;
+#endif
     }
 
     void decode_sequences_for_machine(
@@ -1109,6 +1301,84 @@ private:
         }
     }
 
+    // Write part matrix rows into grid for overwrite=false (add mode).
+    // AVX2 path: 32 bytes/cycle byte-add with scalar tail.
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    __attribute__((target("avx2")))
+    static void grid_add_row_avx2(uint8_t* dst, const uint8_t* src, int len) {
+        int j = 0;
+        for (; j + 32 <= len; j += 32) {
+            const auto d = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + j));
+            const auto s = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j), _mm256_add_epi8(d, s));
+        }
+        for (; j < len; ++j) {
+            dst[j] = static_cast<uint8_t>(dst[j] + src[j]);
+        }
+    }
+#endif
+
+    // Dispatch wrapper: uses AVX2 byte-add if available, else scalar fallback.
+    static void grid_add_row(uint8_t* dst, const uint8_t* src, int len) {
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+        static int has_avx2 = -1;
+        if (has_avx2 < 0) {
+            has_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+        }
+        if (has_avx2 && len >= 32) {
+            grid_add_row_avx2(dst, src, len);
+            return;
+        }
+#endif
+        for (int j = 0; j < len; ++j) {
+            dst[j] = static_cast<uint8_t>(dst[j] + src[j]);
+        }
+    }
+
+    template <bool Overwrite>
+    void add_part_to_bin_impl(
+        BinStateNative& bin,
+        int x,
+        int y,
+        int rotg,
+        int part_idx,
+        int machine_idx,
+        int machine_width
+    ) {
+        const int ph = rot_h_[static_cast<size_t>(rotg)];
+        const int pw = rot_w_[static_cast<size_t>(rotg)];
+        const int y_start = y - ph + 1;
+        const int m_off = rot_matrix_offsets_[static_cast<size_t>(rotg)];
+        const uint8_t* mat_ptr = rot_matrix_flat_u8_.data() + m_off;
+        uint8_t* grid_ptr = bin.grid.data();
+
+        for (int rr = 0; rr < ph; ++rr) {
+            uint8_t*       dst = grid_ptr + static_cast<size_t>((y_start + rr) * machine_width + x);
+            const uint8_t* src = mat_ptr  + static_cast<size_t>(rr * pw);
+            if constexpr (Overwrite) {
+                std::memcpy(dst, src, static_cast<size_t>(pw));
+            } else {
+                grid_add_row(dst, src, pw);
+            }
+        }
+
+        update_vacancy_rows_cpp(bin.vacancy, bin.grid, y_start, ph, machine_width);
+        bin.vacancy_gpu_dirty = true;
+        bin.area += part_area_[static_cast<size_t>(part_idx)];
+        bin.min_occupied_row = std::min(bin.min_occupied_row, y_start);
+        bin.max_occupied_row = std::max(bin.max_occupied_row, y);
+        if constexpr (Overwrite) {
+            bin.enclosure_box_length = ph;
+            bin.proc_time += proc_time(machine_idx, part_idx);
+            bin.proc_time_height = proc_time_height(machine_idx, part_idx);
+        } else {
+            bin.enclosure_box_length = bin.bin_length - bin.min_occupied_row;
+            bin.proc_time += proc_time(machine_idx, part_idx);
+            bin.proc_time_height = std::max(bin.proc_time_height, proc_time_height(machine_idx, part_idx));
+        }
+        bin.grid_fft_valid = false;
+    }
+
     void add_part_to_bin_cpu(
         BinStateNative& bin,
         int x,
@@ -1119,42 +1389,18 @@ private:
         int machine_width,
         bool overwrite
     ) {
-        const int ph = rot_h_[static_cast<size_t>(rotg)];
-        const int pw = rot_w_[static_cast<size_t>(rotg)];
-        const int y_start = y - ph + 1;
-        const int m_off = rot_matrix_offsets_[static_cast<size_t>(rotg)];
-        const uint8_t* mat_ptr = rot_matrix_flat_u8_.data() + m_off;
-
-        for (int rr = 0; rr < ph; ++rr) {
-            const int row_off = (y_start + rr) * machine_width;
-            const int mat_off = rr * pw;
-            for (int cc = 0; cc < pw; ++cc) {
-                const int gi = row_off + x + cc;
-                const uint8_t pv = mat_ptr[static_cast<size_t>(mat_off + cc)];
-                if (overwrite) {
-                    bin.grid[static_cast<size_t>(gi)] = pv;
-                } else {
-                    bin.grid[static_cast<size_t>(gi)] =
-                        static_cast<uint8_t>(bin.grid[static_cast<size_t>(gi)] + pv);
-                }
-            }
-        }
-
-        update_vacancy_rows_cpp(bin.vacancy, bin.grid, y_start, ph, machine_width);
-        bin.vacancy_gpu_dirty = true;
-        bin.area += part_area_[static_cast<size_t>(part_idx)];
-        bin.min_occupied_row = std::min(bin.min_occupied_row, y_start);
-        bin.max_occupied_row = std::max(bin.max_occupied_row, y);
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_t0 = PROF_NOW();
+#endif
         if (overwrite) {
-            bin.enclosure_box_length = ph;
-            bin.proc_time += proc_time(machine_idx, part_idx);
-            bin.proc_time_height = proc_time_height(machine_idx, part_idx);
+            add_part_to_bin_impl<true>(bin, x, y, rotg, part_idx, machine_idx, machine_width);
         } else {
-            bin.enclosure_box_length = bin.bin_length - bin.min_occupied_row;
-            bin.proc_time += proc_time(machine_idx, part_idx);
-            bin.proc_time_height = std::max(bin.proc_time_height, proc_time_height(machine_idx, part_idx));
+            add_part_to_bin_impl<false>(bin, x, y, rotg, part_idx, machine_idx, machine_width);
         }
-        bin.grid_fft_valid = false;
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.aptb_ns += PROF_NS_SINCE(_prof_t0);
+        g_profile.aptb_count += 1;
+#endif
     }
 
     std::vector<double> process_machine_batch(
@@ -1329,7 +1575,13 @@ private:
         std::memcpy(pp + 2 * np,  scratch_pair_den_len_.data(), static_cast<size_t>(np) * sizeof(int32_t));
 
         auto gpu_pairs = ensure_workspace_i32(ws_vac_pairs_gpu_, 3 * np);
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_vup_t0 = PROF_NOW();
+#endif
         gpu_pairs.copy_(cpu_pairs, /*non_blocking=*/false);  // sync: kernel needs data immediately
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.vac_upload_sync_ns += PROF_NS_SINCE(_prof_vup_t0);
+#endif
         auto gpu_vac_row = gpu_pairs.narrow(0, 0,       np);
         auto gpu_den_off = gpu_pairs.narrow(0, np,      np);
         auto gpu_den_len = gpu_pairs.narrow(0, 2 * np,  np);
@@ -1343,7 +1595,14 @@ private:
 
         // Readback result (small: one int8 per pair).
         auto cpu_pass = ensure_cpu_pinned_i8(ws_cpu_pass_buf_, np);
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_vrb_t0 = PROF_NOW();
+#endif
         cpu_pass.copy_(gpu_out, /*non_blocking=*/false);  // sync
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.vac_readback_sync_ns += PROF_NS_SINCE(_prof_vrb_t0);
+        g_profile.vac_call_count += 1;
+#endif
         const int8_t* pass_ptr = cpu_pass.data_ptr<int8_t>();
         scratch_pass_.assign(pass_ptr, pass_ptr + n_pairs);
     }
@@ -1448,6 +1707,9 @@ private:
         scratch_pair_den_off_.clear();
         scratch_pair_den_len_.clear();
 
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_passA_t0 = PROF_NOW();
+#endif
         for (int lc = 0; lc < n_contexts; ++lc) {
             auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
             const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
@@ -1476,12 +1738,24 @@ private:
                 }
             }
         }
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.p3_pass_a_ns += PROF_NS_SINCE(_prof_passA_t0);
+#endif
 
         // Pass B: GPU vacancy check for all pairs.
         const int n_p1_pairs = static_cast<int>(p1_pairs.size());
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_passB_t0 = PROF_NOW();
+#endif
         run_gpu_vacancy_check(n_p1_pairs, H);
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.p3_pass_b_wait_ns += PROF_NS_SINCE(_prof_passB_t0);
+#endif
 
         // Pass C: reconstruct p1 test list using mask, preserving first-valid-bin semantics.
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_passC_t0 = PROF_NOW();
+#endif
         for (int lc = 0; lc < n_contexts; ++lc) {
             auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
             const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
@@ -1519,6 +1793,9 @@ private:
             p1.bin_areas.push_back(b.area);
             p1.part_areas.push_back(p_area);
         }
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.p3_pass_c_ns += PROF_NS_SINCE(_prof_passC_t0);
+#endif
 
         batch_fft_all_tests(
             static_cast<int>(p1.grid_indices.size()),
@@ -1790,6 +2067,9 @@ private:
         phase6_grid_indices.clear();
         phase6_gpu_updates.reserve(newbin_ctx_local.size());
         phase6_grid_indices.reserve(newbin_ctx_local.size());
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_phase6_t0 = PROF_NOW();
+#endif
         for (int lc : newbin_ctx_local) {
             const int ctx_g = scratch_ctx_global_[static_cast<size_t>(lc)];
             const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
@@ -1802,6 +2082,9 @@ private:
                 continue;
             }
 
+#if PROFILE_CPU_HOTSPOTS
+            auto _prof_ctor_t0 = PROF_NOW();
+#endif
             BinStateNative new_bin;
             new_bin.bin_idx = static_cast<int>(ctx.open_bins.size());
             new_bin.grid.assign(static_cast<size_t>(H * W), 0u);
@@ -1816,6 +2099,10 @@ private:
             new_bin.grid_fft_valid = false;
             new_bin.bin_length = H;
             new_bin.bin_width = W;
+#if PROFILE_CPU_HOTSPOTS
+            g_profile.binstate_ctor_ns += PROF_NS_SINCE(_prof_ctor_t0);
+            g_profile.binstate_count += 1;
+#endif
 
             const int best_rot = part_best_rot_[static_cast<size_t>(part_idx)];
             const int rotg = rot_global(part_idx, best_rot);
@@ -1836,6 +2123,9 @@ private:
                 rot_w_[static_cast<size_t>(rotg)]
             });
         }
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.phase6_loop_ns += PROF_NS_SINCE(_prof_phase6_t0);
+#endif
 
         if (!phase6_gpu_updates.empty()) {
             auto idx_t = load_workspace_long_from_i64(
@@ -1940,6 +2230,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<NativeFullDecoder>(m, "NativeFullDecoder")
         .def(py::init<py::dict, int, int, const std::string&>())
         .def("evaluate_batch", &NativeFullDecoder::evaluate_batch);
+#if PROFILE_CPU_HOTSPOTS
+    m.def("get_profile_summary", []() { return g_profile.summary(); });
+    m.def("reset_profile", []() { g_profile.reset(); });
+#else
+    m.def("get_profile_summary", []() { return std::string("(profiling disabled)"); });
+    m.def("reset_profile", []() {});
+#endif
 }
 """
 
@@ -2432,3 +2729,16 @@ class FullNativeDecoderEvaluator:
         chrom = np.ascontiguousarray(chromosomes, dtype=np.float32)
         out = self._decoder.evaluate_batch(chrom)
         return np.asarray(out, dtype=np.float64).tolist()
+
+    @staticmethod
+    def get_profile_summary() -> str:
+        mod = _get_module()
+        if mod is None or not hasattr(mod, "get_profile_summary"):
+            return "(profiling not available)"
+        return mod.get_profile_summary()
+
+    @staticmethod
+    def reset_profile() -> None:
+        mod = _get_module()
+        if mod is not None and hasattr(mod, "reset_profile"):
+            mod.reset_profile()
