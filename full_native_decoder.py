@@ -567,6 +567,14 @@ private:
     std::vector<GpuPlacement> scratch_phase6_gpu_updates_;
     std::vector<int64_t> scratch_phase6_grid_indices_;
 
+    // Pool of recycled BinStateNative objects.  Reusing warm memory avoids
+    // OS page-fault cost on grid.assign() which dominates Phase 6 ctor time.
+    // Entries have pre-faulted grid/vacancy buffers; caller must reset them.
+    std::vector<BinStateNative> bin_pool_;
+    int bin_pool_H_ = 0;  // expected grid height for pooled entries
+    int bin_pool_W_ = 0;  // expected grid width for pooled entries
+    static constexpr int BIN_POOL_MAX = 4096;
+
     std::vector<int32_t> scratch_cell_offsets_;
     std::vector<int32_t> scratch_grid_idxs_;
     std::vector<int32_t> scratch_y_starts_;
@@ -1498,6 +1506,23 @@ private:
             }
             makespans[static_cast<size_t>(i)] = total;
         }
+
+        // Harvest bins into the pool before contexts (and their bins) are destroyed.
+        // This pre-faults the grid/vacancy memory so future allocations avoid OS page faults.
+        if (bin_pool_H_ != H || bin_pool_W_ != W) {
+            bin_pool_.clear();
+            bin_pool_H_ = H;
+            bin_pool_W_ = W;
+        }
+        for (auto& ctx : contexts) {
+            for (auto& bin : ctx.open_bins) {
+                if (static_cast<int>(bin_pool_.size()) >= BIN_POOL_MAX) {
+                    break;
+                }
+                bin_pool_.push_back(std::move(bin));
+            }
+        }
+
         return makespans;
     }
 
@@ -2086,9 +2111,18 @@ private:
             auto _prof_ctor_t0 = PROF_NOW();
 #endif
             BinStateNative new_bin;
+            if (!bin_pool_.empty() && bin_pool_H_ == H && bin_pool_W_ == W) {
+                // Reuse a pre-faulted bin from the pool.  Warm memory: memset runs
+                // at full DRAM bandwidth without OS page-fault overhead.
+                new_bin = std::move(bin_pool_.back());
+                bin_pool_.pop_back();
+                std::memset(new_bin.grid.data(), 0, static_cast<size_t>(H * W));
+                std::fill(new_bin.vacancy.begin(), new_bin.vacancy.end(), static_cast<int32_t>(W));
+            } else {
+                new_bin.grid.assign(static_cast<size_t>(H * W), 0u);
+                new_bin.vacancy.assign(static_cast<size_t>(H), static_cast<int32_t>(W));
+            }
             new_bin.bin_idx = static_cast<int>(ctx.open_bins.size());
-            new_bin.grid.assign(static_cast<size_t>(H * W), 0u);
-            new_bin.vacancy.assign(static_cast<size_t>(H), static_cast<int32_t>(W));
             new_bin.grid_state_idx = grid_idx;
             new_bin.area = 0.0;
             new_bin.enclosure_box_length = 0;
@@ -2097,6 +2131,7 @@ private:
             new_bin.proc_time = 0.0;
             new_bin.proc_time_height = 0.0;
             new_bin.grid_fft_valid = false;
+            new_bin.vacancy_gpu_dirty = true;
             new_bin.bin_length = H;
             new_bin.bin_width = W;
 #if PROFILE_CPU_HOTSPOTS

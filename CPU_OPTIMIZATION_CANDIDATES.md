@@ -4,8 +4,8 @@
 **Goal:** identify and rank CPU-bound optimization opportunities in `full_native_decoder.py` after ideas #1, #2, #5 from `NATIVE_OPTIMIZATION_IDEAS.md` are done and idea #6 was rejected.
 **Context:** Profiling data in `NATIVE_OPTIMIZATION_IDEAS.md` shows **~34.7% of wall time (~675ms/seed) is CPU-only** (invisible to the GPU profiler). This document drills into that 34.7% to find concrete, measurable targets.
 
-**Current baseline (P50M2-0, 500 ind.):** 1.119s/gen (after SIMD UVR + template grid write). Previous: 1.487s/gen.
-**Current baseline (P75M2-0, 750 ind.):** 2.162s/gen. Previous: 3.227s/gen (−33%). vs wave_batch: **2.21×** (up from 1.49× at session start).
+**Current baseline (P50M2-0, 500 ind.):** 1.103s/gen (after SIMD UVR + template grid write + bin pool). Previous: 1.487s/gen (−26%).
+**Current baseline (P75M2-0, 750 ind.):** 2.173s/gen. Previous: 3.227s/gen (−33%). vs wave_batch: **2.15×** (up from 1.49× at session start).
 
 ---
 
@@ -21,6 +21,20 @@ Replaced scalar row scan with runtime-dispatched AVX2 implementation using `_mm2
 | wall clock ms/gen | 1499 | 1212 | 1.24× (−287 ms) |
 
 Correctness verified: makespan fingerprints byte-identical between scalar and SIMD paths on 5-rep P50M2-0 run. The SIMD version shifts `update_vacancy_rows` out of the top slot.
+
+### #4 Phase 6 bin pool — DONE 2026-04-10
+Added `bin_pool_` (up to 4096 `BinStateNative` entries). After each `process_machine_batch` call, bins are moved into the pool instead of being destroyed. Phase 6 new-bin creation pops from the pool (if H/W match) and calls `std::memset` + `std::fill` on warm memory instead of `grid.assign` (which triggers OS page faults on first-touch).
+
+Partial-zero variant (zero only dirty rows using `min_occupied_row`) was tested and was slightly slower — the conditional + potential cache miss on `min_occupied_row` outweighed the reduced memset volume. Kept full memset.
+
+| Metric | Before pool | After pool | Delta |
+|---|---|---|---|
+| BinState ctor ms/gen | 31.5 | 22.2 | −9.3 ms |
+| Phase 6 loop ms/gen | 46.7 | 37.9 | −8.8 ms |
+| wall clock ms/gen (P50) | 1119 | 1103 | −16 ms (−1.4%) |
+| wall clock ms/gen (P75) | 2.162s | 2.173s | within noise |
+
+The P50 saving is real but modest because page faults were not the only cost — warm memset of 221MB/gen still takes ~5-6ms at DRAM bandwidth. P75 sees no meaningful change. Pool is still worth keeping (eliminates allocator churn and smooths variance).
 
 ### #3 Template + memcpy/AVX2-add grid write in `add_part_to_bin_cpu` — DONE 2026-04-10
 Replaced the `if (overwrite)` branch inside the inner `(rr, cc)` loop with a `template <bool Overwrite>` instantiation. For `Overwrite=true`, inner loop becomes `std::memcpy(dst, src, pw)` — glibc uses NT stores and prefetch. For `Overwrite=false`, a runtime-dispatched `grid_add_row_avx2` uses `_mm256_add_epi8` over 32 bytes/iteration with scalar tail.
@@ -401,7 +415,7 @@ Not worth optimizing in isolation. Could be batched across solutions via SoA but
 | ~~1~~ | ~~SIMD `update_vacancy_rows_cpp`~~ | 383 ms/gen (pre) → 89 ms/gen (post) | **DONE** −287 ms/gen | — |
 | ~~2~~ | ~~Vacancy upload sync~~ | 97 ms/gen | **SKIPPED** — mostly real GPU time, no cheap fix | — |
 | ~~3~~ | ~~Template + memcpy/AVX2-add grid write~~ | 111 ms/gen (pre) → 53 ms/gen (post) | **DONE** −58 ms/gen (−7.7%) | — |
-| **4** | **Phase 6 bin pool / lazy grid** | **106 ms/gen total (33 ms ctor)** | **Next candidate** | 20–60 ms/gen |
+| ~~4~~ | ~~Phase 6 bin pool~~ | 31.5 ms/gen ctor → 22.2 ms/gen | **DONE** −9.3 ms/gen ctor, −16 ms wall clock | — |
 | — | ~~Phase 3 Pass A/C merge~~ | 8 ms/gen | Dead target | — |
 | — | ~~Vacancy readback sync~~ | 7 ms/gen | Dead target | — |
 | — | ~~Python-C++ boundary~~ | <1 ms/gen | Dead target | — |
