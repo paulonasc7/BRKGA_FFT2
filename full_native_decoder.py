@@ -241,6 +241,14 @@ void native_batch_vacancy_check_cuda(
     int H
 );
 
+void native_compute_vacancy_rows_cuda(
+    torch::Tensor grid_states,    // (max_bins, H, W) float32
+    torch::Tensor vacancy_flat,   // (max_bins, H) int32
+    torch::Tensor grid_idxs,      // (n_rows,) int32 — which bin
+    torch::Tensor row_idxs,       // (n_rows,) int32 — which row
+    int H, int W, int n_rows
+);
+
 inline void native_batch_vacancy_check(
     torch::Tensor vacancy_flat,
     torch::Tensor density_flat,
@@ -252,6 +260,18 @@ inline void native_batch_vacancy_check(
 ) {
     native_batch_vacancy_check_cuda(
         vacancy_flat, density_flat, pair_vac_row, pair_den_off, pair_den_len, out_pass, H
+    );
+}
+
+inline void native_compute_vacancy_rows(
+    torch::Tensor grid_states,
+    torch::Tensor vacancy_flat,
+    torch::Tensor grid_idxs,
+    torch::Tensor row_idxs,
+    int H, int W, int n_rows
+) {
+    native_compute_vacancy_rows_cuda(
+        grid_states, vacancy_flat, grid_idxs, row_idxs, H, W, n_rows
     );
 }
 
@@ -438,6 +458,7 @@ public:
             );
             density_flat_gpu_ = cpu_t.to(device_);
         }
+
     }
 
     py::array_t<double> evaluate_batch(
@@ -559,7 +580,7 @@ private:
     std::vector<int32_t> scratch_place_cols_;
     std::vector<int32_t> scratch_newbin_ctx_local_;
 
-    // Vacancy dirty-flush scratch.
+    // Vacancy dirty-flush scratch (legacy — kept for reference, no longer used).
     std::vector<int32_t> scratch_dirty_grid_rows_;
     std::vector<BinStateNative*> scratch_dirty_bins_ptr_;
 
@@ -599,6 +620,12 @@ private:
     torch::Tensor ws_x_starts_i32_;
     torch::Tensor ws_part_widths_i32_;
     torch::Tensor ws_part_offsets_i32_;
+    // Packed GPU+CPU buffers for apply_gpu_updates (single copy_ instead of 6).
+    torch::Tensor ws_gpu_update_packed_;
+    torch::Tensor ws_cpu_gpu_update_packed_;
+    // Packed GPU+CPU buffers for batch_fft_all_tests index uploads (single copy_ instead of 4).
+    torch::Tensor ws_fft_idx_packed_;
+    torch::Tensor ws_cpu_fft_idx_packed_;
     // GPU vacancy buffer: (max_total_bins, H) int32.
     // Allocated once per process_machine_batch call; rows updated lazily via dirty flags.
     torch::Tensor ws_vacancy_gpu_;
@@ -612,6 +639,9 @@ private:
     torch::Tensor ws_cpu_vac_row_ids_;    // pinned, int32 — which GPU rows to write
     torch::Tensor ws_cpu_pair_buf_;       // pinned, int32 — packed [vac_row | den_off | den_len]
     torch::Tensor ws_cpu_pass_buf_;       // pinned, int8  — result readback
+    // GPU vacancy recompute workspaces (packed grid_idxs + row_idxs).
+    torch::Tensor ws_gpu_vacancy_recompute_;     // (2*n_rows,) int32 on GPU
+    torch::Tensor ws_cpu_vacancy_recompute_;     // (2*n_rows,) int32 pinned CPU
     // CPU-side scratch for pair building.
     std::vector<int32_t> scratch_pair_vac_row_;
     std::vector<int32_t> scratch_pair_den_off_;
@@ -1130,18 +1160,30 @@ private:
             return;
         }
 
-        auto all_grid_idx_t = load_workspace_long_from_i64(
-            ws_grid_idx_long_, ws_cpu_grid_idx_, test_grid_indices, static_cast<int64_t>(n_tests)
-        );
-        auto all_rot_idx_t = load_workspace_long_from_i32(
-            ws_rot_idx_long_, ws_cpu_rot_idx_, test_rot_global, static_cast<int64_t>(n_tests)
-        );
-        auto all_h_t = load_workspace_long_from_i32(
-            ws_h_long_, ws_cpu_h_, test_heights, static_cast<int64_t>(n_tests)
-        );
-        auto all_w_t = load_workspace_long_from_i32(
-            ws_w_long_, ws_cpu_w_, test_widths, static_cast<int64_t>(n_tests)
-        );
+        // Pack all 4 index arrays into one pinned buffer and upload in a
+        // single copy_ call.  Layout (int64): grid_idx[n] | rot_idx[n] | h[n] | w[n]
+        const int64_t nt = static_cast<int64_t>(n_tests);
+        auto gpu_fft_packed = ensure_workspace_long(ws_fft_idx_packed_, 4 * nt);
+        {
+            auto cpu_packed = ensure_cpu_pinned_long(ws_cpu_fft_idx_packed_, 4 * nt);
+            int64_t* p = cpu_packed.data_ptr<int64_t>();
+            // grid_idx is already int64
+            std::memcpy(p, test_grid_indices.data(), static_cast<size_t>(nt) * sizeof(int64_t));
+            // rot, h, w need widening from int32→int64
+            int64_t* dst_rot = p + nt;
+            int64_t* dst_h   = p + 2 * nt;
+            int64_t* dst_w   = p + 3 * nt;
+            for (int64_t i = 0; i < nt; ++i) {
+                dst_rot[i] = static_cast<int64_t>(test_rot_global[static_cast<size_t>(i)]);
+                dst_h[i]   = static_cast<int64_t>(test_heights[static_cast<size_t>(i)]);
+                dst_w[i]   = static_cast<int64_t>(test_widths[static_cast<size_t>(i)]);
+            }
+            gpu_fft_packed.copy_(cpu_packed, /*non_blocking=*/true);
+        }
+        auto all_grid_idx_t = gpu_fft_packed.narrow(0, 0,      nt);
+        auto all_rot_idx_t  = gpu_fft_packed.narrow(0, nt,     nt);
+        auto all_h_t        = gpu_fft_packed.narrow(0, 2 * nt, nt);
+        auto all_w_t        = gpu_fft_packed.narrow(0, 3 * nt, nt);
 
         constexpr int CHUNK_SIZE = 750;
         for (int chunk_start = 0; chunk_start < n_tests; chunk_start += CHUNK_SIZE) {
@@ -1377,8 +1419,8 @@ private:
             }
         }
 
-        update_vacancy_rows_cpp(bin.vacancy, bin.grid, y_start, ph, machine_width);
-        bin.vacancy_gpu_dirty = true;
+        // Vacancy is now recomputed on GPU after apply_gpu_updates — no CPU
+        // update_vacancy_rows or dirty flag needed here.
         bin.area += part_area_[static_cast<size_t>(part_idx)];
         bin.min_occupied_row = std::min(bin.min_occupied_row, y_start);
         bin.max_occupied_row = std::max(bin.max_occupied_row, y);
@@ -1620,7 +1662,7 @@ private:
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_vup_t0 = PROF_NOW();
 #endif
-        gpu_pairs.copy_(cpu_pairs, /*non_blocking=*/false);  // sync: kernel needs data immediately
+        gpu_pairs.copy_(cpu_pairs, /*non_blocking=*/true);  // pinned→GPU on default stream; ordered before kernel
 #if PROFILE_CPU_HOTSPOTS
         g_profile.vac_upload_sync_ns += PROF_NS_SINCE(_prof_vup_t0);
 #endif
@@ -1717,8 +1759,7 @@ private:
             }
         }
 
-        // Upload any dirty vacancy vectors to GPU before Phase 3.
-        flush_dirty_vacancies(contexts, active_indices, H);
+        // Vacancy is now maintained on GPU — no flush needed.
 
         scratch_ctx_first_valid_bin_.assign(static_cast<size_t>(n_contexts), -1);
         auto& p1 = scratch_p1_;
@@ -2101,6 +2142,7 @@ private:
 
         if (!gpu_updates.empty()) {
             apply_gpu_updates(grid_states, gpu_updates, H, W);
+            recompute_vacancy_gpu(grid_states, gpu_updates, H, W);
         }
 
         auto& phase6_gpu_updates = scratch_phase6_gpu_updates_;
@@ -2150,7 +2192,7 @@ private:
             new_bin.proc_time = 0.0;
             new_bin.proc_time_height = 0.0;
             new_bin.grid_fft_valid = false;
-            new_bin.vacancy_gpu_dirty = true;
+            // vacancy_gpu_dirty no longer used — vacancy maintained on GPU.
             new_bin.bin_length = H;
             new_bin.bin_width = W;
 #if PROFILE_CPU_HOTSPOTS
@@ -2188,8 +2230,48 @@ private:
                 static_cast<int64_t>(phase6_grid_indices.size())
             );
             grid_states.index_fill_(0, idx_t, 0.0);
+            // Initialize vacancy for new bins: all rows = W (empty grid).
+            ws_vacancy_gpu_.index_fill_(0, idx_t, static_cast<int32_t>(W));
             apply_gpu_updates(grid_states, phase6_gpu_updates, H, W);
+            // Recompute vacancy for the rows where parts were placed.
+            recompute_vacancy_gpu(grid_states, phase6_gpu_updates, H, W);
         }
+    }
+
+    // Recompute vacancy rows on GPU for affected (grid_idx, row) pairs.
+    // Called after apply_gpu_updates to keep ws_vacancy_gpu_ in sync.
+    template <typename PlacementVec>
+    void recompute_vacancy_gpu(
+        torch::Tensor& grid_states,
+        const PlacementVec& updates,
+        int H, int W
+    ) {
+        int total_rows = 0;
+        for (const auto& u : updates) {
+            total_rows += u.ph;
+        }
+        if (total_rows <= 0) return;
+
+        const int64_t n = static_cast<int64_t>(total_rows);
+        auto cpu_packed = ensure_cpu_pinned_i32(ws_cpu_vacancy_recompute_, 2 * n);
+        int32_t* p = cpu_packed.data_ptr<int32_t>();
+        int off = 0;
+        for (const auto& u : updates) {
+            for (int r = 0; r < u.ph; ++r) {
+                p[off] = static_cast<int32_t>(u.grid_idx);
+                p[n + off] = static_cast<int32_t>(u.y_start + r);
+                ++off;
+            }
+        }
+
+        auto gpu_packed = ensure_workspace_i32(ws_gpu_vacancy_recompute_, 2 * n);
+        gpu_packed.copy_(cpu_packed, /*non_blocking=*/true);
+        auto grid_idxs_t = gpu_packed.narrow(0, 0, n);
+        auto row_idxs_t  = gpu_packed.narrow(0, n, n);
+
+        native_compute_vacancy_rows(
+            grid_states, ws_vacancy_gpu_, grid_idxs_t, row_idxs_t, H, W, total_rows
+        );
     }
 
     template <typename PlacementVec>
@@ -2244,24 +2326,30 @@ private:
             return;
         }
 
-        auto cell_offsets_t = load_workspace_i32_from_i32(
-            ws_cell_offsets_i32_, ws_cpu_cell_offsets_, cell_offsets, static_cast<int64_t>(n + 1)
-        );
-        auto grid_idxs_t = load_workspace_i32_from_i32(
-            ws_grid_idxs_i32_, ws_cpu_grid_idxs_, grid_idxs, static_cast<int64_t>(n)
-        );
-        auto y_starts_t = load_workspace_i32_from_i32(
-            ws_y_starts_i32_, ws_cpu_y_starts_, y_starts, static_cast<int64_t>(n)
-        );
-        auto x_starts_t = load_workspace_i32_from_i32(
-            ws_x_starts_i32_, ws_cpu_x_starts_, x_starts, static_cast<int64_t>(n)
-        );
-        auto part_widths_t = load_workspace_i32_from_i32(
-            ws_part_widths_i32_, ws_cpu_part_widths_, part_widths, static_cast<int64_t>(n)
-        );
-        auto part_offsets_t = load_workspace_i32_from_i32(
-            ws_part_offsets_i32_, ws_cpu_part_offsets_, part_offsets, static_cast<int64_t>(n)
-        );
+        // Pack all 6 parameter arrays into one contiguous buffer and upload
+        // in a single pinned→GPU copy_ call.  Layout (int32):
+        //   cell_offsets[n+1] | grid_idxs[n] | y_starts[n] | x_starts[n] | part_widths[n] | part_offsets[n]
+        const int64_t packed_len = static_cast<int64_t>(n + 1) + 5 * static_cast<int64_t>(n);
+        auto gpu_packed = ensure_workspace_i32(ws_gpu_update_packed_, packed_len);
+        {
+            auto cpu_packed = ensure_cpu_pinned_i32(ws_cpu_gpu_update_packed_, packed_len);
+            int32_t* p = cpu_packed.data_ptr<int32_t>();
+            int64_t off = 0;
+            std::memcpy(p + off, cell_offsets.data(), static_cast<size_t>(n + 1) * sizeof(int32_t)); off += n + 1;
+            std::memcpy(p + off, grid_idxs.data(),    static_cast<size_t>(n)     * sizeof(int32_t)); off += n;
+            std::memcpy(p + off, y_starts.data(),      static_cast<size_t>(n)     * sizeof(int32_t)); off += n;
+            std::memcpy(p + off, x_starts.data(),      static_cast<size_t>(n)     * sizeof(int32_t)); off += n;
+            std::memcpy(p + off, part_widths.data(),   static_cast<size_t>(n)     * sizeof(int32_t)); off += n;
+            std::memcpy(p + off, part_offsets.data(),  static_cast<size_t>(n)     * sizeof(int32_t));
+            gpu_packed.copy_(cpu_packed, /*non_blocking=*/true);
+        }
+        int64_t off = 0;
+        auto cell_offsets_t = gpu_packed.narrow(0, off, n + 1); off += n + 1;
+        auto grid_idxs_t    = gpu_packed.narrow(0, off, n);     off += n;
+        auto y_starts_t     = gpu_packed.narrow(0, off, n);     off += n;
+        auto x_starts_t     = gpu_packed.narrow(0, off, n);     off += n;
+        auto part_widths_t  = gpu_packed.narrow(0, off, n);     off += n;
+        auto part_offsets_t = gpu_packed.narrow(0, off, n);
 
         native_batch_grid_update(
             grid_states,
@@ -2594,6 +2682,57 @@ void native_batch_vacancy_check_cuda(
     );
 }
 
+// ── Vacancy row recompute kernel ─────────────────────────────────────────────
+// For each (grid_idx, row_idx) pair, scan grid_states[grid_idx][row_idx][0..W-1]
+// and compute max consecutive zeros.  One thread per row.
+__global__ void _compute_vacancy_rows_kernel(
+    const float* __restrict__ grid_flat,   // (max_bins * H * W)
+    int* __restrict__ vacancy_flat,         // (max_bins * H)
+    const int* __restrict__ grid_idxs,      // (n_rows,) which bin
+    const int* __restrict__ row_idxs,       // (n_rows,) which row within the bin
+    int H, int W, int n_rows
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= n_rows) return;
+
+    int grid_idx = grid_idxs[tid];
+    int row_idx  = row_idxs[tid];
+
+    const float* row = grid_flat + (long long)grid_idx * H * W + (long long)row_idx * W;
+
+    int max_zeros = 0;
+    int cur_zeros = 0;
+    for (int j = 0; j < W; ++j) {
+        if (row[j] == 0.0f) {
+            cur_zeros++;
+            if (cur_zeros > max_zeros) max_zeros = cur_zeros;
+        } else {
+            cur_zeros = 0;
+        }
+    }
+
+    vacancy_flat[(long long)grid_idx * H + row_idx] = max_zeros;
+}
+
+void native_compute_vacancy_rows_cuda(
+    torch::Tensor grid_states,
+    torch::Tensor vacancy_flat,
+    torch::Tensor grid_idxs,
+    torch::Tensor row_idxs,
+    int H, int W, int n_rows
+) {
+    if (n_rows <= 0) return;
+    const int threads = 256;
+    const int blocks = (n_rows + threads - 1) / threads;
+    _compute_vacancy_rows_kernel<<<blocks, threads>>>(
+        grid_states.data_ptr<float>(),
+        vacancy_flat.data_ptr<int>(),
+        grid_idxs.data_ptr<int>(),
+        row_idxs.data_ptr<int>(),
+        H, W, n_rows
+    );
+}
+
 """
 
 _module = None
@@ -2773,6 +2912,14 @@ class FullNativeDecoderEvaluator:
         device: str = "cuda",
     ):
         del collision_backend  # kept for interface parity with WaveBatchEvaluator
+        # Enlarge cuFFT plan cache so all unique (H, W, batch) plans stay cached
+        # across waves.  Default is often small (e.g. 16–32), causing repeated
+        # cuModuleLoad/Unload (~275ms/rep on P75M2-0 per nsys).
+        if torch.cuda.is_available():
+            try:
+                torch.backends.cuda.cufft_plan_cache[0].max_size = 4096
+            except Exception:
+                pass
         mod = _get_module()
         if mod is None:
             raise RuntimeError("Failed to build/load _full_native_decoder_ext")

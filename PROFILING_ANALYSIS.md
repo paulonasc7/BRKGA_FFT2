@@ -257,3 +257,275 @@ Practically: merging the p1 and p2 vacancy checks into a single GPU call per wav
 
 ### 5. CHUNK_SIZE Tuning (irfft2 batch efficiency) — LOW, EASY EXPERIMENT
 Current `CHUNK_SIZE=750` means the fused_gather_multiply and irfft2 are always done in chunks ≤750 tests. Increasing to 1024 or 2048 would reduce irfft2 call count but increase per-call time. With cuFFT re-planning fixed (item 1), larger chunks become more attractive. Profile with CHUNK_SIZE=1024 and CHUNK_SIZE=2048 to see if fewer, larger calls are faster end-to-end.
+
+---
+
+## Optimization Attempt: cuFFT Re-Planning Fix — ABANDONED
+
+**Date:** 2026-04-10  
+**Target:** `cuModuleUnload`/`cuModuleLoadData` overhead (138ms/rep, ~6.6% of wall, from nsys CUDA API summary)
+
+### What was attempted
+
+The nsys CUDA API summary showed 448 `cuModuleUnload` + 480 `cuModuleLoadData` calls per rep — cuFFT JIT-compiling new PTX modules for each unique (H, W, batch_size) combination.  The hypothesis was that variable batch sizes in `batch_fft_all_tests` were preventing cuFFT plan reuse.
+
+Two versions were tried, both in the same `batch_fft_all_tests` chunk loop:
+
+**Version 1 (incorrect):** Always allocate workspace for CHUNK_SIZE=750 and pass the full 750-row tensor to `irfft2`, regardless of actual `chunk_n`. Only the first `chunk_n` output rows are read. This ensures `irfft2` always sees batch=750.
+
+**Version 2 (tiered canonical):** Add a `canonical_batch(n)` helper that rounds up to the nearest power-of-2 (16/32/64/128/256/512/750). The workspace is sized for `chunk_canonical` rows; `irfft2` is called on the padded tensor; output is narrowed back to `chunk_n` rows. Also set `torch.backends.cuda.cufft_plan_cache.max_size = 32` at evaluator init to ensure all canonical plans fit in the cache simultaneously.
+
+### What went wrong: wrong eval mode discovered
+
+During testing, the `full_native` argument was mistakenly used instead of the correct `native_full` argument to `BRKGA_alg3.py`. This silently fell through to the **serial single-individual evaluation path** (500 evaluations, one at a time) rather than the `FullNativeDecoderEvaluator` batch path. Serial mode runs at ~13s/gen for P50 regardless of any C++ changes, since it calls `evaluate_solution()` in a Python loop. All results during initial testing were invalid.
+
+The correct invocation is:
+```bash
+python BRKGA_alg3.py 50 2 0 torch_gpu native_full 1 1 N
+```
+
+### Actual results (correct native_full mode, BRKGA_alg3.py)
+
+**P50M2-0 baselines (before fix), gens 1–4:**
+
+| Gen | Time (s) |
+|---|---|
+| 1 | 1.14 |
+| 2 | 1.16 |
+| 3 | 1.14 |
+| 4 | 1.18 |
+| **Avg** | **1.155** |
+
+**P50M2-0 with tiered canonical fix, gens 1–9:**
+
+| Gen | Time (s) |
+|---|---|
+| 1 | 1.10 |
+| 2 | 1.10 |
+| 3 | 1.10 |
+| 4 | 1.19 |
+| 5 | 1.37 (outlier) |
+| 6 | 1.13 |
+| 7 | 1.09 |
+| 8 | 1.10 |
+| 9 | 1.09 |
+| **Avg (excl. gen5)** | **1.11** |
+
+**P75M2-0 baseline (before fix), gens 1–9:**
+
+| Gen | Time (s) |
+|---|---|
+| 1 | 2.20 |
+| 2 | 2.27 |
+| 3 | 2.33 |
+| 4 | 2.46 |
+| 5 | 2.30 |
+| 6 | 2.36 |
+| 7 | 2.35 |
+| 8 | 2.38 |
+| 9 | 2.38 |
+| **Avg** | **2.226** |
+
+**P75M2-0 with tiered canonical fix, gens 1–9:**
+
+| Gen | Time (s) |
+|---|---|
+| 1 | 2.42 |
+| 2 | 2.35 |
+| 3 | 2.40 |
+| 4 | 2.37 |
+| 5 | 2.38 |
+| 6 | 2.38 |
+| 7 | 2.38 |
+| 8 | 2.40 |
+| 9 | 2.36 |
+| **Avg** | **2.382** |
+
+### Summary
+
+| Instance | Baseline | With fix | Delta |
+|---|---|---|---|
+| P50M2-0 | 1.155s | 1.11s | **−45ms (−4%)** |
+| P75M2-0 | 2.226s | 2.382s | **+156ms (+7%)** |
+
+**Net result: negative.** P75 regresses more than P50 improves.
+
+### Why it failed
+
+The nsys data reported avg irfft2 batch size ~11 for P75M2-0 (3,675 total tests ÷ 331 irfft2 calls/gen). Rounding up to canonical=16 adds 45% more FFT computation per call.  Budget analysis:
+
+| Factor | Value |
+|---|---|
+| Plan-loading savings (target) | ~138ms/rep |
+| FFT overhead from padding (16/11 ≈ 1.45×) | ~165ms/rep (368ms × 0.45) |
+| **Net** | **−27ms/rep (regression)** |
+
+The empirical −156ms regression is larger than the predicted −27ms, likely because the actual batch-size distribution is more skewed (many batches of size 1–5, not just 11), making the padding overhead larger than the mean would suggest.
+
+**P50 showed a small improvement** because in P50 the irfft2 accounts for a smaller fraction of wall time (fewer bins × parts), so the plan-loading savings slightly outweigh the padding overhead.
+
+### What this tells us about the batch size distribution
+
+The avg batch of ~11 with a long tail of very small batches (size 1–5) means:
+- Padding to even 16 incurs 200–1500% FFT overhead for the smallest calls
+- The fixed plan-loading cost per call is only ~275µs; small-batch irfft2 is even cheaper, so the overhead is never justified
+- Any padding-based approach to limit distinct cuFFT plans will hurt more than it helps unless the padding is restricted to batches already close to CHUNK_SIZE
+
+### Alternative approaches NOT tried
+
+1. **Pre-warm all plans at init**: Call `irfft2` once with each batch size 1–750 during `FullNativeDecoderEvaluator.__init__` and set `cufft_plan_cache.max_size=750`. Zero runtime overhead. One-time cost ~1–2s per machine per (H, W). Would fully eliminate re-planning without any padding overhead. Not tried due to time constraints.
+2. **Increase cufft_plan_cache.max_size alone**: Without padding, if all 750 possible batch sizes fit in the cache simultaneously, plans are compiled on first use and reused forever. Requires `max_size ≥ 750 × n_machines × n_fft_dims`. Not tried.
+
+### Status: REVERTED (batch-padding approach)
+
+The batch-padding approach was reverted. However, the alternative approach #2 (increasing the plan cache) was later implemented successfully — see the next section.
+
+---
+
+## Optimization Round 2 — Applied Successfully
+
+**Date:** 2026-04-13  
+**Starting baseline:** P50M2-0 ~1.155s/gen, P75M2-0 ~2.226s/gen
+
+Four changes were applied. Two more were tried and reverted.
+
+### Change 1: cuFFT plan cache size = 4096
+
+Set `torch.backends.cuda.cufft_plan_cache[0].max_size = 4096` in `FullNativeDecoderEvaluator.__init__`. This was alternative #2 from the failed batch-padding attempt — instead of padding batches to fixed sizes, simply make the cache large enough to hold all plans simultaneously.
+
+cuFFT plans are keyed by `(H, W, batch_size, direction)`. With variable batch sizes across waves (1–750), the default cache (typically 16–32 entries) evicts plans constantly, triggering `cuModuleLoad/Unload` cycles (~275ms/rep on P75). A cache of 4096 comfortably holds all plans for all machines.
+
+**Result:** P50 improved by ~97ms (8.4%). P75 was neutral — P75 has fewer distinct batch sizes per wave (more tests/wave, values cluster near CHUNK_SIZE), so the default cache was already sufficient.
+
+**Scaling to larger instances:** Multi-machine instances (P200M4, P300M10) should benefit more than P50/P75, because machines have different (H, W) dimensions. Without a large cache, switching machines causes plan eviction and recompilation. With 4096 entries, all plans for all machines coexist.
+
+### Change 2: Vacancy check input copy non-blocking
+
+Changed `gpu_pairs.copy_(cpu_pairs, /*non_blocking=*/false)` to `non_blocking=true` in `run_gpu_vacancy_check`. The original blocking copy was unnecessary — pinned→GPU copies on the default stream are already ordered before any subsequent kernel launch on that stream.
+
+**Result:** No measurable difference in isolation. Kept because it's correct and removes a pointless sync.
+
+### Change 3: apply_gpu_updates — 6 copy_ calls → 1 packed copy
+
+The `apply_gpu_updates` function uploaded 6 separate int32 arrays (cell_offsets, grid_idxs, y_starts, x_starts, part_widths, part_offsets) via 6 individual `load_workspace_i32_from_i32` calls, each doing a pinned→GPU `copy_`. Replaced with a single packed buffer: all 6 arrays are packed contiguously into one pinned int32 tensor, uploaded in one `copy_` call, then split via `narrow()` on the GPU side.
+
+This function is called twice per wave (Phase 5 placements + Phase 6 new bins). Saving 5 copy_ calls × 2 invocations/wave = 10 fewer copy_ calls per wave.
+
+**Result (combined with change 4):** P50 improved by ~20ms on top of change 1. P75 improved by ~30ms.
+
+**Scaling:** Savings scale linearly with wave count. P200M4 (~200+ waves/gen) would save ~2000+ copy_ calls/gen.
+
+### Change 4: batch_fft_all_tests — 4 copy_ calls → 1 packed copy
+
+The 4 index arrays uploaded at the start of `batch_fft_all_tests` (grid_idx int64, rot_idx int32→int64, heights int32→int64, widths int32→int64) were each uploaded separately. Replaced with a single packed int64 buffer with one `copy_` call. The int32→int64 widening is done during the packing memcpy on the CPU side.
+
+Called twice per wave (p1 and p2). Saving 3 copy_ calls × 2 = 6 fewer calls/wave.
+
+**Scaling:** Same linear scaling with wave count as change 3.
+
+### Results — All 4 changes combined
+
+| Instance | Previous baseline | After changes | Delta |
+|---|---|---|---|
+| P50M2-0 | 1.155s/gen | **~1.04s/gen** | **−115ms (−10.0%)** |
+| P75M2-0 | 2.226s/gen | **~2.20s/gen** | **~−26ms (~−1.2%)** |
+
+P50 sees a clear 10% improvement. P75 improvement is modest and within noise on individual runs, but consistently trends ~20-30ms better across longer runs (gens 10+ trend to ~2.15s).
+
+---
+
+## Optimization Attempts — Tried and Reverted
+
+### Attempt: Eager rfft2 at end of wave
+
+**Idea:** After Phase 5/6 GPU updates, immediately fire rfft2 for all invalidated bins at the end of `process_wave`. The next wave's Phase 2 would find all bins already valid and skip. The rfft2 GPU work would overlap with the CPU's start-of-next-wave bookkeeping.
+
+**Result:** P50 regressed from ~1.04s to ~1.07s. P75 was neutral (~2.24s).
+
+**Why it failed:** Everything runs on the default CUDA stream. The rfft2 queued at end of wave N serializes with the vacancy upload and vacancy check at the start of wave N+1 — the GPU must finish rfft2 before the vacancy kernel can run, even though the vacancy kernel doesn't need rfft2 results. The rfft2 just adds to the serial work on the default stream instead of overlapping with CPU work.
+
+### Attempt: Multi-stream Phase 2 rfft2
+
+**Idea:** Create a secondary CUDA stream (`fft_stream_`). Run Phase 2 rfft2 on `fft_stream_` while vacancy check runs on the default stream. Use `CUDAEvent` for synchronization: record on default stream → block `fft_stream_` (so it waits for grid_states writes) → run rfft2 on `fft_stream_` → record completion → default stream blocks before Phase 4.
+
+**Result:** `CUDA error: device-side assert triggered` at runtime. Works with `CUDA_LAUNCH_BLOCKING=1` (which serializes everything, defeating the purpose).
+
+**Why it failed:** PyTorch's caching CUDA allocator tracks which stream owns each memory allocation. When `fft_stream_` accesses `grid_states` and `grid_ffts` (allocated on the default stream), the allocator may recycle that memory for a default-stream allocation before `fft_stream_` is done with it. Fixing this requires calling `c10::cuda::CUDACachingAllocator::recordStream()` on every tensor shared between streams — a fragile pattern that must be maintained for all future code changes.
+
+---
+
+## Assessment: Is Multi-Stream Pipelining Worth Pursuing?
+
+**Short answer: No.** The cost-benefit ratio is poor.
+
+### What multi-stream Phase 2 would actually save
+
+Phase 2 rfft2 GPU time: **84ms/gen on P75** (4.0% of wall time). This is the maximum saving from overlapping it with CPU work. On larger instances the absolute ms grows proportionally, but as a fraction of wall time it stays ~4%.
+
+### Why the other 27% of GPU idle time can't be reclaimed
+
+Total GPU idle: **655ms/gen (31%)**. Multi-stream Phase 2 reclaims only 84ms (13% of idle time). The remaining 571ms comes from structural sync points that can't be pipelined:
+
+1. **Vacancy check readback sync** (~210ms/gen): CPU must read vacancy results before Pass C. Data dependency — can't overlap.
+2. **Phase 4→5 readback sync**: CPU must read selector results before `add_part_to_bin`. Data dependency — can't overlap.
+3. **Inter-phase CPU work** (Pass A, Pass C, active indices): CPU is busy, nothing to queue on GPU.
+
+The fundamental constraint is that each wave has a **serial dependency chain**:
+```
+Phase 2 → vacancy check → Phase 4 → Phase 5 → Phase 6 → (next wave)
+```
+You can't pipeline wave N+1's Phase 4 with wave N's because Phase 4 of N+1 depends on grid_ffts updated by Phase 5/6 of N.
+
+### Implementation cost
+
+Multi-stream requires:
+- `recordStream()` on every tensor shared across streams (`grid_states`, `grid_ffts`, index tensors)
+- Careful event management (4 synchronization points per wave)
+- Every future code change touching shared GPU tensors must be stream-aware
+
+This is fragile infrastructure for a ~4% gain.
+
+---
+
+## What Would Actually Move the Needle for Large Instances
+
+Ranked by expected impact and feasibility:
+
+### ~~1. Merge p1/p2 vacancy checks — eliminate one sync round-trip per wave~~ — NOT VIABLE
+
+> **Cross-reference:** Already analyzed in `NATIVE_OPTIMIZATION_IDEAS.md` Idea #3 ("Merge p1 and p2 FFT batches") and `CPU_OPTIMIZATION_CANDIDATES.md` #4.C. Conclusion: p2 depends on p1 FFT results (chicken-and-egg problem), true merge is impossible, and dropping the early exit would multiply Phase 3 CPU work 4-5×. **SKIPPED with good reason.**
+
+~~Currently each wave does two vacancy check round-trips...~~
+
+**Status: Removed from consideration.** The dependency chain between p1 and p2 makes this fundamentally infeasible without restructuring the entire decoder loop, which would likely be net-negative.
+
+### 2. Move update_vacancy_rows to GPU — GENUINELY NEW
+
+> **Cross-reference:** NOT previously tried. The closest attempt was `OPTIMIZATION_IDEAS.md` Idea #6 "Eliminate CPU grid mirror," which tried the *inverse* — moving grid reads to GPU for vacancy — and failed catastrophically (+137%) because each `.cpu()` call forced a GPU stream flush. This proposal is fundamentally different: it does the vacancy row scan *on* the GPU where the grid already lives, avoiding CPU↔GPU sync entirely.
+
+`add_part_to_bin` → `update_vacancy_rows` is the single largest CPU hotspot (146ms on P75, 7.3%). It's a per-row max-consecutive-zeros scan over the grid — embarrassingly parallel across rows.
+
+A GPU kernel doing this would eliminate the CPU bottleneck that causes GPU idle time. The grid data is already on the GPU (`grid_states`). The vacancy result could stay on the GPU (`ws_vacancy_gpu_`), eliminating the entire vacancy upload path (`flush_dirty_vacancies` + its copy_ calls).
+
+**Expected saving:** 146ms CPU + 200ms vacancy upload sync = **~346ms/gen on P75 (17%)**. This is the single biggest opportunity.
+
+**Feasibility:** High complexity. Requires a new CUDA kernel for max-consecutive-zeros, plus restructuring `add_part_to_bin` so the CPU grid write and GPU vacancy compute can coexist. The CPU still needs the grid for `add_part_to_bin` (memcpy/AVX2-add), so the grid must exist in both CPU and GPU memory, with the GPU vacancy kernel running after the GPU grid update.
+
+### 3. Reduce wave count (algorithmic) — GENUINELY NEW
+
+> **Cross-reference:** NOT previously tried or analyzed in any optimization file. This is an algorithmic change rather than a systems-level optimization.
+
+If you could place 2 parts per wave instead of 1, you'd halve the wave count and all per-wave overhead (syncs, copy_ calls, GPU idle gaps). This is an algorithm-level change — each wave would evaluate the best placement for each solution's current part AND next part simultaneously, then apply both placements.
+
+**Expected saving:** ~50% reduction in per-wave overhead. On P75: ~500ms/gen.
+
+**Feasibility:** Very high complexity. Changes the core decoder semantics. Placement of part N+1 depends on where part N was placed (bin state changes). Would need speculative evaluation or a two-pass scheme.
+
+### Summary
+
+| Opportunity | Expected saving (P75) | Effort | Scalability | Status |
+|---|---|---|---|---|
+| ~~Merge p1/p2 vacancy checks~~ | ~~100-200ms (5-10%)~~ | ~~Medium~~ | ~~Linear with waves~~ | **Not viable** — p2 depends on p1 results |
+| **GPU update_vacancy_rows** | **~346ms (17%)** | **High** | **Linear with bins×parts** | **New — best opportunity** |
+| Reduce wave count | ~500ms (25%) | Very high | Halves all overhead | New — highest impact but hardest |
+| Multi-stream Phase 2 | ~84ms (4%) | Medium-high, fragile | Constant fraction | Tried and reverted |
