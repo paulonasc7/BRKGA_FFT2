@@ -1,8 +1,9 @@
 # Profiling Analysis — FullNativeDecoderEvaluator
 
-**Date:** 2026-04-10  
-**Baseline after CPU optimizations:** P50M2-0 1.105s/gen, P75M2-0 2.010s/gen  
-**vs wave_batch (P75M2-0):** 2.15×  
+**Date:** 2026-04-10 (initial), 2026-04-13 (Round 2+3 updates)  
+**Original baseline after CPU optimizations:** P50M2-0 1.105s/gen, P75M2-0 2.010s/gen  
+**Current (after Round 3):** P50M2-0 **0.974s/gen**, P75M2-0 **1.742s/gen**  
+**Total speedup vs original:** P50 −15.7%, P75 −21.7%  
 
 All data collected with `profile_cpu_hotspots.py` (10 reps, seed 123) and `profile_phases_native.py` (3 seeds: 123, 321, 777).
 
@@ -511,21 +512,119 @@ A GPU kernel doing this would eliminate the CPU bottleneck that causes GPU idle 
 
 **Feasibility:** High complexity. Requires a new CUDA kernel for max-consecutive-zeros, plus restructuring `add_part_to_bin` so the CPU grid write and GPU vacancy compute can coexist. The CPU still needs the grid for `add_part_to_bin` (memcpy/AVX2-add), so the grid must exist in both CPU and GPU memory, with the GPU vacancy kernel running after the GPU grid update.
 
-### 3. Reduce wave count (algorithmic) — GENUINELY NEW
+### ~~3. Reduce wave count (algorithmic)~~ — NOT VIABLE
 
-> **Cross-reference:** NOT previously tried or analyzed in any optimization file. This is an algorithmic change rather than a systems-level optimization.
-
-If you could place 2 parts per wave instead of 1, you'd halve the wave count and all per-wave overhead (syncs, copy_ calls, GPU idle gaps). This is an algorithm-level change — each wave would evaluate the best placement for each solution's current part AND next part simultaneously, then apply both placements.
-
-**Expected saving:** ~50% reduction in per-wave overhead. On P75: ~500ms/gen.
-
-**Feasibility:** Very high complexity. Changes the core decoder semantics. Placement of part N+1 depends on where part N was placed (bin state changes). Would need speculative evaluation or a two-pass scheme.
+> **Reassessment (2026-04-13):** On closer analysis, this doesn't actually save meaningful time.
+>
+> **Loop restructuring (place 2 parts sequentially per wave):** This preserves algorithm correctness — place part N, commit it, then place part N+1 against the updated grid, all inside one `process_wave` call. However, the expensive per-part work (vacancy check upload+readback, FFT batch, grid update, vacancy recompute) still runs once per part regardless of nesting. The only saving is the trivial outer-loop bookkeeping (scanning `scratch_active_`, checking `is_done`) — microseconds, not milliseconds.
+>
+> **Speculative placement (evaluate N+1 before committing N):** This would actually halve the expensive pipeline calls, but it's a major algorithmic change — placement quality would differ because part N+1 would be evaluated against a stale grid. Ruled out.
+>
+> **Conclusion:** The original framing was misleading. "Reduce wave count" only helps if you reduce the number of times the expensive pipeline runs, which requires speculative placement. Simply restructuring the loop around sequential placements per wave gives the same total work.
 
 ### Summary
 
 | Opportunity | Expected saving (P75) | Effort | Scalability | Status |
 |---|---|---|---|---|
 | ~~Merge p1/p2 vacancy checks~~ | ~~100-200ms (5-10%)~~ | ~~Medium~~ | ~~Linear with waves~~ | **Not viable** — p2 depends on p1 results |
-| **GPU update_vacancy_rows** | **~346ms (17%)** | **High** | **Linear with bins×parts** | **New — best opportunity** |
-| Reduce wave count | ~500ms (25%) | Very high | Halves all overhead | New — highest impact but hardest |
+| ~~GPU update_vacancy_rows~~ | ~~~346ms (17%)~~ | ~~High~~ | ~~Linear with bins×parts~~ | **DONE — see Round 3 below** |
+| ~~Reduce wave count~~ | ~~500ms (25%)~~ | ~~Very high~~ | ~~Halves all overhead~~ | **Not viable** — loop restructuring saves nothing, speculative placement is algorithmic change |
 | Multi-stream Phase 2 | ~84ms (4%) | Medium-high, fragile | Constant fraction | Tried and reverted |
+
+---
+
+## Optimization Round 3 — GPU Vacancy Recompute
+
+**Date:** 2026-04-13  
+**Starting baseline (after Round 2):** P50M2-0 ~1.04s/gen, P75M2-0 ~2.20s/gen
+
+### What was done
+
+Moved `update_vacancy_rows` (max-consecutive-zeros per grid row) from CPU to GPU. Previously the vacancy data lived on CPU, was computed by AVX2 SIMD code in `add_part_to_bin_impl`, tracked with dirty flags, and bulk-uploaded to GPU before each Phase 3 vacancy check via `flush_dirty_vacancies`.
+
+The new approach:
+1. **New CUDA kernel `_compute_vacancy_rows_kernel`**: One thread per affected row. Each thread scans `grid_states[grid_idx][row][0..W-1]` and computes max consecutive zeros, writing directly to `ws_vacancy_gpu_[grid_idx][row]`.
+2. **`recompute_vacancy_gpu` method**: Called after `apply_gpu_updates` in both Phase 5 (existing bin placements) and Phase 6 (new bin placements). Packs affected `(grid_idx, row_idx)` pairs into a pinned buffer, uploads once, launches the kernel.
+3. **Phase 6 new-bin init**: Before placing the first part, `ws_vacancy_gpu_.index_fill_(0, idx_t, W)` sets all rows to full width (empty grid).
+4. **Removed**: `update_vacancy_rows_cpp` call from `add_part_to_bin_impl`, `flush_dirty_vacancies` call from `process_wave`, `vacancy_gpu_dirty` flag usage.
+
+The CPU `vacancy` vector in `BinStateNative` is no longer maintained. Vacancy data lives exclusively on GPU.
+
+### Results
+
+Profiled with `profile_cpu_hotspots.py` (5 reps, seed 123):
+
+| Instance | Round 2 baseline | After GPU vacancy | Delta |
+|---|---|---|---|
+| **P50M2-0** | 1.04s/gen | **0.974s/gen** | **−66ms (−6.3%)** |
+| **P75M2-0** | 2.20s/gen | **1.742s/gen** | **−458ms (−20.8%)** |
+
+P75 improvement is dramatically larger than predicted (−458ms actual vs −346ms predicted). The full profiler run also shows better numbers than the initial `BRKGA_alg3.py` test (~2.05s), likely because the profiler uses a stable single-seed population.
+
+### New CPU Hotspot Breakdown
+
+#### P50M2-0 — 0.974s/gen
+
+| Hot spot | ms/gen | % wall |
+|---|---|---|
+| `add_part_to_bin_cpu` (no UVR) | 56.6 | 5.8% |
+| Phase 3 Pass B wait (vacancy check GPU) | 130.5 | 13.4% |
+| Vacancy readback sync | 130.8 | 13.4% |
+| Phase 6 new-bin loop (total) | 32.5 | 3.3% |
+| — BinState ctor | 27.0 | 2.8% |
+| Vacancy upload sync | 1.0 | 0.1% |
+| Phase 3 Pass A + C | 8.2 | 0.8% |
+| `update_vacancy_rows` | **0** | **0%** |
+
+Event counts (per gen): 2,942 new bins, 21,614 aptb calls, 136 vacancy-check invocations.
+
+#### P75M2-0 — 1.742s/gen
+
+| Hot spot | ms/gen | % wall |
+|---|---|---|
+| `add_part_to_bin_cpu` (no UVR) | 70.1 | 4.0% |
+| Phase 3 Pass B wait (vacancy check GPU) | 257.0 | 14.8% |
+| Vacancy readback sync | 258.1 | 14.8% |
+| Phase 6 new-bin loop (total) | 39.9 | 2.3% |
+| — BinState ctor | 32.7 | 1.9% |
+| Vacancy upload sync | 1.2 | 0.1% |
+| Phase 3 Pass A + C | 10.4 | 0.6% |
+| `update_vacancy_rows` | **0** | **0%** |
+
+Event counts (per gen): 4,178 new bins, 38,558 aptb calls, 187 vacancy-check invocations.
+
+### Analysis — What changed
+
+**Eliminated entirely:**
+- CPU `update_vacancy_rows` (was 90ms P50 / 146ms P75) — now 0ms
+- CPU→GPU vacancy upload path (`flush_dirty_vacancies` + dirty flags) — vacancy upload sync dropped from ~102ms to 1ms (P50), ~201ms to 1ms (P75)
+
+**Shifted profile:**
+- `add_part_to_bin_cpu` dropped from 140ms to 57ms (P50) and 239ms to 70ms (P75) — the UVR component is gone
+- Phase 3 Pass B wait and vacancy readback sync are now the dominant costs, both at ~13-15% each. These represent the GPU vacancy check kernel execution + sync, which was always there but previously masked by the larger CPU+upload overhead
+
+**New bottleneck structure (P75):**
+- ~30% of wall time is spent in Phase 3 vacancy check round-trips (Pass B wait + readback sync)
+- ~4% is CPU grid writes (`add_part_to_bin_cpu` without UVR)
+- ~2.3% is Phase 6 new-bin construction
+- The remaining ~64% is GPU-side work (Phase 2 FFT, Phase 4 IFFT, Phase 5 selector) + structural sync overhead
+
+### Cumulative optimization summary
+
+| Change | P50M2-0 | P75M2-0 |
+|---|---|---|
+| Original baseline | 1.155s | 2.226s |
+| + Round 2 (cuFFT cache, packed copies, non-blocking) | 1.04s (−10%) | 2.20s (−1.2%) |
+| + Round 3 (GPU vacancy recompute) | **0.974s (−15.7%)** | **1.742s (−21.7%)** |
+
+### What to investigate next
+
+With vacancy eliminated as a CPU bottleneck, the profile has shifted. The dominant costs are now:
+
+1. **Reduce copy_ call count** (instance-independent): Every `copy_` call incurs CUDA driver overhead (~263µs avg from nsys). Savings compound with wave count — larger instances have more waves, so each copy_ eliminated multiplies its benefit. This is the most promising next step: audit the remaining per-wave copy_ calls and consolidate or eliminate wherever possible.
+
+2. **Phase 3 vacancy readback overlap** (~258ms on P75, 14.8%): The vacancy check readback is a blocking sync — CPU waits for GPU to finish the vacancy kernel before Pass C. If the readback could be deferred or overlapped with other CPU work, significant savings are possible. However, any solution must be adaptive (benefit depends on kernel duration, which varies by instance/wave). Worth investigating but must not be instance-specific.
+
+3. **Phase 4 IFFT** (~18% GPU time from nsys): Still the single largest identified GPU kernel cost. Batch sizes are still variable and small (avg ~11 for P75). CHUNK_SIZE tuning is possible but instance/GPU-dependent — deferred for now.
+
+**Ruled out:** Reduce wave count (loop restructuring saves nothing; speculative placement is an algorithmic change). Merge p1/p2 vacancy checks (p2 depends on p1 results). Multi-stream pipelining (fragile for ~4% gain).
