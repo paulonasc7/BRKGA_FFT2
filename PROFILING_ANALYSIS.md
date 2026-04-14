@@ -617,14 +617,96 @@ Event counts (per gen): 4,178 new bins, 38,558 aptb calls, 187 vacancy-check inv
 | + Round 2 (cuFFT cache, packed copies, non-blocking) | 1.04s (−10%) | 2.20s (−1.2%) |
 | + Round 3 (GPU vacancy recompute) | **0.974s (−15.7%)** | **1.742s (−21.7%)** |
 
-### What to investigate next
+### What was investigated next — and why we stopped
 
-With vacancy eliminated as a CPU bottleneck, the profile has shifted. The dominant costs are now:
+Three additional optimizations were attempted after Round 3. None produced measurable improvement.
 
-1. **Reduce copy_ call count** (instance-independent): Every `copy_` call incurs CUDA driver overhead (~263µs avg from nsys). Savings compound with wave count — larger instances have more waves, so each copy_ eliminated multiplies its benefit. This is the most promising next step: audit the remaining per-wave copy_ calls and consolidate or eliminate wherever possible.
+---
 
-2. **Phase 3 vacancy readback overlap** (~258ms on P75, 14.8%): The vacancy check readback is a blocking sync — CPU waits for GPU to finish the vacancy kernel before Pass C. If the readback could be deferred or overlapped with other CPU work, significant savings are possible. However, any solution must be adaptive (benefit depends on kernel duration, which varies by instance/wave). Worth investigating but must not be instance-specific.
+## Optimization Round 4 — Copy_ Consolidation — NEUTRAL
 
-3. **Phase 4 IFFT** (~18% GPU time from nsys): Still the single largest identified GPU kernel cost. Batch sizes are still variable and small (avg ~11 for P75). CHUNK_SIZE tuning is possible but instance/GPU-dependent — deferred for now.
+**Date:** 2026-04-14
 
-**Ruled out:** Reduce wave count (loop restructuring saves nothing; speculative placement is an algorithmic change). Merge p1/p2 vacancy checks (p2 depends on p1 results). Multi-stream pipelining (fragile for ~4% gain).
+### What was done
+
+Full audit of every `copy_` call per wave identified 17 calls/wave (9 non-blocking CPU→GPU, 8 blocking GPU→CPU). Two consolidation changes were implemented:
+
+**Candidate A — Merge 3 selector readbacks into 1:** The CUDA selector kernel writes has/row/col to 3 separate GPU tensors, each read back with `.to(kCPU)` (3 blocking syncs per chunk). Changed to allocate all 3 as views into a single contiguous GPU buffer, then read back with one blocking `copy_`.
+
+**Candidate B — Merge apply_gpu_updates + recompute_vacancy_gpu uploads:** These two methods each did a separate packed CPU→GPU `copy_`. Combined into a single method `apply_gpu_updates_and_vacancy` with one packed buffer containing both grid-update params and vacancy-recompute params.
+
+### Results
+
+| Instance | Round 3 baseline | After consolidation | Delta |
+|---|---|---|---|
+| P50M2-0 | 0.974s | 0.96s (best reps) / 1.00s (mean) | Within noise |
+| P75M2-0 | 1.742s | 1.74s (best reps) / 1.80s (mean) | Within noise |
+
+### Why it didn't help
+
+The 263µs average copy_ overhead from nsys was **bimodal**: most calls complete in ~6µs (median), with a long tail of implicit blocking when the CUDA command queue is full. Saving 2-3 calls per wave at 6µs each ≈ ~1ms/gen total. The blocking readback syncs (Candidate A) were similarly cheap because by the time the first `.to(kCPU)` fires, the GPU selector kernel has already finished — the "sync" is just a fast memcpy check.
+
+### Status: REVERTED
+
+Changes were clean but negligible. Reverted to keep codebase simpler.
+
+---
+
+## Optimization Attempt — Eager rfft2 After Phase 5 — NEUTRAL
+
+**Date:** 2026-04-14
+
+### What was done
+
+After Phase 5's `apply_gpu_updates` + `recompute_vacancy_gpu`, immediately fire `rfft2` for all bins invalidated by Phase 5 placements (async on default stream). The intent was to overlap this GPU rfft2 work with Phase 6's CPU work (BinState ctor, memset, add_part_to_bin_cpu — ~40ms/gen on P75).
+
+Implementation: collect grid indices of placed bins, deduplicate, fire `rfft2` + `index_copy_` into `grid_ffts`, mark bins as `grid_fft_valid = true`. The next wave's Phase 2 then only needs to handle Phase-6-new bins (smaller batch).
+
+### Results
+
+| Instance | Round 3 baseline | With eager rfft2 | Delta |
+|---|---|---|---|
+| P50M2-0 | 0.974s | ~0.96s (best) / 1.02s (mean) | Within noise |
+| P75M2-0 | 1.742s | ~1.78s (best) / 1.83s (mean) | Slightly worse |
+
+### Why it didn't help
+
+Same root cause as the earlier "Eager rfft2 at end of wave" attempt (see above): on a single CUDA stream, all GPU work is serial. The rfft2 is queued after `apply_gpu_updates` and `recompute_vacancy_gpu` — it must wait for those to finish. Meanwhile, Phase 6 CPU work was **already overlapping** with the async GPU kernels from Phase 5. Adding rfft2 just extends the GPU queue without changing when the CPU is free to work. On P75, the extra GPU work slightly delays the next wave's vacancy check.
+
+This is the **third** time eager/early rfft2 has been tried and failed (two from this round, one from Round 2). The fundamental limitation is single-stream serialization: you cannot overlap independent GPU operations without multiple CUDA streams, and multi-stream was already tried and rejected as too fragile.
+
+### Status: REVERTED
+
+---
+
+## Performance Floor Assessment
+
+**Date:** 2026-04-14
+
+After Round 3 (GPU vacancy recompute) and two additional failed optimization attempts, we have high confidence that the current performance represents the **practical floor for single-stream optimization** on this architecture.
+
+### Final performance
+
+| Instance | Original baseline | Current (Round 3) | Total improvement |
+|---|---|---|---|
+| P50M2-0 | 1.155s/gen | **0.974s/gen** | **−15.7%** |
+| P75M2-0 | 2.226s/gen | **1.742s/gen** | **−21.7%** |
+
+### Why further single-stream optimization is unlikely to help
+
+1. **GPU idle time is structural, not fixable:** The wave pipeline has unavoidable serial dependencies (vacancy readback → Pass C → Phase 4 → selector readback → Phase 5). At each sync point, CPU waits for GPU results before issuing next GPU work. This creates idle gaps that cannot be filled without multi-stream pipelining.
+
+2. **CPU hotspots are eliminated:** `update_vacancy_rows` (was ~8% of wall time) is now 0ms. The remaining CPU work (`add_part_to_bin_cpu` at ~4%, Phase 6 at ~2.3%) already overlaps with async GPU kernels.
+
+3. **Copy_ consolidation has diminishing returns:** The remaining per-wave copies are either (a) blocking readbacks that are inherently sequential, or (b) non-blocking uploads completing in ~6µs median. Consolidating these saves single-digit milliseconds per generation.
+
+4. **Eager rfft2 fails on single stream:** Tried 3 times with different approaches. All fail because GPU work serializes on the default stream — you can't overlap independent GPU operations.
+
+### What would be needed for further improvement
+
+- **Multi-stream pipelining** (~4% gain, tried and reverted due to PyTorch allocator fragility with `recordStream()`)
+- **Larger instances** (P200M4+) where GPU utilization is naturally higher and per-wave overhead is a smaller fraction
+- **CHUNK_SIZE tuning** (instance/GPU-dependent, deferred)
+- **Persist grid_states/grid_ffts across evaluate_batch calls** (~10-15ms/gen, trivial but small)
+
+The last item (tensor persistence) is the only untried change likely to help across all instances, but its ~10-15ms saving is marginal compared to the ~180-480ms already gained.
