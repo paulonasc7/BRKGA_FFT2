@@ -1503,11 +1503,13 @@ private:
             contexts[static_cast<size_t>(s)] = std::move(ctx);
         }
 
-        auto grid_states = torch::zeros(
+        // torch::empty instead of torch::zeros — Phase 6 zeroes each bin slot
+        // via index_fill_ before use, making the upfront bulk memset redundant.
+        auto grid_states = torch::empty(
             {max_total_bins, H, W},
             torch::TensorOptions().dtype(torch::kFloat32).device(device_)
         );
-        auto grid_ffts = torch::zeros(
+        auto grid_ffts = torch::empty(
             {max_total_bins, H, (W / 2) + 1},
             torch::TensorOptions().dtype(torch::kComplexFloat).device(device_)
         );

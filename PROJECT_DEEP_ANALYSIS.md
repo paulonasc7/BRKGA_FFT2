@@ -2,8 +2,10 @@
 
 Complete technical reference for the BRKGA-based 2D nesting optimizer. Written to give a future reader (or AI assistant) full context without needing to re-analyze the codebase.
 
-**Last updated:** 2026-03-26
-**Benchmark command:** `python BRKGA_alg3.py 50 2 0 torch_gpu wave_batch 1 1 3`
+**Last updated:** 2026-04-16
+**Benchmark command:** `python BRKGA_alg3.py 50 2 0 torch_gpu native_full 1 1 3`
+
+> **Important:** Sections 1 (Problem Domain) and 2 (Algorithm: BRKGA) are current. Section 3 (File-by-File Analysis) describes the **wave_batch Python decoder** which has been superseded by a **full native C++/CUDA decoder** in `full_native_decoder.py`. For current architecture details, see [CLAUDE.md](CLAUDE.md). For optimization history, see [OPTIMIZATION_CATALOG.md](OPTIMIZATION_CATALOG.md).
 
 ---
 

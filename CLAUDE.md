@@ -1,113 +1,98 @@
 # Claude Context — BRKGA_FFT2
 
-This file is automatically read by Claude Code at the start of every conversation. It gives you the full picture of what this project is, how to work on it, and how to run experiments autonomously on the remote GPU.
+## What this project is
+
+A BRKGA (Biased Random-Key Genetic Algorithm) optimizer for a **2D Nesting + Scheduling** problem in additive manufacturing. Parts are assigned to machines and packed into bins (building plates) to minimize worst-case makespan. FFT-based collision detection runs on GPU for placement evaluation.
+
+**Technical reference:** [PROJECT_DEEP_ANALYSIS.md](PROJECT_DEEP_ANALYSIS.md) covers the problem domain, chromosome encoding, BRKGA loop, and decoder pipeline. Note: it was written during the wave_batch era — the decoder architecture section is outdated, but the problem/algorithm sections (§1–§2) remain accurate.
 
 ---
 
-## What this project is
+## Current architecture (as of April 2026)
 
-A BRKGA (Biased Random-Key Genetic Algorithm) optimizer for a **2D Nesting + Scheduling** problem in additive manufacturing. The goal is to assign 3D-printed parts to machines and pack them into batches (bins) to minimize the worst-case makespan across all machines. FFT-based collision detection is used for GPU-accelerated placement evaluation.
+The decoder is a **single C++/CUDA extension** compiled at runtime via `torch.utils.cpp_extension.load_inline`. All decoder phases (1–6) run in compiled C++ with custom CUDA kernels. Python only handles the BRKGA outer loop (crossover, mutation, selection).
 
-**Full technical reference → [PROJECT_DEEP_ANALYSIS.md](PROJECT_DEEP_ANALYSIS.md)**
+| Component | File | Role |
+|-----------|------|------|
+| BRKGA outer loop | `BRKGA_alg3.py` | Population init, evolution, fitness tracking |
+| **Full native decoder** | **`full_native_decoder.py`** | **C++/CUDA extension — entire decoder (Phases 1–6)** |
+| Data structures | `data_structures.py` | Dataclasses for parts, machines, problem data |
+| Collision backend | `collision_backend.py` | GPU FFT backend — used for part FFT pre-computation at init |
+| Instance data | `data/Instances/`, `data/partsMatrices/` | Problem files (`.txt`) and part shape matrices (`.npy`) |
 
-This document covers: problem domain, chromosome encoding, decoder pipeline, collision detection math, evaluation modes, data structures, performance bottlenecks, and optimization history. Read it before proposing any non-trivial changes.
+**Legacy files (not used in native_full mode but still importable):** `wave_batch_evaluator.py`, `placement.py`, `binClassNew.py`, `cuda_batch_update.py`, `numba_utils.py`, `profile_phases.py`. These were the Python-era decoder. The `wave_batch` eval_mode still works but is 2–4× slower than `native_full`.
+
+### Decoder phases (inside full_native_decoder.py)
+
+| Phase | What it does | Bottleneck? |
+|-------|-------------|-------------|
+| 1 | Gather context info (which parts, which bins) | No (~0.4%) |
+| 2 | Batch rfft2 of all active grids | No (~5%) |
+| 3 | GPU vacancy check + collect FFT test pairs (p1/p2 two-pass) | No (~8%) |
+| **4** | **Batch irfft2 — collision detection** | **Yes (~52%)** |
+| 5 | CUDA selector kernel finds best positions + CPU grid updates | Moderate (~20%) |
+| 6 | Open new bins for parts that didn't fit (bin pool reuse) | No (~7%) |
+
+### Key implementation details
+
+- **First-valid-bin (p1/p2):** For each part, only the first bin passing vacancy is tested in p1. Only parts failing FFT collision go to p2 (remaining bins). >99% resolve in p1.
+- **Custom CUDA kernels:** fused gather-multiply, batch grid update, selector (best position), vacancy check, vacancy recompute.
+- **AVX2 SIMD:** vacancy row updates, grid writes, vacancy fitting — all with runtime CPU feature detection.
+- **cuFFT plan cache:** Set to 4096 entries. Plans cached after first generation.
+- **irfft2 "forward" norm:** Avoids normalization multiply; part FFTs pre-divided at init.
+- **Bin pool:** Keyed by (H,W), recycles BinStateNative structs to avoid re-allocation.
+- **First-run compilation:** Takes 2–3 min. Cached in `~/.cache/torch_extensions/`. If you change CUDA kernel source in `full_native_decoder.py`, delete cache: `rm -rf /root/.cache/torch_extensions/py*/`
+
+---
+
+## Performance
+
+| Instance | Gen time | Baseline (Python serial) | Speedup |
+|----------|----------|-------------------------|---------|
+| P50M2-0 | **0.974s** | ~40s | **41×** |
+| P75M2-0 | **1.742s** | — | — |
+
+GPU utilization is ~43% (nsys-confirmed). The remaining 57% is structural CPU-GPU sync overhead (vacancy readbacks, selector readbacks, inter-phase CPU work). Single CUDA stream — no overlap possible without PyTorch allocator issues.
+
+**Optimization history:** [OPTIMIZATION_CATALOG.md](OPTIMIZATION_CATALOG.md) has every optimization idea ever considered, categorized as tested-positive, tested-negative, untested-worth-testing, untested-not-worth-testing.
 
 ---
 
 ## How to run experiments (remote GPU)
 
-All experiments run on a **Paperspace Gradient notebook** (NVIDIA RTX A4000, 16 GB VRAM). You have full autonomous access to it via `remote.py` — a local CLI tool that can upload files, execute commands on the remote GPU, and download results.
-
-**Full remote execution reference → [REMOTE_EXECUTION.md](REMOTE_EXECUTION.md)**
-
-This document covers: all `remote.py` commands, the full autonomous loop, run command format, output files, and gotchas (numba install, token expiry, timeouts).
-
-### Quick reference
+All experiments run on **Paperspace Gradient** (NVIDIA RTX A4000, 16 GB VRAM). Use `remote.py` (gitignored, contains token) for autonomous access.
 
 ```bash
-# Push local changes to Paperspace
+# Push code to Paperspace
 python remote.py sync . BRKGA_FFT2 --ext .py
 
-# Run an experiment (streams output in real time)
-python remote.py run "python BRKGA_alg3.py 50 2 0 torch_gpu wave_batch 1 1 3" \
+# Run with native decoder (default when ABRKGA_FULL_NATIVE_DECODER=1 or eval_mode=native_full)
+python remote.py run "ABRKGA_FULL_NATIVE_DECODER=1 python BRKGA_alg3.py 50 2 0 torch_gpu wave_batch 1 1 3" \
     --cwd /notebooks/BRKGA_FFT2 --timeout 900
 
-# Download result file
+# Or use native_full eval_mode directly
+python remote.py run "python BRKGA_alg3.py 50 2 0 torch_gpu native_full 1 1 3" \
+    --cwd /notebooks/BRKGA_FFT2 --timeout 900
+
+# Download results
 python remote.py download BRKGA_FFT2/OriginalInitialSol_P50M2-0_prob_10.xlsx results/
 
-# Check GPU / environment
+# Check GPU
 python remote.py run "nvidia-smi" --cwd /notebooks/BRKGA_FFT2
 ```
 
-`remote.py` is **gitignored** (contains the Paperspace token). It lives only on the local machine. If it is missing, recreate it from the template in [REMOTE_EXECUTION.md](REMOTE_EXECUTION.md) and fill in the URL and token from Paperspace.
+**CLI args:** `python BRKGA_alg3.py <nbParts> <nbMachines> <instNumber> [backend] [eval_mode] [workers] [chunksize] [generations]`
 
----
-
-## Key files
-
-| File | Role |
-|------|------|
-| `BRKGA_alg3.py` | Main algorithm — population init, evolution loop, fitness tracking |
-| `placement.py` | Chromosome decoder — assigns parts to machines, packs bins |
-| `binClassNew.py` | `BuildingPlate` class — bin packing with FFT collision detection |
-| `collision_backend.py` | GPU FFT backend (torch) for collision checking |
-| `wave_batch_evaluator.py` | Batches FFT ops across multiple solutions simultaneously (latest approach) |
-| `cuda_batch_update.py` | Custom CUDA kernel for batched GPU grid updates in Phase 5 (JIT-compiled via `load_inline`) |
-| `data_structures.py` | Dataclasses for parts, machines, problem data |
-| `numba_utils.py` | JIT-compiled vacancy checking (called ~100K×/run) |
-| `profile_phases.py` | Per-phase wall-clock profiling of wave_batch_evaluator |
-| `data/Instances/` | Problem instance files (`P50M2-0.txt`, etc.) |
-| `data/partsMatrices/` | Binary part shape matrices (`.npy`) |
-| `remote.py` | Autonomous remote runner — **gitignored** |
+Full remote reference: [REMOTE_EXECUTION.md](REMOTE_EXECUTION.md). If `remote.py` is missing, recreate from template there.
 
 ---
 
 ## Workflow
 
-1. Read `PROJECT_DEEP_ANALYSIS.md` to understand the current state and any open questions.
-2. Make code changes locally.
-3. Push with `python remote.py sync . BRKGA_FFT2 --ext .py`.
-4. Run on the GPU and read the streamed output.
-5. Download result files if needed.
-6. Reason about results, iterate.
+1. Make code changes locally.
+2. `python remote.py sync . BRKGA_FFT2 --ext .py`
+3. Run on GPU, read streamed output.
+4. Download result files if needed.
+5. Reason about results, iterate.
 
-The user's intent is for you to drive this loop autonomously — proposing changes, running experiments, reading results, and iterating — with minimal manual intervention on their part.
-
----
-
-## Performance optimization summary
-
-**Also see → [PHASE5_OPTIMIZATION.md](PHASE5_OPTIMIZATION.md)** for detailed analysis of Phase 5 optimization ideas (status of each).
-
-### Current performance (P50M2-0, 500 individuals, wave_batch, torch_gpu)
-
-| Metric | Value |
-|--------|-------|
-| Mean gen time | **~3.80s** |
-| Original baseline (pre-optimization) | ~40s/gen |
-| Total speedup | **~10.5x** |
-
-### Key optimizations applied (most recent session)
-
-| Change | Impact | File(s) |
-|--------|--------|---------|
-| `rfft2`/`irfft2` instead of `fft2`/`ifft2` | 5.74s → 4.53s | `wave_batch_evaluator.py`, `collision_backend.py` |
-| NumPy-side composite scoring (moved density calc out of Python loop) | 4.53s → 4.23s | `wave_batch_evaluator.py` |
-| Custom CUDA kernel for batched GPU grid updates | 4.23s → 3.80s | `cuda_batch_update.py`, `wave_batch_evaluator.py` |
-
-### Phase breakdown (5 gens, 360 waves, profiled with `profile_phases.py`)
-
-| Phase | Time(s) | % | Description |
-|-------|---------|---|-------------|
-| Phase 1 | 0.074 | 0.4% | Gather context info |
-| Phase 2 | 0.900 | 4.8% | Batch grid FFTs |
-| Phase 3 | 1.418 | 7.6% | Vacancy check + collect tests |
-| **Phase 4** | **12.398** | **66.1%** | **Batch IFFT (dominant)** |
-| Phase 5 | 2.629 | 14.0% | Find best placements + grid updates |
-| Phase 6 | 1.347 | 7.2% | Open new bins |
-
-### Important notes for the CUDA kernel
-
-- **First-run compilation**: `cuda_batch_update.py` uses `torch.utils.cpp_extension.load_inline` to JIT-compile a CUDA kernel. First run takes 2-3 minutes. The compiled `.so` is cached in `~/.cache/torch_extensions/` for subsequent runs.
-- **Cache invalidation**: If you change the CUDA kernel source, delete the cache: `rm -rf /root/.cache/torch_extensions/py311_cu121/_cuda_batch_update_ext/`
-- **Fallback**: If CUDA compilation fails, the evaluator falls back to sequential GPU slice updates (Option C) automatically.
+Drive this loop autonomously — propose changes, run experiments, read results, iterate — with minimal user intervention.
