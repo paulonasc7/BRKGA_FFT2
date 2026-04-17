@@ -267,7 +267,15 @@ class BRKGA():
         self.used_bins = math.floor(best_fitness)
         self.best_fitness = best_fitness
         self.solution = best_solution
-        
+
+        # Print CPU hotspot profile if available
+        if self.eval_mode == "native_full" and self._native_decoder is not None:
+            try:
+                from full_native_decoder import FullNativeDecoderEvaluator
+                print(FullNativeDecoderEvaluator.get_profile_summary())
+            except Exception:
+                pass
+
         # Clean up executor after fit completes
         self.shutdown()
         return 'feasible'

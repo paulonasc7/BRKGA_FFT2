@@ -46,13 +46,8 @@ using torch::indexing::Slice;
 struct WaveProfile {
     // Phase 6 new-bin creation
     int64_t phase6_loop_ns = 0;         // whole Phase 6 new-bin loop (per wave)
-    int64_t binstate_ctor_ns = 0;       // sum of BinStateNative field init + grid.assign + vacancy.assign
+    int64_t binstate_ctor_ns = 0;       // sum of BinStateNative field init + grid.assign
     int64_t binstate_count = 0;
-
-    // update_vacancy_rows_cpp
-    int64_t uvr_ns = 0;
-    int64_t uvr_call_count = 0;
-    int64_t uvr_total_rows = 0;
 
     // add_part_to_bin_cpu (whole function, includes uvr)
     int64_t aptb_ns = 0;
@@ -68,34 +63,55 @@ struct WaveProfile {
     int64_t vac_readback_sync_ns = 0;   // non_blocking=false readback
     int64_t vac_call_count = 0;
 
+    // Comprehensive phase breakdown
+    int64_t total_wave_ns = 0;
+    int64_t wave_count = 0;
+    int64_t phase2_rfft2_ns = 0;         // rfft2 of invalid grids
+    int64_t phase4_p1_fft_ns = 0;        // batch_fft_all_tests for p1
+    int64_t phase4_p2_fft_ns = 0;        // batch_fft_all_tests for p2
+    int64_t phase5_select_ns = 0;        // best selection + placement CPU loop
+    int64_t phase5_gpu_update_ns = 0;    // apply_gpu_updates + recompute_vacancy
+    int64_t phase3_p2_collect_ns = 0;    // p2 pair collection + vacancy check
+    int64_t decode_seq_ns = 0;           // decode_sequences_for_machine total
+    int64_t phase1_active_ns = 0;        // Phase 1: gather active contexts + invalid FFTs
+
     void reset() { *this = WaveProfile{}; }
 
     std::string summary() const {
         auto ms = [](int64_t ns) { return static_cast<double>(ns) / 1e6; };
         std::ostringstream os;
         os << "\n═══ CPU Hotspot Profile ═══\n";
-        os << "  Phase 6 new-bin loop  : " << ms(phase6_loop_ns) << " ms  ("
+        os << "  Total wave time      : " << ms(total_wave_ns) << " ms  (" << wave_count << " waves)\n";
+        os << "  Phase 1 (active+FFT) : " << ms(phase1_active_ns) << " ms\n";
+        os << "  Phase 2 (rfft2)      : " << ms(phase2_rfft2_ns) << " ms\n";
+        os << "  Phase 3 Pass A       : " << ms(p3_pass_a_ns) << " ms\n";
+        os << "  Phase 3 Pass B wait  : " << ms(p3_pass_b_wait_ns) << " ms\n";
+        os << "  Phase 3 Pass C       : " << ms(p3_pass_c_ns) << " ms\n";
+        os << "  Phase 3 p2 collect   : " << ms(phase3_p2_collect_ns) << " ms\n";
+        os << "  Phase 4 p1 (irfft2)  : " << ms(phase4_p1_fft_ns) << " ms\n";
+        os << "  Phase 4 p2 (irfft2)  : " << ms(phase4_p2_fft_ns) << " ms\n";
+        os << "  Phase 5 (select+place): " << ms(phase5_select_ns) << " ms\n";
+        os << "  Phase 5 GPU updates  : " << ms(phase5_gpu_update_ns) << " ms\n";
+        os << "  Phase 6 new-bin loop : " << ms(phase6_loop_ns) << " ms  ("
            << binstate_count << " bins)\n";
         os << "    └ BinState ctor    : " << ms(binstate_ctor_ns) << " ms  ("
            << binstate_count << " calls, "
            << (binstate_count ? ms(binstate_ctor_ns) / static_cast<double>(binstate_count) * 1e3 : 0.0)
            << " µs/call)\n";
-        os << "  update_vacancy_rows  : " << ms(uvr_ns) << " ms  ("
-           << uvr_call_count << " calls, " << uvr_total_rows << " rows, "
-           << (uvr_call_count ? ms(uvr_ns) / static_cast<double>(uvr_call_count) * 1e3 : 0.0)
-           << " µs/call, "
-           << (uvr_total_rows ? ms(uvr_ns) / static_cast<double>(uvr_total_rows) * 1e3 : 0.0)
-           << " µs/row)\n";
         os << "  add_part_to_bin_cpu  : " << ms(aptb_ns) << " ms  ("
            << aptb_count << " calls, "
            << (aptb_count ? ms(aptb_ns) / static_cast<double>(aptb_count) * 1e3 : 0.0)
            << " µs/call)\n";
-        os << "  Phase 3 Pass A       : " << ms(p3_pass_a_ns) << " ms\n";
-        os << "  Phase 3 Pass B wait  : " << ms(p3_pass_b_wait_ns) << " ms\n";
-        os << "  Phase 3 Pass C       : " << ms(p3_pass_c_ns) << " ms\n";
+        os << "  decode_sequences     : " << ms(decode_seq_ns) << " ms\n";
         os << "  Vacancy upload sync  : " << ms(vac_upload_sync_ns) << " ms\n";
         os << "  Vacancy readback sync: " << ms(vac_readback_sync_ns) << " ms\n";
         os << "  (" << vac_call_count << " vacancy-check invocations)\n";
+        double accounted = ms(phase1_active_ns) + ms(phase2_rfft2_ns) + ms(p3_pass_a_ns)
+            + ms(p3_pass_b_wait_ns) + ms(p3_pass_c_ns) + ms(phase3_p2_collect_ns)
+            + ms(phase4_p1_fft_ns) + ms(phase4_p2_fft_ns) + ms(phase5_select_ns)
+            + ms(phase5_gpu_update_ns) + ms(phase6_loop_ns);
+        os << "  Accounted in waves   : " << accounted << " ms / " << ms(total_wave_ns) << " ms ("
+           << (ms(total_wave_ns) > 0 ? 100.0 * accounted / ms(total_wave_ns) : 0.0) << "%)\n";
         return os.str();
     }
 };
@@ -112,8 +128,9 @@ static WaveProfile g_profile;
 
 struct BinStateNative {
     int bin_idx = 0;
-    std::vector<uint8_t> grid;
-    std::vector<int32_t> vacancy;
+    // NOTE: No CPU grid mirror.  grid_states (GPU) is the authoritative grid.
+    // Vacancy is computed on GPU via recompute_vacancy_gpu.
+    // Grid FFTs are computed on GPU via rfft2(grid_states).
     int grid_state_idx = 0;
     double area = 0.0;
     int enclosure_box_length = 0;
@@ -122,7 +139,6 @@ struct BinStateNative {
     double proc_time = 0.0;
     double proc_time_height = 0.0;
     bool grid_fft_valid = false;
-    bool vacancy_gpu_dirty = true;  // true when vacancy vector not yet uploaded to GPU
     int bin_length = 0;
     int bin_width = 0;
 };
@@ -400,17 +416,9 @@ public:
         density_flat_ = vec_from_1d<int32_t>(
             packed["density_flat"].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>()
         );
-        rot_matrix_offsets_ = vec_from_1d<int32_t>(
-            packed["rot_matrix_offsets"].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>()
-        );
-        rot_matrix_flat_u8_ = vec_from_1d<uint8_t>(
-            packed["rot_matrix_flat_u8"].cast<py::array_t<uint8_t, py::array::c_style | py::array::forcecast>>()
-        );
-
         n_rot_total_ = static_cast<int>(rot_h_.size());
         if (static_cast<int>(rot_w_.size()) != n_rot_total_ ||
-            static_cast<int>(rot_density_offsets_.size()) != n_rot_total_ + 1 ||
-            static_cast<int>(rot_matrix_offsets_.size()) != n_rot_total_ + 1) {
+            static_cast<int>(rot_density_offsets_.size()) != n_rot_total_ + 1) {
             throw std::runtime_error("rotation metadata size mismatch");
         }
 
@@ -523,8 +531,6 @@ private:
     std::vector<int32_t> rot_w_;
     std::vector<int32_t> rot_density_offsets_;
     std::vector<int32_t> density_flat_;
-    std::vector<int32_t> rot_matrix_offsets_;
-    std::vector<uint8_t> rot_matrix_flat_u8_;
 
     std::vector<double> machine_proc_time_;
     std::vector<double> machine_proc_time_height_;
@@ -580,28 +586,11 @@ private:
     std::vector<int32_t> scratch_place_cols_;
     std::vector<int32_t> scratch_newbin_ctx_local_;
 
-    // Vacancy dirty-flush scratch (legacy — kept for reference, no longer used).
-    std::vector<int32_t> scratch_dirty_grid_rows_;
-    std::vector<BinStateNative*> scratch_dirty_bins_ptr_;
 
     std::vector<GpuPlacement> scratch_gpu_updates_;
     std::vector<GpuPlacement> scratch_phase6_gpu_updates_;
     std::vector<int64_t> scratch_phase6_grid_indices_;
 
-    // Pool of recycled BinStateNative objects keyed by (H,W).  Reusing warm
-    // memory avoids OS page-fault cost on grid.assign() for new bins.
-    // Total memory capped at BIN_POOL_MAX_BYTES to stay safe on large instances.
-    struct BinPoolKey {
-        int H, W;
-        bool operator==(const BinPoolKey& o) const { return H == o.H && W == o.W; }
-    };
-    struct BinPoolKeyHash {
-        std::size_t operator()(const BinPoolKey& k) const {
-            return std::hash<int64_t>{}((static_cast<int64_t>(k.H) << 32) | k.W);
-        }
-    };
-    std::unordered_map<BinPoolKey, std::vector<BinStateNative>, BinPoolKeyHash> bin_pool_map_;
-    static constexpr int64_t BIN_POOL_MAX_BYTES = 256LL * 1024 * 1024;  // 256 MB cap
 
     std::vector<int32_t> scratch_cell_offsets_;
     std::vector<int32_t> scratch_grid_idxs_;
@@ -629,14 +618,10 @@ private:
     // GPU vacancy buffer: (max_total_bins, H) int32.
     // Allocated once per process_machine_batch call; rows updated lazily via dirty flags.
     torch::Tensor ws_vacancy_gpu_;
-    // Temporary GPU buffer for uploading dirty vacancy rows (separate from pair buffer).
-    torch::Tensor ws_vac_upload_gpu_;     // (n_dirty * H,) int32 — staging for index_copy_
     // GPU scratch for vacancy-check pair inputs/output (packed: 3*n_pairs int32).
     torch::Tensor ws_vac_pairs_gpu_;      // (3*n_pairs,) int32: vac_row | den_off | den_len
     torch::Tensor ws_vac_out_pass_;       // (n_pairs,) int8
     // Pinned CPU backing for vacancy upload and pair data.
-    torch::Tensor ws_cpu_vac_upload_;     // pinned, int32 — batched vacancy rows
-    torch::Tensor ws_cpu_vac_row_ids_;    // pinned, int32 — which GPU rows to write
     torch::Tensor ws_cpu_pair_buf_;       // pinned, int32 — packed [vac_row | den_off | den_len]
     torch::Tensor ws_cpu_pass_buf_;       // pinned, int8  — result readback
     // GPU vacancy recompute workspaces (packed grid_idxs + row_idxs).
@@ -800,302 +785,6 @@ private:
         }
         return (mv > thresholds_[static_cast<size_t>(machine_idx - 1)]) &&
                (mv <= thresholds_[static_cast<size_t>(machine_idx)]);
-    }
-
-    static bool check_vacancy_fit_simple_cpp(
-        const std::vector<int32_t>& vacancy,
-        const int32_t* density,
-        int density_len
-    ) {
-        const int n = static_cast<int>(vacancy.size());
-        if (density_len > n) {
-            return false;
-        }
-
-        // Optional kill-switch for A/B benchmarks and debugging.
-        const bool simd_enabled = []() {
-            const char* env = std::getenv("ABRKGA_NATIVE_VACANCY_SIMD");
-            if (env == nullptr) {
-                return true;
-            }
-            const std::string s(env);
-            return !(s == "0" || s == "false" || s == "False");
-        }();
-
-        if (!simd_enabled) {
-            return check_vacancy_fit_simple_scalar_cpp(vacancy, density, density_len);
-        }
-
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-        static int simd_level = -1;  // 0=scalar, 1=avx2, 2=avx512
-        if (simd_level < 0) {
-            simd_level = 0;
-            if (__builtin_cpu_supports("avx512f")) {
-                simd_level = 2;
-            } else if (__builtin_cpu_supports("avx2")) {
-                simd_level = 1;
-            }
-        }
-
-        if (simd_level == 2 && density_len >= 16) {
-            return check_vacancy_fit_simple_avx512_cpp(vacancy, density, density_len);
-        }
-        if (simd_level >= 1 && density_len >= 8) {
-            return check_vacancy_fit_simple_avx2_cpp(vacancy, density, density_len);
-        }
-#endif
-
-        return check_vacancy_fit_simple_scalar_cpp(vacancy, density, density_len);
-    }
-
-    static bool check_vacancy_fit_simple_scalar_cpp(
-        const std::vector<int32_t>& vacancy,
-        const int32_t* density,
-        int density_len
-    ) {
-        const int n = static_cast<int>(vacancy.size());
-        if (density_len > n) {
-            return false;
-        }
-        const int max_start = n - density_len;
-        for (int start = 0; start <= max_start; ++start) {
-            bool fits = true;
-            for (int i = 0; i < density_len; ++i) {
-                if (vacancy[static_cast<size_t>(start + i)] < density[i]) {
-                    fits = false;
-                    break;
-                }
-            }
-            if (fits) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    __attribute__((target("avx2")))
-    static inline bool window_fits_avx2_cpp(
-        const int32_t* vacancy_ptr,
-        const int32_t* density_ptr,
-        int density_len
-    ) {
-        int i = 0;
-        for (; i + 8 <= density_len; i += 8) {
-            const auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vacancy_ptr + i));
-            const auto d = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(density_ptr + i));
-            const auto bad = _mm256_cmpgt_epi32(d, v);  // bad when density > vacancy
-            if (_mm256_movemask_ps(_mm256_castsi256_ps(bad)) != 0) {
-                return false;
-            }
-        }
-        for (; i < density_len; ++i) {
-            if (vacancy_ptr[i] < density_ptr[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    __attribute__((target("avx2")))
-    static bool check_vacancy_fit_simple_avx2_cpp(
-        const std::vector<int32_t>& vacancy,
-        const int32_t* density,
-        int density_len
-    ) {
-        const int n = static_cast<int>(vacancy.size());
-        const int max_start = n - density_len;
-        const int32_t* vacancy_ptr = vacancy.data();
-        for (int start = 0; start <= max_start; ++start) {
-            if (window_fits_avx2_cpp(vacancy_ptr + start, density, density_len)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    __attribute__((target("avx512f")))
-    static inline bool window_fits_avx512_cpp(
-        const int32_t* vacancy_ptr,
-        const int32_t* density_ptr,
-        int density_len
-    ) {
-        int i = 0;
-        for (; i + 16 <= density_len; i += 16) {
-            const auto v = _mm512_loadu_si512(reinterpret_cast<const void*>(vacancy_ptr + i));
-            const auto d = _mm512_loadu_si512(reinterpret_cast<const void*>(density_ptr + i));
-            const auto bad = _mm512_cmpgt_epi32_mask(d, v);  // bad when density > vacancy
-            if (bad != 0) {
-                return false;
-            }
-        }
-        for (; i < density_len; ++i) {
-            if (vacancy_ptr[i] < density_ptr[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    __attribute__((target("avx512f")))
-    static bool check_vacancy_fit_simple_avx512_cpp(
-        const std::vector<int32_t>& vacancy,
-        const int32_t* density,
-        int density_len
-    ) {
-        const int n = static_cast<int>(vacancy.size());
-        const int max_start = n - density_len;
-        const int32_t* vacancy_ptr = vacancy.data();
-        for (int start = 0; start <= max_start; ++start) {
-            if (window_fits_avx512_cpp(vacancy_ptr + start, density, density_len)) {
-                return true;
-            }
-        }
-        return false;
-    }
-#endif
-
-    static void update_vacancy_rows_scalar_cpp(
-        std::vector<int32_t>& vacancy_vector,
-        const std::vector<uint8_t>& grid,
-        int y_start,
-        int num_rows,
-        int width
-    ) {
-        for (int i = 0; i < num_rows; ++i) {
-            int max_zeros = 0;
-            int current_zeros = 0;
-            const int row_idx = y_start + i;
-            const int row_off = row_idx * width;
-            for (int j = 0; j < width; ++j) {
-                if (grid[static_cast<size_t>(row_off + j)] == 0) {
-                    current_zeros += 1;
-                    if (current_zeros > max_zeros) {
-                        max_zeros = current_zeros;
-                    }
-                } else {
-                    current_zeros = 0;
-                }
-            }
-            vacancy_vector[static_cast<size_t>(row_idx)] = max_zeros;
-        }
-    }
-
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    // Process a 32-bit movemask (bit i = 1 iff byte i was zero in the chunk),
-    // updating the running carry (length of zero run ending at the end of the
-    // previously-seen bytes) and the running max-zeros value.
-    __attribute__((target("avx2")))
-    static inline void update_vacancy_process_mask32(uint32_t m, int& carry, int& mx) {
-        if (m == 0u) {
-            carry = 0;
-            return;
-        }
-        if (m == 0xFFFFFFFFu) {
-            carry += 32;
-            if (carry > mx) mx = carry;
-            return;
-        }
-        // Leading ones (from bit 0) extend the existing carry.
-        const int lead = __builtin_ctz(~m);
-        carry += lead;
-        if (carry > mx) mx = carry;
-        // Trailing ones (ending at bit 31) become the new carry for the next chunk.
-        const int trail = __builtin_clz(~m);
-        // Isolate the middle region (strip leading and trailing ones).
-        uint32_t mid = m & ~((1u << lead) - 1u);
-        mid &= (0xFFFFFFFFu >> trail);
-        // Scan internal ones-runs.
-        while (mid != 0u) {
-            const int s = __builtin_ctz(mid);
-            const uint32_t r = mid >> s;
-            const int len = __builtin_ctz(~r);  // r has LSB=1 and is not all-ones
-            if (len > mx) mx = len;
-            mid &= ~(((1u << len) - 1u) << s);
-        }
-        if (trail > mx) mx = trail;
-        carry = trail;
-    }
-
-    __attribute__((target("avx2")))
-    static void update_vacancy_rows_avx2_cpp(
-        std::vector<int32_t>& vacancy_vector,
-        const std::vector<uint8_t>& grid,
-        int y_start,
-        int num_rows,
-        int width
-    ) {
-        const __m256i zero = _mm256_setzero_si256();
-        const uint8_t* base = grid.data();
-        for (int i = 0; i < num_rows; ++i) {
-            const int row_idx = y_start + i;
-            const uint8_t* row = base + static_cast<size_t>(row_idx) * static_cast<size_t>(width);
-            int mx = 0;
-            int carry = 0;
-            int j = 0;
-            const int limit = width - 32;
-            for (; j <= limit; j += 32) {
-                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + j));
-                const __m256i eq = _mm256_cmpeq_epi8(v, zero);
-                const uint32_t m = static_cast<uint32_t>(_mm256_movemask_epi8(eq));
-                update_vacancy_process_mask32(m, carry, mx);
-            }
-            for (; j < width; ++j) {
-                if (row[j] == 0) {
-                    carry += 1;
-                    if (carry > mx) mx = carry;
-                } else {
-                    carry = 0;
-                }
-            }
-            vacancy_vector[static_cast<size_t>(row_idx)] = mx;
-        }
-    }
-#endif
-
-    static void update_vacancy_rows_cpp(
-        std::vector<int32_t>& vacancy_vector,
-        const std::vector<uint8_t>& grid,
-        int y_start,
-        int num_rows,
-        int width
-    ) {
-#if PROFILE_CPU_HOTSPOTS
-        auto _prof_t0 = PROF_NOW();
-#endif
-
-        const bool simd_enabled = []() {
-            const char* env = std::getenv("ABRKGA_NATIVE_UVR_SIMD");
-            if (env == nullptr) {
-                return true;
-            }
-            const std::string s(env);
-            return !(s == "0" || s == "false" || s == "False");
-        }();
-
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-        static int uvr_simd_level = -1;  // 0=scalar, 1=avx2
-        if (uvr_simd_level < 0) {
-            uvr_simd_level = 0;
-            if (__builtin_cpu_supports("avx2")) {
-                uvr_simd_level = 1;
-            }
-        }
-        if (simd_enabled && uvr_simd_level >= 1 && width >= 32) {
-            update_vacancy_rows_avx2_cpp(vacancy_vector, grid, y_start, num_rows, width);
-        } else {
-            update_vacancy_rows_scalar_cpp(vacancy_vector, grid, y_start, num_rows, width);
-        }
-#else
-        (void)simd_enabled;
-        update_vacancy_rows_scalar_cpp(vacancy_vector, grid, y_start, num_rows, width);
-#endif
-
-#if PROFILE_CPU_HOTSPOTS
-        g_profile.uvr_ns += PROF_NS_SINCE(_prof_t0);
-        g_profile.uvr_call_count += 1;
-        g_profile.uvr_total_rows += num_rows;
-#endif
     }
 
     void decode_sequences_for_machine(
@@ -1358,40 +1047,6 @@ private:
         }
     }
 
-    // Write part matrix rows into grid for overwrite=false (add mode).
-    // AVX2 path: 32 bytes/cycle byte-add with scalar tail.
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-    __attribute__((target("avx2")))
-    static void grid_add_row_avx2(uint8_t* dst, const uint8_t* src, int len) {
-        int j = 0;
-        for (; j + 32 <= len; j += 32) {
-            const auto d = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + j));
-            const auto s = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + j));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + j), _mm256_add_epi8(d, s));
-        }
-        for (; j < len; ++j) {
-            dst[j] = static_cast<uint8_t>(dst[j] + src[j]);
-        }
-    }
-#endif
-
-    // Dispatch wrapper: uses AVX2 byte-add if available, else scalar fallback.
-    static void grid_add_row(uint8_t* dst, const uint8_t* src, int len) {
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
-        static int has_avx2 = -1;
-        if (has_avx2 < 0) {
-            has_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
-        }
-        if (has_avx2 && len >= 32) {
-            grid_add_row_avx2(dst, src, len);
-            return;
-        }
-#endif
-        for (int j = 0; j < len; ++j) {
-            dst[j] = static_cast<uint8_t>(dst[j] + src[j]);
-        }
-    }
-
     template <bool Overwrite>
     void add_part_to_bin_impl(
         BinStateNative& bin,
@@ -1403,24 +1058,10 @@ private:
         int machine_width
     ) {
         const int ph = rot_h_[static_cast<size_t>(rotg)];
-        const int pw = rot_w_[static_cast<size_t>(rotg)];
         const int y_start = y - ph + 1;
-        const int m_off = rot_matrix_offsets_[static_cast<size_t>(rotg)];
-        const uint8_t* mat_ptr = rot_matrix_flat_u8_.data() + m_off;
-        uint8_t* grid_ptr = bin.grid.data();
+        // No CPU grid write — grid_states (GPU) is authoritative.
+        // GPU is updated via apply_gpu_updates after all placements.
 
-        for (int rr = 0; rr < ph; ++rr) {
-            uint8_t*       dst = grid_ptr + static_cast<size_t>((y_start + rr) * machine_width + x);
-            const uint8_t* src = mat_ptr  + static_cast<size_t>(rr * pw);
-            if constexpr (Overwrite) {
-                std::memcpy(dst, src, static_cast<size_t>(pw));
-            } else {
-                grid_add_row(dst, src, pw);
-            }
-        }
-
-        // Vacancy is now recomputed on GPU after apply_gpu_updates — no CPU
-        // update_vacancy_rows or dirty flag needed here.
         bin.area += part_area_[static_cast<size_t>(part_idx)];
         bin.min_occupied_row = std::min(bin.min_occupied_row, y_start);
         bin.max_occupied_row = std::max(bin.max_occupied_row, y);
@@ -1484,6 +1125,9 @@ private:
         }
         const int max_total_bins = std::max(1, num_solutions * max_bins_per_sol);
 
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_decode_t0 = PROF_NOW();
+#endif
         std::vector<ContextNative> contexts(static_cast<size_t>(num_solutions));
         int max_seq_len = 0;
         for (int s = 0; s < num_solutions; ++s) {
@@ -1502,6 +1146,9 @@ private:
             max_seq_len = std::max(max_seq_len, static_cast<int>(ctx.parts_sequence.size()));
             contexts[static_cast<size_t>(s)] = std::move(ctx);
         }
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.decode_seq_ns += PROF_NS_SINCE(_prof_decode_t0);
+#endif
 
         // torch::empty instead of torch::zeros — Phase 6 zeroes each bin slot
         // via index_fill_ before use, making the upfront bulk memset redundant.
@@ -1558,91 +1205,7 @@ private:
             makespans[static_cast<size_t>(i)] = total;
         }
 
-        // Harvest bins into the per-(H,W) pool before contexts are destroyed.
-        // Total pool memory is capped at BIN_POOL_MAX_BYTES to stay safe on large instances.
-        {
-            const BinPoolKey key{H, W};
-            auto& slot = bin_pool_map_[key];
-            const int64_t bytes_per_bin = static_cast<int64_t>(H) * W;
-            // Count current pool memory across all (H,W) keys.
-            int64_t used_bytes = 0;
-            for (const auto& kv : bin_pool_map_) {
-                used_bytes += static_cast<int64_t>(kv.second.size()) *
-                              static_cast<int64_t>(kv.first.H) * kv.first.W;
-            }
-            bool cap_hit = false;
-            for (auto& ctx : contexts) {
-                if (cap_hit) break;
-                for (auto& bin : ctx.open_bins) {
-                    if (used_bytes + bytes_per_bin > BIN_POOL_MAX_BYTES) {
-                        cap_hit = true;
-                        break;
-                    }
-                    slot.push_back(std::move(bin));
-                    used_bytes += bytes_per_bin;
-                }
-            }
-        }
-
         return makespans;
-    }
-
-    // Upload all dirty vacancy vectors to GPU in one batched copy.
-    void flush_dirty_vacancies(
-        const std::vector<ContextNative>& contexts,
-        const std::vector<int>& active_indices,
-        int H
-    ) {
-        // Collect dirty bins.
-        scratch_dirty_grid_rows_.clear();
-        scratch_dirty_bins_ptr_.clear();
-        for (int gidx : active_indices) {
-            const auto& ctx = contexts[static_cast<size_t>(gidx)];
-            for (const auto& b : ctx.open_bins) {
-                if (b.vacancy_gpu_dirty) {
-                    scratch_dirty_grid_rows_.push_back(b.grid_state_idx);
-                    scratch_dirty_bins_ptr_.push_back(const_cast<BinStateNative*>(&b));
-                }
-            }
-        }
-        const int n_dirty = static_cast<int>(scratch_dirty_grid_rows_.size());
-        if (n_dirty == 0) return;
-
-        // Pack vacancy rows into one pinned buffer: shape (n_dirty * H,)
-        const int64_t total_elems = static_cast<int64_t>(n_dirty) * H;
-        auto cpu_vac = ensure_cpu_pinned_i32(ws_cpu_vac_upload_, total_elems);
-        int32_t* dst = cpu_vac.data_ptr<int32_t>();
-        for (int i = 0; i < n_dirty; ++i) {
-            const auto* b = scratch_dirty_bins_ptr_[static_cast<size_t>(i)];
-            std::memcpy(dst + i * H, b->vacancy.data(), static_cast<size_t>(H) * sizeof(int32_t));
-        }
-        // Transfer to GPU: one copy_ call.
-        auto gpu_vac_flat = ws_vacancy_gpu_.view({-1});  // (max_total_bins * H,)
-        auto cpu_vac_flat = cpu_vac;                     // (n_dirty * H,)
-        // Use index_copy_ via a row index tensor to write only the dirty rows.
-        auto cpu_rows = ensure_cpu_pinned_i32(ws_cpu_vac_row_ids_, static_cast<int64_t>(n_dirty));
-        int32_t* row_ptr = cpu_rows.data_ptr<int32_t>();
-        for (int i = 0; i < n_dirty; ++i) {
-            row_ptr[i] = scratch_dirty_grid_rows_[static_cast<size_t>(i)];
-        }
-        // Build GPU row-index tensor and use index_copy_.
-        auto gpu_row_idx_long = ensure_workspace_long(ws_wave_idx_long_, static_cast<int64_t>(n_dirty));
-        {
-            auto cpu_long = ensure_cpu_pinned_long(ws_cpu_wave_idx_, static_cast<int64_t>(n_dirty));
-            int64_t* lp = cpu_long.data_ptr<int64_t>();
-            for (int i = 0; i < n_dirty; ++i) lp[i] = static_cast<int64_t>(row_ptr[i]);
-            gpu_row_idx_long.copy_(cpu_long, /*non_blocking=*/true);
-        }
-        // Upload dirty rows: select dirty rows from packed buffer, index_copy_ into ws_vacancy_gpu_.
-        auto gpu_src = ensure_workspace_i32(ws_vac_upload_gpu_, total_elems);
-        gpu_src.copy_(cpu_vac_flat, /*non_blocking=*/true);
-        auto gpu_src_2d = gpu_src.view({n_dirty, H});
-        ws_vacancy_gpu_.index_copy_(0, gpu_row_idx_long, gpu_src_2d);
-
-        // Clear dirty flags.
-        for (auto* b : scratch_dirty_bins_ptr_) {
-            b->vacancy_gpu_dirty = false;
-        }
     }
 
     // Evaluate vacancy checks for all (bin, rotation) pairs on GPU.
@@ -1708,6 +1271,10 @@ private:
         const torch::Tensor& col_idx_f,
         const torch::Tensor& neg_inf
     ) {
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_wave_t0 = PROF_NOW();
+        g_profile.wave_count += 1;
+#endif
         scratch_ctx_global_.clear();
         scratch_part_idx_local_.clear();
         scratch_ctx_global_.reserve(active_indices.size());
@@ -1747,6 +1314,10 @@ private:
                 }
             }
         }
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.phase1_active_ns += PROF_NS_SINCE(_prof_wave_t0);
+        auto _prof_rfft2_t0 = PROF_NOW();
+#endif
         if (!scratch_invalid_grid_indices_.empty()) {
             auto idx_t = load_workspace_long_from_i64(
                 ws_wave_idx_long_, ws_cpu_wave_idx_,
@@ -1760,6 +1331,9 @@ private:
                 b->grid_fft_valid = true;
             }
         }
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.phase2_rfft2_ns += PROF_NS_SINCE(_prof_rfft2_t0);
+#endif
 
         // Vacancy is now maintained on GPU — no flush needed.
 
@@ -1880,6 +1454,7 @@ private:
         }
 #if PROFILE_CPU_HOTSPOTS
         g_profile.p3_pass_c_ns += PROF_NS_SINCE(_prof_passC_t0);
+        auto _prof_p4p1_t0 = PROF_NOW();
 #endif
 
         batch_fft_all_tests(
@@ -1888,6 +1463,9 @@ private:
             p1.bin_indices, p1.enclosure_lengths, p1.bin_areas, p1.part_areas,
             machine_idx, grid_ffts, H, W, row_idx, col_idx, row_idx_f, col_idx_f, neg_inf, scratch_fft_p1_
         );
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.phase4_p1_fft_ns += PROF_NS_SINCE(_prof_p4p1_t0);
+#endif
 
         scratch_ctx_p1_hit_.assign(static_cast<size_t>(n_contexts), 0);
         for (size_t i = 0; i < p1.ctx_local.size(); ++i) {
@@ -1897,6 +1475,9 @@ private:
             }
         }
 
+#if PROFILE_CPU_HOTSPOTS
+        auto _prof_p3p2_t0 = PROF_NOW();
+#endif
         // ── Phase 3 p2: GPU vacancy check ──────────────────────────────────────
         auto& p2 = scratch_p2_;
         p2.grid_indices.clear();
@@ -1981,12 +1562,20 @@ private:
             p2.part_areas.push_back(p_area);
         }
 
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.phase3_p2_collect_ns += PROF_NS_SINCE(_prof_p3p2_t0);
+        auto _prof_p4p2_t0 = PROF_NOW();
+#endif
         batch_fft_all_tests(
             static_cast<int>(p2.grid_indices.size()),
             p2.grid_indices, p2.rot_global, p2.heights, p2.widths,
             p2.bin_indices, p2.enclosure_lengths, p2.bin_areas, p2.part_areas,
             machine_idx, grid_ffts, H, W, row_idx, col_idx, row_idx_f, col_idx_f, neg_inf, scratch_fft_p2_
         );
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.phase4_p2_fft_ns += PROF_NS_SINCE(_prof_p4p2_t0);
+        auto _prof_p5_t0 = PROF_NOW();
+#endif
 
         auto& test_ctx_local = scratch_test_ctx_local_;
         auto& test_bin_local = scratch_test_bin_local_;
@@ -2142,10 +1731,17 @@ private:
             });
         }
 
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.phase5_select_ns += PROF_NS_SINCE(_prof_p5_t0);
+        auto _prof_gpu_upd_t0 = PROF_NOW();
+#endif
         if (!gpu_updates.empty()) {
             apply_gpu_updates(grid_states, gpu_updates, H, W);
             recompute_vacancy_gpu(grid_states, gpu_updates, H, W);
         }
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.phase5_gpu_update_ns += PROF_NS_SINCE(_prof_gpu_upd_t0);
+#endif
 
         auto& phase6_gpu_updates = scratch_phase6_gpu_updates_;
         auto& phase6_grid_indices = scratch_phase6_grid_indices_;
@@ -2172,19 +1768,7 @@ private:
             auto _prof_ctor_t0 = PROF_NOW();
 #endif
             BinStateNative new_bin;
-            {
-                auto pit = bin_pool_map_.find(BinPoolKey{H, W});
-                if (pit != bin_pool_map_.end() && !pit->second.empty()) {
-                    // Reuse a pre-faulted bin from the pool.
-                    new_bin = std::move(pit->second.back());
-                    pit->second.pop_back();
-                    std::memset(new_bin.grid.data(), 0, static_cast<size_t>(H * W));
-                    std::fill(new_bin.vacancy.begin(), new_bin.vacancy.end(), static_cast<int32_t>(W));
-                } else {
-                    new_bin.grid.assign(static_cast<size_t>(H * W), 0u);
-                    new_bin.vacancy.assign(static_cast<size_t>(H), static_cast<int32_t>(W));
-                }
-            }
+            // No CPU grid allocation needed — GPU grid_states is authoritative.
             new_bin.bin_idx = static_cast<int>(ctx.open_bins.size());
             new_bin.grid_state_idx = grid_idx;
             new_bin.area = 0.0;
@@ -2194,7 +1778,6 @@ private:
             new_bin.proc_time = 0.0;
             new_bin.proc_time_height = 0.0;
             new_bin.grid_fft_valid = false;
-            // vacancy_gpu_dirty no longer used — vacancy maintained on GPU.
             new_bin.bin_length = H;
             new_bin.bin_width = W;
 #if PROFILE_CPU_HOTSPOTS
@@ -2238,6 +1821,9 @@ private:
             // Recompute vacancy for the rows where parts were placed.
             recompute_vacancy_gpu(grid_states, phase6_gpu_updates, H, W);
         }
+#if PROFILE_CPU_HOTSPOTS
+        g_profile.total_wave_ns += PROF_NS_SINCE(_prof_wave_t0);
+#endif
     }
 
     // Recompute vacancy rows on GPU for affected (grid_idx, row) pairs.
