@@ -237,6 +237,20 @@ void native_select_best_positions_cuda(
     torch::Tensor out_col_start
 );
 
+void native_gather_grids_cuda(
+    torch::Tensor grid_states,   // (max_bins, H, W) float32
+    torch::Tensor idx,           // (N,) int64
+    torch::Tensor output,        // (N, H, W) float32, pre-allocated
+    int N, int H, int W
+);
+
+void native_scatter_ffts_cuda(
+    torch::Tensor input,         // (N, H, W2) complex64
+    torch::Tensor idx,           // (N,) int64
+    torch::Tensor grid_ffts,     // (max_bins, H, W2) complex64
+    int N, int H, int W2
+);
+
 void native_fused_gather_multiply_cuda(
     torch::Tensor grid_ffts,
     torch::Tensor part_ffts,
@@ -335,6 +349,20 @@ inline void native_select_best_positions(
     native_select_best_positions_cuda(
         overlap_batch, part_h, part_w, H, W, out_has, out_row, out_col_start
     );
+}
+
+inline void native_gather_grids(
+    torch::Tensor grid_states, torch::Tensor idx, torch::Tensor output,
+    int N, int H, int W
+) {
+    native_gather_grids_cuda(grid_states, idx, output, N, H, W);
+}
+
+inline void native_scatter_ffts(
+    torch::Tensor input, torch::Tensor idx, torch::Tensor grid_ffts,
+    int N, int H, int W2
+) {
+    native_scatter_ffts_cuda(input, idx, grid_ffts, N, H, W2);
 }
 
 class NativeFullDecoder {
@@ -635,6 +663,11 @@ private:
     // Pre-allocated complex64 buffer for fused gather-multiply output.
     // Shape: (CHUNK_SIZE * fft_size,) viewed as (chunk_n, H, W/2+1) per chunk.
     torch::Tensor ws_fused_product_;
+    // Pre-allocated float32 buffer for Phase 2 gather output (dirty grids).
+    // Shape: (N * H * W,) viewed as (N, H, W) per wave. Replaces the per-wave
+    // allocation done by grid_states.index_select which showed up as ~37ms/gen
+    // P50 of CUDA kernel time plus its own allocation churn.
+    torch::Tensor ws_gather_out_float_;
     // Output buffers for the CUDA selector kernel — pre-allocated once and
     // reused every chunk so we avoid repeated GPU alloc + fill_(0) per chunk.
     torch::Tensor ws_sel_has_i32_;
@@ -688,6 +721,14 @@ private:
     torch::Tensor ensure_workspace_cfloat(torch::Tensor& ws, int64_t n) {
         auto opts = torch::TensorOptions().dtype(torch::kComplexFloat).device(device_);
         if (!ws.defined() || ws.scalar_type() != torch::kComplexFloat || ws.device() != device_ || ws.numel() < n) {
+            ws = torch::empty({std::max<int64_t>(n, 1)}, opts);
+        }
+        return ws.narrow(0, 0, n);
+    }
+
+    torch::Tensor ensure_workspace_float(torch::Tensor& ws, int64_t n) {
+        auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(device_);
+        if (!ws.defined() || ws.scalar_type() != torch::kFloat32 || ws.device() != device_ || ws.numel() < n) {
             ws = torch::empty({std::max<int64_t>(n, 1)}, opts);
         }
         return ws.narrow(0, 0, n);
@@ -1319,14 +1360,36 @@ private:
         auto _prof_rfft2_t0 = PROF_NOW();
 #endif
         if (!scratch_invalid_grid_indices_.empty()) {
+            const int64_t N = static_cast<int64_t>(scratch_invalid_grid_indices_.size());
             auto idx_t = load_workspace_long_from_i64(
                 ws_wave_idx_long_, ws_cpu_wave_idx_,
-                scratch_invalid_grid_indices_,
-                static_cast<int64_t>(scratch_invalid_grid_indices_.size())
+                scratch_invalid_grid_indices_, N
             );
-            auto batch_grids = grid_states.index_select(0, idx_t);
+            torch::Tensor batch_grids;
+            if (grid_states.is_cuda()) {
+                // Custom gather kernel → pre-allocated workspace (N, H, W) float.
+                // Avoids the ~37ms/gen P50 spent in aten::index_select +
+                // per-wave allocation churn.
+                const int H_ = static_cast<int>(grid_states.size(1));
+                const int W_ = static_cast<int>(grid_states.size(2));
+                auto gather_flat = ensure_workspace_float(
+                    ws_gather_out_float_, N * H_ * W_
+                );
+                native_gather_grids(grid_states, idx_t, gather_flat,
+                                    static_cast<int>(N), H_, W_);
+                batch_grids = gather_flat.view({N, H_, W_});
+            } else {
+                batch_grids = grid_states.index_select(0, idx_t);
+            }
             auto batch_ffts = torch::fft::rfft2(batch_grids);
-            grid_ffts.index_copy_(0, idx_t, batch_ffts);
+            if (grid_ffts.is_cuda()) {
+                const int H_ = static_cast<int>(grid_ffts.size(1));
+                const int W2_ = static_cast<int>(grid_ffts.size(2));
+                native_scatter_ffts(batch_ffts, idx_t, grid_ffts,
+                                    static_cast<int>(N), H_, W2_);
+            } else {
+                grid_ffts.index_copy_(0, idx_t, batch_ffts);
+            }
             for (auto* b : scratch_invalid_bins_) {
                 b->grid_fft_valid = true;
             }
@@ -2073,6 +2136,80 @@ __global__ void _native_select_best_positions_kernel(
         out_row[test_idx] = row;
         out_col_start[test_idx] = col - (w - 1);
     }
+}
+
+// Gather grids by index into a compact (N, H, W) float buffer.
+// Replaces grid_states.index_select(0, idx) which dispatches a general
+// indexSelectLargeIndex kernel; this specialized version is pure coalesced
+// reads/writes with no dtype dispatch or broadcasting logic.
+__global__ void _native_gather_grids_kernel(
+    const float* __restrict__ grid_states,
+    const int64_t* __restrict__ idx,
+    float* __restrict__ output,
+    int N, int H, int W
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int HW = H * W;
+    int total = N * HW;
+    if (tid >= total) return;
+    int i = tid / HW;
+    int rem = tid - i * HW;
+    int src_bin = (int)idx[i];
+    output[tid] = grid_states[(long long)src_bin * HW + rem];
+}
+
+// Scatter complex FFT results into grid_ffts[idx[i]].
+// Replaces grid_ffts.index_copy_(0, idx, batch_ffts).
+__global__ void _native_scatter_ffts_kernel(
+    const float2* __restrict__ input,
+    const int64_t* __restrict__ idx,
+    float2* __restrict__ grid_ffts,
+    int N, int H, int W2
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int HW2 = H * W2;
+    int total = N * HW2;
+    if (tid >= total) return;
+    int i = tid / HW2;
+    int rem = tid - i * HW2;
+    int dst_bin = (int)idx[i];
+    grid_ffts[(long long)dst_bin * HW2 + rem] = input[tid];
+}
+
+void native_gather_grids_cuda(
+    torch::Tensor grid_states,
+    torch::Tensor idx,
+    torch::Tensor output,
+    int N, int H, int W
+) {
+    if (N <= 0) return;
+    const int total = N * H * W;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    _native_gather_grids_kernel<<<blocks, threads>>>(
+        grid_states.data_ptr<float>(),
+        idx.data_ptr<int64_t>(),
+        output.data_ptr<float>(),
+        N, H, W
+    );
+}
+
+void native_scatter_ffts_cuda(
+    torch::Tensor input,
+    torch::Tensor idx,
+    torch::Tensor grid_ffts,
+    int N, int H, int W2
+) {
+    if (N <= 0) return;
+    const int total = N * H * W2;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    _native_scatter_ffts_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const float2*>(input.data_ptr<c10::complex<float>>()),
+        idx.data_ptr<int64_t>(),
+        reinterpret_cast<float2*>(grid_ffts.data_ptr<c10::complex<float>>()),
+        N, H, W2
+    );
 }
 
 void native_batch_grid_update_cuda(

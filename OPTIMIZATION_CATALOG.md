@@ -112,7 +112,27 @@ Moving the entire decoder (Phases 1–6) into a single C++/pybind11 extension:
 | VRAM cap in C++ evaluator (safety, prevents OOM on large instances) | Safety only | full_native_decoder.py |
 | Nsight Systems profiling (`nsys profile --trace=cuda,osrt`) | Resolved "44% unaccounted CUDA time" mystery — torch.profiler mis-attributed CPU-blocked time; actual GPU util is ~43% | PROFILING_ANALYSIS.md |
 
-### 1.9 Bug fixes that affected performance (BUG_FIXES_LOG.md)
+### 1.9 Phase 2 custom gather/scatter kernels (2026-04-19)
+
+**Source:** Deep CUDA-activity profiling (torch.profiler + CUDA events) identifying transfer bucket as 26% of GPU time.
+
+Replaced two PyTorch ops in Phase 2 (batch rfft2 pipeline) with custom CUDA kernels:
+- `grid_states.index_select(0, idx_t)` → `_native_gather_grids_kernel` (gather uint8 grids into batched float32 input for rfft2)
+- `grid_ffts.index_copy_(0, idx_t, batch_ffts)` → `_native_scatter_ffts_kernel` (scatter rfft2 output back into the per-bin FFT tensor)
+
+| Metric | P50M2-0 | P75M2-0 |
+|--------|---------|---------|
+| Wall clock | 870 → 875ms (flat, within ±35ms noise) | 1639 → 1634ms (flat) |
+| GPU kernel time | 1470 → 1354ms (**−116ms**) | — |
+| Transfer GPU time | 389 → 313ms (**−75ms**) | — |
+| Custom kernel time | 254 → 284ms (+30ms) | — |
+| Phase 2 wall time | 176 → 156ms (−20ms) | flat |
+
+**Correctness:** fingerprints match baseline exactly (P50: `281426.499026`; P75: all `10000000000000000`).
+
+**Nuance — kept despite flat wall clock:** The GPU is ~100% saturated on the critical path (rfft2 → vacancy readback → irfft2). The gather/scatter ops ran concurrently with neighboring GPU work, so they weren't on the serial dependency chain. Removing them freed GPU cycles without shortening the chain. Retained because it (a) reduces GPU pressure / thermal load, and (b) provides headroom for any future optimization that introduces concurrent streams or overlaps work across machines (§3.1).
+
+### 1.10 Bug fixes that affected performance (BUG_FIXES_LOG.md)
 
 | Bug | Impact | Files |
 |-----|--------|-------|
@@ -171,7 +191,18 @@ These were implemented, measured, and either reverted or shown to have no benefi
 | Eager rfft2 after Phase 5 | Neutral | Third attempt at early rfft2; same single-stream serialization problem |
 | Persist grid_states/grid_ffts across evaluate_batch calls | Neutral | PyTorch caching allocator already pools freed CUDA memory; tested today |
 
-### 2.6 OPTIMIZATION_ANALYSIS.md — Phase 3/6 native experiments
+### 2.6 Transfer-bucket attempts (2026-04-19)
+
+Two attempts targeted the 26%-of-GPU-time transfer bucket. Both reverted.
+
+| Change | Result | Reason |
+|--------|--------|--------|
+| Stride-aware selector kernel (eliminate `.contiguous()` DtoD in Phase 5) | 0% improvement; DtoD count unchanged (198 calls) | The 146ms DtoD is **inside** `aten::_fft_c2r` — PyTorch normalizes cuFFT output via an internal DtoD-style copy. Our `.contiguous()` was not the source. Removing it had no effect. Reverted. |
+| Manual cuFFT (bypass PyTorch `_fft_c2r` to skip internal DtoD) | `CUFFT_INVALID_VALUE` (code 5) on plan creation | Tried `cufftPlanMany` (explicit inembed/onembed), `cufftMakePlanMany64` (explicit + NULL embed), `cufftPlanMany` 32-bit w/ NULL — all fail at batched C2R plan creation. Unbatched `cufftPlan2d(300,300,C2R)` succeeds. Suspected conflict with PyTorch's cuFFT plan cache for batched C2R plans. Not debuggable remotely in reasonable time. Reverted. |
+
+**Lesson:** The largest DtoD in the native decoder lives inside PyTorch's FFT wrapper, not in our code. Reducing it requires either bypassing `torch::fft::irfft2` (blocked by plan-creation conflict above) or accepting it as structural.
+
+### 2.7 OPTIMIZATION_ANALYSIS.md — Phase 3/6 native experiments
 
 | Change | Result | Reason |
 |--------|--------|--------|
