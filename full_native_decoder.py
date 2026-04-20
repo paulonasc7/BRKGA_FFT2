@@ -495,6 +495,10 @@ public:
             density_flat_gpu_ = cpu_t.to(device_);
         }
 
+        // One MachineWorkspace per machine.  Each holds its own scratch vectors,
+        // GPU/CPU workspace tensors, and pinned buffers so machines can be
+        // processed concurrently without data races (Stage 3).
+        workspaces_.resize(static_cast<size_t>(nb_machines_));
     }
 
     py::array_t<double> evaluate_batch(
@@ -576,117 +580,121 @@ private:
         int pw;
     };
 
-    CollectedTests scratch_p1_;
-    CollectedTests scratch_p2_;
-    FFTBatchResult scratch_fft_p1_;
-    FFTBatchResult scratch_fft_p2_;
+    // Per-machine workspace: all scratch + GPU/pinned-CPU buffers used during
+    // a single process_machine_batch call.  One instance per machine (indexed
+    // by machine_idx), isolating state across concurrent machine processing.
+    struct MachineWorkspace {
+        CollectedTests scratch_p1_;
+        CollectedTests scratch_p2_;
+        FFTBatchResult scratch_fft_p1_;
+        FFTBatchResult scratch_fft_p2_;
 
-    std::vector<int> scratch_active_;
-    std::vector<int> scratch_ctx_global_;
-    std::vector<int> scratch_part_idx_local_;
-    std::vector<int64_t> scratch_invalid_grid_indices_;
-    std::vector<BinStateNative*> scratch_invalid_bins_;
-    std::vector<int32_t> scratch_ctx_first_valid_bin_;
-    std::vector<uint8_t> scratch_ctx_p1_hit_;
+        std::vector<int> scratch_active_;
+        std::vector<int> scratch_ctx_global_;
+        std::vector<int> scratch_part_idx_local_;
+        std::vector<int64_t> scratch_invalid_grid_indices_;
+        std::vector<BinStateNative*> scratch_invalid_bins_;
+        std::vector<int32_t> scratch_ctx_first_valid_bin_;
+        std::vector<uint8_t> scratch_ctx_p1_hit_;
 
-    std::vector<int32_t> scratch_test_ctx_local_;
-    std::vector<int32_t> scratch_test_bin_local_;
-    std::vector<int32_t> scratch_test_rot_global_;
-    std::vector<uint8_t> scratch_placement_has_;
-    std::vector<int32_t> scratch_placement_cols_;
-    std::vector<int32_t> scratch_placement_rows_;
-    std::vector<double> scratch_sc_bin_indices_;
-    std::vector<double> scratch_sc_densities_;
-    std::vector<double> scratch_sc_rows_;
-    std::vector<double> scratch_sc_cols_;
-    std::vector<uint8_t> scratch_sc_valid_;
+        std::vector<int32_t> scratch_test_ctx_local_;
+        std::vector<int32_t> scratch_test_bin_local_;
+        std::vector<int32_t> scratch_test_rot_global_;
+        std::vector<uint8_t> scratch_placement_has_;
+        std::vector<int32_t> scratch_placement_cols_;
+        std::vector<int32_t> scratch_placement_rows_;
+        std::vector<double> scratch_sc_bin_indices_;
+        std::vector<double> scratch_sc_densities_;
+        std::vector<double> scratch_sc_rows_;
+        std::vector<double> scratch_sc_cols_;
+        std::vector<uint8_t> scratch_sc_valid_;
 
-    std::vector<int32_t> scratch_best_ti_;
-    std::vector<uint8_t> scratch_has_best_;
-    std::vector<double> scratch_best_neg_bin_;
-    std::vector<double> scratch_best_density_;
-    std::vector<double> scratch_best_row_;
-    std::vector<double> scratch_best_neg_col_;
+        std::vector<int32_t> scratch_best_ti_;
+        std::vector<uint8_t> scratch_has_best_;
+        std::vector<double> scratch_best_neg_bin_;
+        std::vector<double> scratch_best_density_;
+        std::vector<double> scratch_best_row_;
+        std::vector<double> scratch_best_neg_col_;
 
-    std::vector<int32_t> scratch_place_ctx_local_;
-    std::vector<int32_t> scratch_place_ti_;
-    std::vector<int32_t> scratch_place_rows_;
-    std::vector<int32_t> scratch_place_cols_;
-    std::vector<int32_t> scratch_newbin_ctx_local_;
+        std::vector<int32_t> scratch_place_ctx_local_;
+        std::vector<int32_t> scratch_place_ti_;
+        std::vector<int32_t> scratch_place_rows_;
+        std::vector<int32_t> scratch_place_cols_;
+        std::vector<int32_t> scratch_newbin_ctx_local_;
 
+        std::vector<GpuPlacement> scratch_gpu_updates_;
+        std::vector<GpuPlacement> scratch_phase6_gpu_updates_;
+        std::vector<int64_t> scratch_phase6_grid_indices_;
 
-    std::vector<GpuPlacement> scratch_gpu_updates_;
-    std::vector<GpuPlacement> scratch_phase6_gpu_updates_;
-    std::vector<int64_t> scratch_phase6_grid_indices_;
+        std::vector<int32_t> scratch_cell_offsets_;
+        std::vector<int32_t> scratch_grid_idxs_;
+        std::vector<int32_t> scratch_y_starts_;
+        std::vector<int32_t> scratch_x_starts_;
+        std::vector<int32_t> scratch_part_widths_;
+        std::vector<int32_t> scratch_part_offsets_;
 
+        torch::Tensor ws_grid_idx_long_;
+        torch::Tensor ws_rot_idx_long_;
+        torch::Tensor ws_h_long_;
+        torch::Tensor ws_w_long_;
+        torch::Tensor ws_wave_idx_long_;
+        torch::Tensor ws_cell_offsets_i32_;
+        torch::Tensor ws_grid_idxs_i32_;
+        torch::Tensor ws_y_starts_i32_;
+        torch::Tensor ws_x_starts_i32_;
+        torch::Tensor ws_part_widths_i32_;
+        torch::Tensor ws_part_offsets_i32_;
+        // Packed GPU+CPU buffers for apply_gpu_updates (single copy_ instead of 6).
+        torch::Tensor ws_gpu_update_packed_;
+        torch::Tensor ws_cpu_gpu_update_packed_;
+        // Packed GPU+CPU buffers for batch_fft_all_tests index uploads (single copy_ instead of 4).
+        torch::Tensor ws_fft_idx_packed_;
+        torch::Tensor ws_cpu_fft_idx_packed_;
+        // GPU vacancy buffer: (max_total_bins, H) int32.
+        // Allocated once per process_machine_batch call; rows updated lazily via dirty flags.
+        torch::Tensor ws_vacancy_gpu_;
+        // GPU scratch for vacancy-check pair inputs/output (packed: 3*n_pairs int32).
+        torch::Tensor ws_vac_pairs_gpu_;      // (3*n_pairs,) int32: vac_row | den_off | den_len
+        torch::Tensor ws_vac_out_pass_;       // (n_pairs,) int8
+        // Pinned CPU backing for vacancy upload and pair data.
+        torch::Tensor ws_cpu_pair_buf_;       // pinned, int32 — packed [vac_row | den_off | den_len]
+        torch::Tensor ws_cpu_pass_buf_;       // pinned, int8  — result readback
+        // GPU vacancy recompute workspaces (packed grid_idxs + row_idxs).
+        torch::Tensor ws_gpu_vacancy_recompute_;     // (2*n_rows,) int32 on GPU
+        torch::Tensor ws_cpu_vacancy_recompute_;     // (2*n_rows,) int32 pinned CPU
+        // CPU-side scratch for pair building.
+        std::vector<int32_t> scratch_pair_vac_row_;
+        std::vector<int32_t> scratch_pair_den_off_;
+        std::vector<int32_t> scratch_pair_den_len_;
+        std::vector<int8_t>  scratch_pass_;
+        // Pre-allocated complex64 buffer for fused gather-multiply output.
+        // Shape: (CHUNK_SIZE * fft_size,) viewed as (chunk_n, H, W/2+1) per chunk.
+        torch::Tensor ws_fused_product_;
+        // Pre-allocated float32 buffer for Phase 2 gather output (dirty grids).
+        torch::Tensor ws_gather_out_float_;
+        // Output buffers for the CUDA selector kernel — pre-allocated once and
+        // reused every chunk so we avoid repeated GPU alloc + fill_(0) per chunk.
+        torch::Tensor ws_sel_has_i32_;
+        torch::Tensor ws_sel_row_i32_;
+        torch::Tensor ws_sel_col_i32_;
+        // CPU-side pinned backing tensors for CPU→GPU transfers.
+        // Pinned (page-locked) memory allows direct DMA without a staging copy.
+        // One per GPU workspace so buffers are never overwritten before consumed.
+        torch::Tensor ws_cpu_grid_idx_;
+        torch::Tensor ws_cpu_rot_idx_;
+        torch::Tensor ws_cpu_h_;
+        torch::Tensor ws_cpu_w_;
+        torch::Tensor ws_cpu_wave_idx_;
+        torch::Tensor ws_cpu_cell_offsets_;
+        torch::Tensor ws_cpu_grid_idxs_;
+        torch::Tensor ws_cpu_y_starts_;
+        torch::Tensor ws_cpu_x_starts_;
+        torch::Tensor ws_cpu_part_widths_;
+        torch::Tensor ws_cpu_part_offsets_;
+    };
 
-    std::vector<int32_t> scratch_cell_offsets_;
-    std::vector<int32_t> scratch_grid_idxs_;
-    std::vector<int32_t> scratch_y_starts_;
-    std::vector<int32_t> scratch_x_starts_;
-    std::vector<int32_t> scratch_part_widths_;
-    std::vector<int32_t> scratch_part_offsets_;
-    torch::Tensor ws_grid_idx_long_;
-    torch::Tensor ws_rot_idx_long_;
-    torch::Tensor ws_h_long_;
-    torch::Tensor ws_w_long_;
-    torch::Tensor ws_wave_idx_long_;
-    torch::Tensor ws_cell_offsets_i32_;
-    torch::Tensor ws_grid_idxs_i32_;
-    torch::Tensor ws_y_starts_i32_;
-    torch::Tensor ws_x_starts_i32_;
-    torch::Tensor ws_part_widths_i32_;
-    torch::Tensor ws_part_offsets_i32_;
-    // Packed GPU+CPU buffers for apply_gpu_updates (single copy_ instead of 6).
-    torch::Tensor ws_gpu_update_packed_;
-    torch::Tensor ws_cpu_gpu_update_packed_;
-    // Packed GPU+CPU buffers for batch_fft_all_tests index uploads (single copy_ instead of 4).
-    torch::Tensor ws_fft_idx_packed_;
-    torch::Tensor ws_cpu_fft_idx_packed_;
-    // GPU vacancy buffer: (max_total_bins, H) int32.
-    // Allocated once per process_machine_batch call; rows updated lazily via dirty flags.
-    torch::Tensor ws_vacancy_gpu_;
-    // GPU scratch for vacancy-check pair inputs/output (packed: 3*n_pairs int32).
-    torch::Tensor ws_vac_pairs_gpu_;      // (3*n_pairs,) int32: vac_row | den_off | den_len
-    torch::Tensor ws_vac_out_pass_;       // (n_pairs,) int8
-    // Pinned CPU backing for vacancy upload and pair data.
-    torch::Tensor ws_cpu_pair_buf_;       // pinned, int32 — packed [vac_row | den_off | den_len]
-    torch::Tensor ws_cpu_pass_buf_;       // pinned, int8  — result readback
-    // GPU vacancy recompute workspaces (packed grid_idxs + row_idxs).
-    torch::Tensor ws_gpu_vacancy_recompute_;     // (2*n_rows,) int32 on GPU
-    torch::Tensor ws_cpu_vacancy_recompute_;     // (2*n_rows,) int32 pinned CPU
-    // CPU-side scratch for pair building.
-    std::vector<int32_t> scratch_pair_vac_row_;
-    std::vector<int32_t> scratch_pair_den_off_;
-    std::vector<int32_t> scratch_pair_den_len_;
-    std::vector<int8_t>  scratch_pass_;
-    // Pre-allocated complex64 buffer for fused gather-multiply output.
-    // Shape: (CHUNK_SIZE * fft_size,) viewed as (chunk_n, H, W/2+1) per chunk.
-    torch::Tensor ws_fused_product_;
-    // Pre-allocated float32 buffer for Phase 2 gather output (dirty grids).
-    // Shape: (N * H * W,) viewed as (N, H, W) per wave. Replaces the per-wave
-    // allocation done by grid_states.index_select which showed up as ~37ms/gen
-    // P50 of CUDA kernel time plus its own allocation churn.
-    torch::Tensor ws_gather_out_float_;
-    // Output buffers for the CUDA selector kernel — pre-allocated once and
-    // reused every chunk so we avoid repeated GPU alloc + fill_(0) per chunk.
-    torch::Tensor ws_sel_has_i32_;
-    torch::Tensor ws_sel_row_i32_;
-    torch::Tensor ws_sel_col_i32_;
-    // CPU-side pinned backing tensors for CPU→GPU transfers.
-    // Pinned (page-locked) memory allows direct DMA without a staging copy.
-    // One per GPU workspace so buffers are never overwritten before consumed.
-    torch::Tensor ws_cpu_grid_idx_;
-    torch::Tensor ws_cpu_rot_idx_;
-    torch::Tensor ws_cpu_h_;
-    torch::Tensor ws_cpu_w_;
-    torch::Tensor ws_cpu_wave_idx_;
-    torch::Tensor ws_cpu_cell_offsets_;
-    torch::Tensor ws_cpu_grid_idxs_;
-    torch::Tensor ws_cpu_y_starts_;
-    torch::Tensor ws_cpu_x_starts_;
-    torch::Tensor ws_cpu_part_widths_;
-    torch::Tensor ws_cpu_part_offsets_;
+    // One workspace per machine.  Sized in the constructor once nb_machines_ is known.
+    std::vector<MachineWorkspace> workspaces_;
 
     inline int rot_global(int part_idx, int rot) const {
         return part_rot_offsets_[static_cast<size_t>(part_idx)] + rot;
@@ -876,7 +884,8 @@ private:
         const torch::Tensor& row_idx_f,
         const torch::Tensor& col_idx_f,
         const torch::Tensor& neg_inf,
-        FFTBatchResult& out
+        FFTBatchResult& out,
+        MachineWorkspace& ws
     ) {
         out.has_result.assign(static_cast<size_t>(n_tests), 0);
         out.cols.assign(static_cast<size_t>(n_tests), 0);
@@ -893,9 +902,9 @@ private:
         // Pack all 4 index arrays into one pinned buffer and upload in a
         // single copy_ call.  Layout (int64): grid_idx[n] | rot_idx[n] | h[n] | w[n]
         const int64_t nt = static_cast<int64_t>(n_tests);
-        auto gpu_fft_packed = ensure_workspace_long(ws_fft_idx_packed_, 4 * nt);
+        auto gpu_fft_packed = ensure_workspace_long(ws.ws_fft_idx_packed_, 4 * nt);
         {
-            auto cpu_packed = ensure_cpu_pinned_long(ws_cpu_fft_idx_packed_, 4 * nt);
+            auto cpu_packed = ensure_cpu_pinned_long(ws.ws_cpu_fft_idx_packed_, 4 * nt);
             int64_t* p = cpu_packed.data_ptr<int64_t>();
             // grid_idx is already int64
             std::memcpy(p, test_grid_indices.data(), static_cast<size_t>(nt) * sizeof(int64_t));
@@ -926,7 +935,7 @@ private:
             auto part_w_t = all_w_t.narrow(0, chunk_start, chunk_n);
 
             const int fft_size = H * ((W / 2) + 1);
-            auto product_flat = ensure_workspace_cfloat(ws_fused_product_, static_cast<int64_t>(chunk_n) * fft_size);
+            auto product_flat = ensure_workspace_cfloat(ws.ws_fused_product_, static_cast<int64_t>(chunk_n) * fft_size);
             auto product = product_flat.view({chunk_n, H, (W / 2) + 1});
             if (grid_ffts.is_cuda()) {
                 native_fused_gather_multiply(
@@ -977,9 +986,9 @@ private:
                 torch::Tensor col_cpu_i32;
 
                 if (use_cuda_selector_kernel_ && overlap_batch.is_cuda()) {
-                    auto out_has_t = ensure_workspace_i32(ws_sel_has_i32_, chunk_n);
-                    auto out_row_t = ensure_workspace_i32(ws_sel_row_i32_, chunk_n);
-                    auto out_col_t = ensure_workspace_i32(ws_sel_col_i32_, chunk_n);
+                    auto out_has_t = ensure_workspace_i32(ws.ws_sel_has_i32_, chunk_n);
+                    auto out_row_t = ensure_workspace_i32(ws.ws_sel_row_i32_, chunk_n);
+                    auto out_col_t = ensure_workspace_i32(ws.ws_sel_col_i32_, chunk_n);
                     auto overlap_contig = overlap_batch.contiguous();
                     auto part_h_contig = part_h_t.contiguous();
                     auto part_w_contig = part_w_t.contiguous();
@@ -1147,6 +1156,7 @@ private:
         int num_solutions,
         int machine_idx
     ) {
+        MachineWorkspace& ws = workspaces_[static_cast<size_t>(machine_idx)];
         const int H = machine_bin_length_[static_cast<size_t>(machine_idx)];
         const int W = machine_bin_width_[static_cast<size_t>(machine_idx)];
         const double bin_area = machine_bin_area_[static_cast<size_t>(machine_idx)];
@@ -1203,7 +1213,7 @@ private:
         );
         // Vacancy GPU buffer: one row per open bin slot, length H each.
         // Filled lazily via dirty flags before Phase 3 each wave.
-        ws_vacancy_gpu_ = torch::empty(
+        ws.ws_vacancy_gpu_ = torch::empty(
             {max_total_bins, H},
             torch::TensorOptions().dtype(torch::kInt32).device(device_)
         );
@@ -1215,19 +1225,19 @@ private:
 
         const int max_waves = max_seq_len * 3;
         for (int wave = 0; wave < max_waves; ++wave) {
-            scratch_active_.clear();
-            scratch_active_.reserve(static_cast<size_t>(num_solutions));
+            ws.scratch_active_.clear();
+            ws.scratch_active_.reserve(static_cast<size_t>(num_solutions));
             for (int i = 0; i < num_solutions; ++i) {
                 auto& ctx = contexts[static_cast<size_t>(i)];
                 if (!ctx.is_done && ctx.is_feasible) {
-                    scratch_active_.push_back(i);
+                    ws.scratch_active_.push_back(i);
                 }
             }
-            if (scratch_active_.empty()) {
+            if (ws.scratch_active_.empty()) {
                 break;
             }
-            process_wave(scratch_active_, contexts, machine_idx, max_total_bins, H, W,
-                         grid_states, grid_ffts, row_idx, col_idx, row_idx_f, col_idx_f, neg_inf);
+            process_wave(ws.scratch_active_, contexts, machine_idx, max_total_bins, H, W,
+                         grid_states, grid_ffts, row_idx, col_idx, row_idx_f, col_idx_f, neg_inf, ws);
         }
 
         std::vector<double> makespans(static_cast<size_t>(num_solutions), 0.0);
@@ -1250,21 +1260,21 @@ private:
     }
 
     // Evaluate vacancy checks for all (bin, rotation) pairs on GPU.
-    // Returns a bool pass/fail for each pair via scratch_pass_.
-    void run_gpu_vacancy_check(int n_pairs, int H) {
-        scratch_pass_.assign(static_cast<size_t>(n_pairs), 0);
+    // Returns a bool pass/fail for each pair via ws.scratch_pass_.
+    void run_gpu_vacancy_check(int n_pairs, int H, MachineWorkspace& ws) {
+        ws.scratch_pass_.assign(static_cast<size_t>(n_pairs), 0);
         if (n_pairs == 0) return;
         const int64_t np = static_cast<int64_t>(n_pairs);
 
         // Transfer pair arrays CPU→GPU in one packed buffer.
         // Layout: vac_row[n] | den_off[n] | den_len[n]
-        auto cpu_pairs = ensure_cpu_pinned_i32(ws_cpu_pair_buf_, 3 * np);
+        auto cpu_pairs = ensure_cpu_pinned_i32(ws.ws_cpu_pair_buf_, 3 * np);
         int32_t* pp = cpu_pairs.data_ptr<int32_t>();
-        std::memcpy(pp,           scratch_pair_vac_row_.data(), static_cast<size_t>(np) * sizeof(int32_t));
-        std::memcpy(pp + np,      scratch_pair_den_off_.data(), static_cast<size_t>(np) * sizeof(int32_t));
-        std::memcpy(pp + 2 * np,  scratch_pair_den_len_.data(), static_cast<size_t>(np) * sizeof(int32_t));
+        std::memcpy(pp,           ws.scratch_pair_vac_row_.data(), static_cast<size_t>(np) * sizeof(int32_t));
+        std::memcpy(pp + np,      ws.scratch_pair_den_off_.data(), static_cast<size_t>(np) * sizeof(int32_t));
+        std::memcpy(pp + 2 * np,  ws.scratch_pair_den_len_.data(), static_cast<size_t>(np) * sizeof(int32_t));
 
-        auto gpu_pairs = ensure_workspace_i32(ws_vac_pairs_gpu_, 3 * np);
+        auto gpu_pairs = ensure_workspace_i32(ws.ws_vac_pairs_gpu_, 3 * np);
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_vup_t0 = PROF_NOW();
 #endif
@@ -1276,15 +1286,15 @@ private:
         auto gpu_den_off = gpu_pairs.narrow(0, np,      np);
         auto gpu_den_len = gpu_pairs.narrow(0, 2 * np,  np);
 
-        auto gpu_out = ensure_workspace_i8(ws_vac_out_pass_, np);
+        auto gpu_out = ensure_workspace_i8(ws.ws_vac_out_pass_, np);
         native_batch_vacancy_check(
-            ws_vacancy_gpu_, density_flat_gpu_,
+            ws.ws_vacancy_gpu_, density_flat_gpu_,
             gpu_vac_row, gpu_den_off, gpu_den_len,
             gpu_out, H
         );
 
         // Readback result (small: one int8 per pair).
-        auto cpu_pass = ensure_cpu_pinned_i8(ws_cpu_pass_buf_, np);
+        auto cpu_pass = ensure_cpu_pinned_i8(ws.ws_cpu_pass_buf_, np);
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_vrb_t0 = PROF_NOW();
 #endif
@@ -1294,7 +1304,7 @@ private:
         g_profile.vac_call_count += 1;
 #endif
         const int8_t* pass_ptr = cpu_pass.data_ptr<int8_t>();
-        scratch_pass_.assign(pass_ptr, pass_ptr + n_pairs);
+        ws.scratch_pass_.assign(pass_ptr, pass_ptr + n_pairs);
     }
 
     void process_wave(
@@ -1310,16 +1320,17 @@ private:
         const torch::Tensor& col_idx,
         const torch::Tensor& row_idx_f,
         const torch::Tensor& col_idx_f,
-        const torch::Tensor& neg_inf
+        const torch::Tensor& neg_inf,
+        MachineWorkspace& ws
     ) {
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_wave_t0 = PROF_NOW();
         g_profile.wave_count += 1;
 #endif
-        scratch_ctx_global_.clear();
-        scratch_part_idx_local_.clear();
-        scratch_ctx_global_.reserve(active_indices.size());
-        scratch_part_idx_local_.reserve(active_indices.size());
+        ws.scratch_ctx_global_.clear();
+        ws.scratch_part_idx_local_.clear();
+        ws.scratch_ctx_global_.reserve(active_indices.size());
+        ws.scratch_part_idx_local_.reserve(active_indices.size());
 
         for (int gidx : active_indices) {
             auto& ctx = contexts[static_cast<size_t>(gidx)];
@@ -1335,23 +1346,23 @@ private:
                 ctx.is_feasible = false;
                 continue;
             }
-            scratch_ctx_global_.push_back(gidx);
-            scratch_part_idx_local_.push_back(part_idx);
+            ws.scratch_ctx_global_.push_back(gidx);
+            ws.scratch_part_idx_local_.push_back(part_idx);
         }
 
-        const int n_contexts = static_cast<int>(scratch_ctx_global_.size());
+        const int n_contexts = static_cast<int>(ws.scratch_ctx_global_.size());
         if (n_contexts == 0) {
             return;
         }
 
-        scratch_invalid_grid_indices_.clear();
-        scratch_invalid_bins_.clear();
+        ws.scratch_invalid_grid_indices_.clear();
+        ws.scratch_invalid_bins_.clear();
         for (int lc = 0; lc < n_contexts; ++lc) {
-            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
+            auto& ctx = contexts[static_cast<size_t>(ws.scratch_ctx_global_[static_cast<size_t>(lc)])];
             for (auto& b : ctx.open_bins) {
                 if (!b.grid_fft_valid) {
-                    scratch_invalid_grid_indices_.push_back(static_cast<int64_t>(b.grid_state_idx));
-                    scratch_invalid_bins_.push_back(&b);
+                    ws.scratch_invalid_grid_indices_.push_back(static_cast<int64_t>(b.grid_state_idx));
+                    ws.scratch_invalid_bins_.push_back(&b);
                 }
             }
         }
@@ -1359,11 +1370,11 @@ private:
         g_profile.phase1_active_ns += PROF_NS_SINCE(_prof_wave_t0);
         auto _prof_rfft2_t0 = PROF_NOW();
 #endif
-        if (!scratch_invalid_grid_indices_.empty()) {
-            const int64_t N = static_cast<int64_t>(scratch_invalid_grid_indices_.size());
+        if (!ws.scratch_invalid_grid_indices_.empty()) {
+            const int64_t N = static_cast<int64_t>(ws.scratch_invalid_grid_indices_.size());
             auto idx_t = load_workspace_long_from_i64(
-                ws_wave_idx_long_, ws_cpu_wave_idx_,
-                scratch_invalid_grid_indices_, N
+                ws.ws_wave_idx_long_, ws.ws_cpu_wave_idx_,
+                ws.scratch_invalid_grid_indices_, N
             );
             torch::Tensor batch_grids;
             if (grid_states.is_cuda()) {
@@ -1373,7 +1384,7 @@ private:
                 const int H_ = static_cast<int>(grid_states.size(1));
                 const int W_ = static_cast<int>(grid_states.size(2));
                 auto gather_flat = ensure_workspace_float(
-                    ws_gather_out_float_, N * H_ * W_
+                    ws.ws_gather_out_float_, N * H_ * W_
                 );
                 native_gather_grids(grid_states, idx_t, gather_flat,
                                     static_cast<int>(N), H_, W_);
@@ -1390,7 +1401,7 @@ private:
             } else {
                 grid_ffts.index_copy_(0, idx_t, batch_ffts);
             }
-            for (auto* b : scratch_invalid_bins_) {
+            for (auto* b : ws.scratch_invalid_bins_) {
                 b->grid_fft_valid = true;
             }
         }
@@ -1400,8 +1411,8 @@ private:
 
         // Vacancy is now maintained on GPU — no flush needed.
 
-        scratch_ctx_first_valid_bin_.assign(static_cast<size_t>(n_contexts), -1);
-        auto& p1 = scratch_p1_;
+        ws.scratch_ctx_first_valid_bin_.assign(static_cast<size_t>(n_contexts), -1);
+        auto& p1 = ws.scratch_p1_;
         p1.grid_indices.clear();
         p1.heights.clear();
         p1.widths.clear();
@@ -1425,16 +1436,16 @@ private:
         std::vector<P1Pair> p1_pairs;
         p1_pairs.reserve(static_cast<size_t>(n_contexts) * 4);
 
-        scratch_pair_vac_row_.clear();
-        scratch_pair_den_off_.clear();
-        scratch_pair_den_len_.clear();
+        ws.scratch_pair_vac_row_.clear();
+        ws.scratch_pair_den_off_.clear();
+        ws.scratch_pair_den_len_.clear();
 
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_passA_t0 = PROF_NOW();
 #endif
         for (int lc = 0; lc < n_contexts; ++lc) {
-            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
-            const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
+            auto& ctx = contexts[static_cast<size_t>(ws.scratch_ctx_global_[static_cast<size_t>(lc)])];
+            const int part_idx = ws.scratch_part_idx_local_[static_cast<size_t>(lc)];
             const double p_area = part_area_[static_cast<size_t>(part_idx)];
             const int nrot = part_nrot_[static_cast<size_t>(part_idx)];
             const int r0 = part_rot_offsets_[static_cast<size_t>(part_idx)];
@@ -1454,9 +1465,9 @@ private:
                     const int d0 = rot_density_offsets_[static_cast<size_t>(rg)];
                     const int d1 = rot_density_offsets_[static_cast<size_t>(rg + 1)];
                     p1_pairs.push_back({lc, bidx, rg, p_area});
-                    scratch_pair_vac_row_.push_back(static_cast<int32_t>(b.grid_state_idx));
-                    scratch_pair_den_off_.push_back(static_cast<int32_t>(d0));
-                    scratch_pair_den_len_.push_back(static_cast<int32_t>(d1 - d0));
+                    ws.scratch_pair_vac_row_.push_back(static_cast<int32_t>(b.grid_state_idx));
+                    ws.scratch_pair_den_off_.push_back(static_cast<int32_t>(d0));
+                    ws.scratch_pair_den_len_.push_back(static_cast<int32_t>(d1 - d0));
                 }
             }
         }
@@ -1469,7 +1480,7 @@ private:
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_passB_t0 = PROF_NOW();
 #endif
-        run_gpu_vacancy_check(n_p1_pairs, H);
+        run_gpu_vacancy_check(n_p1_pairs, H, ws);
 #if PROFILE_CPU_HOTSPOTS
         g_profile.p3_pass_b_wait_ns += PROF_NS_SINCE(_prof_passB_t0);
 #endif
@@ -1479,30 +1490,30 @@ private:
         auto _prof_passC_t0 = PROF_NOW();
 #endif
         for (int lc = 0; lc < n_contexts; ++lc) {
-            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
-            const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
+            auto& ctx = contexts[static_cast<size_t>(ws.scratch_ctx_global_[static_cast<size_t>(lc)])];
+            const int part_idx = ws.scratch_part_idx_local_[static_cast<size_t>(lc)];
             const double p_area = part_area_[static_cast<size_t>(part_idx)];
-            scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)] = -1;
+            ws.scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)] = -1;
         }
         for (int pi = 0; pi < n_p1_pairs; ++pi) {
-            if (!scratch_pass_[static_cast<size_t>(pi)]) continue;
+            if (!ws.scratch_pass_[static_cast<size_t>(pi)]) continue;
             const auto& pair = p1_pairs[static_cast<size_t>(pi)];
             const int lc = pair.lc;
             const int bidx = pair.bidx;
             const int rg = pair.rg;
             const double p_area = pair.p_area;
             // Enforce first-valid-bin: only add tests for bidx <= current first_valid
-            const int first_valid = scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)];
+            const int first_valid = ws.scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)];
             if (first_valid >= 0 && bidx > first_valid) {
                 continue;  // already found a better bin
             }
-            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
+            auto& ctx = contexts[static_cast<size_t>(ws.scratch_ctx_global_[static_cast<size_t>(lc)])];
             auto& b = ctx.open_bins[static_cast<size_t>(bidx)];
             if (first_valid < 0 || bidx < first_valid) {
                 // New first-valid bin for this context: drop any p1 tests from later bins
                 // that may have slipped in from previous pairs (shouldn't happen since we
                 // iterate pairs in (lc, bidx, rot) order, but guard for safety).
-                scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)] = bidx;
+                ws.scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)] = bidx;
             }
             p1.grid_indices.push_back(static_cast<int64_t>(b.grid_state_idx));
             p1.heights.push_back(rot_h_[static_cast<size_t>(rg)]);
@@ -1524,17 +1535,17 @@ private:
             static_cast<int>(p1.grid_indices.size()),
             p1.grid_indices, p1.rot_global, p1.heights, p1.widths,
             p1.bin_indices, p1.enclosure_lengths, p1.bin_areas, p1.part_areas,
-            machine_idx, grid_ffts, H, W, row_idx, col_idx, row_idx_f, col_idx_f, neg_inf, scratch_fft_p1_
+            machine_idx, grid_ffts, H, W, row_idx, col_idx, row_idx_f, col_idx_f, neg_inf, ws.scratch_fft_p1_, ws
         );
 #if PROFILE_CPU_HOTSPOTS
         g_profile.phase4_p1_fft_ns += PROF_NS_SINCE(_prof_p4p1_t0);
 #endif
 
-        scratch_ctx_p1_hit_.assign(static_cast<size_t>(n_contexts), 0);
+        ws.scratch_ctx_p1_hit_.assign(static_cast<size_t>(n_contexts), 0);
         for (size_t i = 0; i < p1.ctx_local.size(); ++i) {
-            if (scratch_fft_p1_.has_result[i]) {
+            if (ws.scratch_fft_p1_.has_result[i]) {
                 const int lc = p1.ctx_local[i];
-                scratch_ctx_p1_hit_[static_cast<size_t>(lc)] = 1;
+                ws.scratch_ctx_p1_hit_[static_cast<size_t>(lc)] = 1;
             }
         }
 
@@ -1542,7 +1553,7 @@ private:
         auto _prof_p3p2_t0 = PROF_NOW();
 #endif
         // ── Phase 3 p2: GPU vacancy check ──────────────────────────────────────
-        auto& p2 = scratch_p2_;
+        auto& p2 = ws.scratch_p2_;
         p2.grid_indices.clear();
         p2.heights.clear();
         p2.widths.clear();
@@ -1561,20 +1572,20 @@ private:
         std::vector<P2Pair> p2_pairs;
         p2_pairs.reserve(32);
 
-        scratch_pair_vac_row_.clear();
-        scratch_pair_den_off_.clear();
-        scratch_pair_den_len_.clear();
+        ws.scratch_pair_vac_row_.clear();
+        ws.scratch_pair_den_off_.clear();
+        ws.scratch_pair_den_len_.clear();
 
         for (int lc = 0; lc < n_contexts; ++lc) {
-            if (scratch_ctx_p1_hit_[static_cast<size_t>(lc)]) {
+            if (ws.scratch_ctx_p1_hit_[static_cast<size_t>(lc)]) {
                 continue;
             }
-            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
-            const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
+            auto& ctx = contexts[static_cast<size_t>(ws.scratch_ctx_global_[static_cast<size_t>(lc)])];
+            const int part_idx = ws.scratch_part_idx_local_[static_cast<size_t>(lc)];
             const double p_area = part_area_[static_cast<size_t>(part_idx)];
             const int nrot = part_nrot_[static_cast<size_t>(part_idx)];
             const int r0 = part_rot_offsets_[static_cast<size_t>(part_idx)];
-            const int first_valid = scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)];
+            const int first_valid = ws.scratch_ctx_first_valid_bin_[static_cast<size_t>(lc)];
 
             for (int bidx = 0; bidx < static_cast<int>(ctx.open_bins.size()); ++bidx) {
                 if (bidx == first_valid) {
@@ -1594,24 +1605,24 @@ private:
                     const int d0 = rot_density_offsets_[static_cast<size_t>(rg)];
                     const int d1 = rot_density_offsets_[static_cast<size_t>(rg + 1)];
                     p2_pairs.push_back({lc, bidx, rg, p_area});
-                    scratch_pair_vac_row_.push_back(static_cast<int32_t>(b.grid_state_idx));
-                    scratch_pair_den_off_.push_back(static_cast<int32_t>(d0));
-                    scratch_pair_den_len_.push_back(static_cast<int32_t>(d1 - d0));
+                    ws.scratch_pair_vac_row_.push_back(static_cast<int32_t>(b.grid_state_idx));
+                    ws.scratch_pair_den_off_.push_back(static_cast<int32_t>(d0));
+                    ws.scratch_pair_den_len_.push_back(static_cast<int32_t>(d1 - d0));
                 }
             }
         }
 
         const int n_p2_pairs = static_cast<int>(p2_pairs.size());
-        run_gpu_vacancy_check(n_p2_pairs, H);
+        run_gpu_vacancy_check(n_p2_pairs, H, ws);
 
         for (int pi = 0; pi < n_p2_pairs; ++pi) {
-            if (!scratch_pass_[static_cast<size_t>(pi)]) continue;
+            if (!ws.scratch_pass_[static_cast<size_t>(pi)]) continue;
             const auto& pair = p2_pairs[static_cast<size_t>(pi)];
             const int lc = pair.lc;
             const int bidx = pair.bidx;
             const int rg = pair.rg;
             const double p_area = pair.p_area;
-            auto& ctx = contexts[static_cast<size_t>(scratch_ctx_global_[static_cast<size_t>(lc)])];
+            auto& ctx = contexts[static_cast<size_t>(ws.scratch_ctx_global_[static_cast<size_t>(lc)])];
             auto& b = ctx.open_bins[static_cast<size_t>(bidx)];
             p2.grid_indices.push_back(static_cast<int64_t>(b.grid_state_idx));
             p2.heights.push_back(rot_h_[static_cast<size_t>(rg)]);
@@ -1633,24 +1644,24 @@ private:
             static_cast<int>(p2.grid_indices.size()),
             p2.grid_indices, p2.rot_global, p2.heights, p2.widths,
             p2.bin_indices, p2.enclosure_lengths, p2.bin_areas, p2.part_areas,
-            machine_idx, grid_ffts, H, W, row_idx, col_idx, row_idx_f, col_idx_f, neg_inf, scratch_fft_p2_
+            machine_idx, grid_ffts, H, W, row_idx, col_idx, row_idx_f, col_idx_f, neg_inf, ws.scratch_fft_p2_, ws
         );
 #if PROFILE_CPU_HOTSPOTS
         g_profile.phase4_p2_fft_ns += PROF_NS_SINCE(_prof_p4p2_t0);
         auto _prof_p5_t0 = PROF_NOW();
 #endif
 
-        auto& test_ctx_local = scratch_test_ctx_local_;
-        auto& test_bin_local = scratch_test_bin_local_;
-        auto& test_rot_global = scratch_test_rot_global_;
-        auto& placement_has = scratch_placement_has_;
-        auto& placement_cols = scratch_placement_cols_;
-        auto& placement_rows = scratch_placement_rows_;
-        auto& sc_bin_indices = scratch_sc_bin_indices_;
-        auto& sc_densities = scratch_sc_densities_;
-        auto& sc_rows = scratch_sc_rows_;
-        auto& sc_cols = scratch_sc_cols_;
-        auto& sc_valid = scratch_sc_valid_;
+        auto& test_ctx_local = ws.scratch_test_ctx_local_;
+        auto& test_bin_local = ws.scratch_test_bin_local_;
+        auto& test_rot_global = ws.scratch_test_rot_global_;
+        auto& placement_has = ws.scratch_placement_has_;
+        auto& placement_cols = ws.scratch_placement_cols_;
+        auto& placement_rows = ws.scratch_placement_rows_;
+        auto& sc_bin_indices = ws.scratch_sc_bin_indices_;
+        auto& sc_densities = ws.scratch_sc_densities_;
+        auto& sc_rows = ws.scratch_sc_rows_;
+        auto& sc_cols = ws.scratch_sc_cols_;
+        auto& sc_valid = ws.scratch_sc_valid_;
 
         test_ctx_local.clear();
         test_bin_local.clear();
@@ -1695,15 +1706,15 @@ private:
                 sc_valid.push_back(f.sc_valid[i]);
             }
         };
-        append_tests(p1, scratch_fft_p1_);
-        append_tests(p2, scratch_fft_p2_);
+        append_tests(p1, ws.scratch_fft_p1_);
+        append_tests(p2, ws.scratch_fft_p2_);
 
-        auto& best_ti = scratch_best_ti_;
-        auto& has_best = scratch_has_best_;
-        auto& best_neg_bin = scratch_best_neg_bin_;
-        auto& best_density = scratch_best_density_;
-        auto& best_row = scratch_best_row_;
-        auto& best_neg_col = scratch_best_neg_col_;
+        auto& best_ti = ws.scratch_best_ti_;
+        auto& has_best = ws.scratch_has_best_;
+        auto& best_neg_bin = ws.scratch_best_neg_bin_;
+        auto& best_density = ws.scratch_best_density_;
+        auto& best_row = ws.scratch_best_row_;
+        auto& best_neg_col = ws.scratch_best_neg_col_;
         best_ti.assign(static_cast<size_t>(n_contexts), -1);
         has_best.assign(static_cast<size_t>(n_contexts), 0);
         best_neg_bin.assign(static_cast<size_t>(n_contexts), 0.0);
@@ -1733,11 +1744,11 @@ private:
             }
         }
 
-        auto& place_ctx_local = scratch_place_ctx_local_;
-        auto& place_ti = scratch_place_ti_;
-        auto& place_rows = scratch_place_rows_;
-        auto& place_cols = scratch_place_cols_;
-        auto& newbin_ctx_local = scratch_newbin_ctx_local_;
+        auto& place_ctx_local = ws.scratch_place_ctx_local_;
+        auto& place_ti = ws.scratch_place_ti_;
+        auto& place_rows = ws.scratch_place_rows_;
+        auto& place_cols = ws.scratch_place_cols_;
+        auto& newbin_ctx_local = ws.scratch_newbin_ctx_local_;
         place_ctx_local.clear();
         place_ti.clear();
         place_rows.clear();
@@ -1761,14 +1772,14 @@ private:
             }
         }
 
-        auto& gpu_updates = scratch_gpu_updates_;
+        auto& gpu_updates = ws.scratch_gpu_updates_;
         gpu_updates.clear();
         gpu_updates.reserve(place_ctx_local.size());
 
         for (size_t i = 0; i < place_ctx_local.size(); ++i) {
             const int lc = place_ctx_local[i];
-            const int ctx_g = scratch_ctx_global_[static_cast<size_t>(lc)];
-            const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
+            const int ctx_g = ws.scratch_ctx_global_[static_cast<size_t>(lc)];
+            const int part_idx = ws.scratch_part_idx_local_[static_cast<size_t>(lc)];
             const int ti = place_ti[i];
             const int row = place_rows[i];
             const int col = place_cols[i];
@@ -1799,15 +1810,15 @@ private:
         auto _prof_gpu_upd_t0 = PROF_NOW();
 #endif
         if (!gpu_updates.empty()) {
-            apply_gpu_updates(grid_states, gpu_updates, H, W);
-            recompute_vacancy_gpu(grid_states, gpu_updates, H, W);
+            apply_gpu_updates(grid_states, gpu_updates, H, W, ws);
+            recompute_vacancy_gpu(grid_states, gpu_updates, H, W, ws);
         }
 #if PROFILE_CPU_HOTSPOTS
         g_profile.phase5_gpu_update_ns += PROF_NS_SINCE(_prof_gpu_upd_t0);
 #endif
 
-        auto& phase6_gpu_updates = scratch_phase6_gpu_updates_;
-        auto& phase6_grid_indices = scratch_phase6_grid_indices_;
+        auto& phase6_gpu_updates = ws.scratch_phase6_gpu_updates_;
+        auto& phase6_grid_indices = ws.scratch_phase6_grid_indices_;
         phase6_gpu_updates.clear();
         phase6_grid_indices.clear();
         phase6_gpu_updates.reserve(newbin_ctx_local.size());
@@ -1816,8 +1827,8 @@ private:
         auto _prof_phase6_t0 = PROF_NOW();
 #endif
         for (int lc : newbin_ctx_local) {
-            const int ctx_g = scratch_ctx_global_[static_cast<size_t>(lc)];
-            const int part_idx = scratch_part_idx_local_[static_cast<size_t>(lc)];
+            const int ctx_g = ws.scratch_ctx_global_[static_cast<size_t>(lc)];
+            const int part_idx = ws.scratch_part_idx_local_[static_cast<size_t>(lc)];
             auto& ctx = contexts[static_cast<size_t>(ctx_g)];
 
             const int grid_idx = ctx.next_grid_idx;
@@ -1873,16 +1884,16 @@ private:
 
         if (!phase6_gpu_updates.empty()) {
             auto idx_t = load_workspace_long_from_i64(
-                ws_wave_idx_long_, ws_cpu_wave_idx_,
+                ws.ws_wave_idx_long_, ws.ws_cpu_wave_idx_,
                 phase6_grid_indices,
                 static_cast<int64_t>(phase6_grid_indices.size())
             );
             grid_states.index_fill_(0, idx_t, 0.0);
             // Initialize vacancy for new bins: all rows = W (empty grid).
-            ws_vacancy_gpu_.index_fill_(0, idx_t, static_cast<int32_t>(W));
-            apply_gpu_updates(grid_states, phase6_gpu_updates, H, W);
+            ws.ws_vacancy_gpu_.index_fill_(0, idx_t, static_cast<int32_t>(W));
+            apply_gpu_updates(grid_states, phase6_gpu_updates, H, W, ws);
             // Recompute vacancy for the rows where parts were placed.
-            recompute_vacancy_gpu(grid_states, phase6_gpu_updates, H, W);
+            recompute_vacancy_gpu(grid_states, phase6_gpu_updates, H, W, ws);
         }
 #if PROFILE_CPU_HOTSPOTS
         g_profile.total_wave_ns += PROF_NS_SINCE(_prof_wave_t0);
@@ -1890,12 +1901,13 @@ private:
     }
 
     // Recompute vacancy rows on GPU for affected (grid_idx, row) pairs.
-    // Called after apply_gpu_updates to keep ws_vacancy_gpu_ in sync.
+    // Called after apply_gpu_updates to keep ws.ws_vacancy_gpu_ in sync.
     template <typename PlacementVec>
     void recompute_vacancy_gpu(
         torch::Tensor& grid_states,
         const PlacementVec& updates,
-        int H, int W
+        int H, int W,
+        MachineWorkspace& ws
     ) {
         int total_rows = 0;
         for (const auto& u : updates) {
@@ -1904,7 +1916,7 @@ private:
         if (total_rows <= 0) return;
 
         const int64_t n = static_cast<int64_t>(total_rows);
-        auto cpu_packed = ensure_cpu_pinned_i32(ws_cpu_vacancy_recompute_, 2 * n);
+        auto cpu_packed = ensure_cpu_pinned_i32(ws.ws_cpu_vacancy_recompute_, 2 * n);
         int32_t* p = cpu_packed.data_ptr<int32_t>();
         int off = 0;
         for (const auto& u : updates) {
@@ -1915,13 +1927,13 @@ private:
             }
         }
 
-        auto gpu_packed = ensure_workspace_i32(ws_gpu_vacancy_recompute_, 2 * n);
+        auto gpu_packed = ensure_workspace_i32(ws.ws_gpu_vacancy_recompute_, 2 * n);
         gpu_packed.copy_(cpu_packed, /*non_blocking=*/true);
         auto grid_idxs_t = gpu_packed.narrow(0, 0, n);
         auto row_idxs_t  = gpu_packed.narrow(0, n, n);
 
         native_compute_vacancy_rows(
-            grid_states, ws_vacancy_gpu_, grid_idxs_t, row_idxs_t, H, W, total_rows
+            grid_states, ws.ws_vacancy_gpu_, grid_idxs_t, row_idxs_t, H, W, total_rows
         );
     }
 
@@ -1930,7 +1942,8 @@ private:
         torch::Tensor& grid_states,
         const PlacementVec& updates,
         int H,
-        int W
+        int W,
+        MachineWorkspace& ws
     ) {
         const int n = static_cast<int>(updates.size());
         if (n <= 0) {
@@ -1948,12 +1961,12 @@ private:
             return;
         }
 
-        auto& cell_offsets = scratch_cell_offsets_;
-        auto& grid_idxs = scratch_grid_idxs_;
-        auto& y_starts = scratch_y_starts_;
-        auto& x_starts = scratch_x_starts_;
-        auto& part_widths = scratch_part_widths_;
-        auto& part_offsets = scratch_part_offsets_;
+        auto& cell_offsets = ws.scratch_cell_offsets_;
+        auto& grid_idxs = ws.scratch_grid_idxs_;
+        auto& y_starts = ws.scratch_y_starts_;
+        auto& x_starts = ws.scratch_x_starts_;
+        auto& part_widths = ws.scratch_part_widths_;
+        auto& part_offsets = ws.scratch_part_offsets_;
         cell_offsets.assign(static_cast<size_t>(n + 1), 0);
         grid_idxs.resize(static_cast<size_t>(n));
         y_starts.resize(static_cast<size_t>(n));
@@ -1981,9 +1994,9 @@ private:
         // in a single pinned→GPU copy_ call.  Layout (int32):
         //   cell_offsets[n+1] | grid_idxs[n] | y_starts[n] | x_starts[n] | part_widths[n] | part_offsets[n]
         const int64_t packed_len = static_cast<int64_t>(n + 1) + 5 * static_cast<int64_t>(n);
-        auto gpu_packed = ensure_workspace_i32(ws_gpu_update_packed_, packed_len);
+        auto gpu_packed = ensure_workspace_i32(ws.ws_gpu_update_packed_, packed_len);
         {
-            auto cpu_packed = ensure_cpu_pinned_i32(ws_cpu_gpu_update_packed_, packed_len);
+            auto cpu_packed = ensure_cpu_pinned_i32(ws.ws_cpu_gpu_update_packed_, packed_len);
             int32_t* p = cpu_packed.data_ptr<int32_t>();
             int64_t off = 0;
             std::memcpy(p + off, cell_offsets.data(), static_cast<size_t>(n + 1) * sizeof(int32_t)); off += n + 1;
