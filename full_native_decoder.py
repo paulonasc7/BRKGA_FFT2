@@ -784,7 +784,7 @@ private:
         if (n > 0) {
             auto pinned = ensure_cpu_pinned_long(cpu_pinned_ws, n);
             std::memcpy(pinned.data_ptr<int64_t>(), src.data(), static_cast<size_t>(n) * sizeof(int64_t));
-            out.copy_(pinned, /*non_blocking=*/true);
+            out.copy_(pinned, /*non_blocking=*/false);
         }
         return out;
     }
@@ -802,7 +802,7 @@ private:
             for (int64_t i = 0; i < n; ++i) {
                 dst[i] = static_cast<int64_t>(src[static_cast<size_t>(i)]);
             }
-            out.copy_(pinned, /*non_blocking=*/true);
+            out.copy_(pinned, /*non_blocking=*/false);
         }
         return out;
     }
@@ -817,7 +817,7 @@ private:
         if (n > 0) {
             auto pinned = ensure_cpu_pinned_i32(cpu_pinned_ws, n);
             std::memcpy(pinned.data_ptr<int32_t>(), src.data(), static_cast<size_t>(n) * sizeof(int32_t));
-            out.copy_(pinned, /*non_blocking=*/true);
+            out.copy_(pinned, /*non_blocking=*/false);
         }
         return out;
     }
@@ -917,7 +917,7 @@ private:
                 dst_h[i]   = static_cast<int64_t>(test_heights[static_cast<size_t>(i)]);
                 dst_w[i]   = static_cast<int64_t>(test_widths[static_cast<size_t>(i)]);
             }
-            gpu_fft_packed.copy_(cpu_packed, /*non_blocking=*/true);
+            gpu_fft_packed.copy_(cpu_packed, /*non_blocking=*/false);
         }
         auto all_grid_idx_t = gpu_fft_packed.narrow(0, 0,      nt);
         auto all_rot_idx_t  = gpu_fft_packed.narrow(0, nt,     nt);
@@ -1278,7 +1278,7 @@ private:
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_vup_t0 = PROF_NOW();
 #endif
-        gpu_pairs.copy_(cpu_pairs, /*non_blocking=*/true);  // pinned→GPU on default stream; ordered before kernel
+        gpu_pairs.copy_(cpu_pairs, /*non_blocking=*/false);  // pinned→GPU on default stream; ordered before kernel
 #if PROFILE_CPU_HOTSPOTS
         g_profile.vac_upload_sync_ns += PROF_NS_SINCE(_prof_vup_t0);
 #endif
@@ -1928,7 +1928,7 @@ private:
         }
 
         auto gpu_packed = ensure_workspace_i32(ws.ws_gpu_vacancy_recompute_, 2 * n);
-        gpu_packed.copy_(cpu_packed, /*non_blocking=*/true);
+        gpu_packed.copy_(cpu_packed, /*non_blocking=*/false);
         auto grid_idxs_t = gpu_packed.narrow(0, 0, n);
         auto row_idxs_t  = gpu_packed.narrow(0, n, n);
 
@@ -2005,7 +2005,7 @@ private:
             std::memcpy(p + off, x_starts.data(),      static_cast<size_t>(n)     * sizeof(int32_t)); off += n;
             std::memcpy(p + off, part_widths.data(),   static_cast<size_t>(n)     * sizeof(int32_t)); off += n;
             std::memcpy(p + off, part_offsets.data(),  static_cast<size_t>(n)     * sizeof(int32_t));
-            gpu_packed.copy_(cpu_packed, /*non_blocking=*/true);
+            gpu_packed.copy_(cpu_packed, /*non_blocking=*/false);
         }
         int64_t off = 0;
         auto cell_offsets_t = gpu_packed.narrow(0, off, n + 1); off += n + 1;

@@ -320,8 +320,101 @@ Following items are discussed elsewhere and not part of this plan:
 
 | Stage | Status | Commit | Notes |
 |-------|--------|--------|-------|
-| 1 — MachineWorkspace refactor | Not started | — | Plumbing only, no behavior change |
-| 2 — Sparse grid allocation | Not started | — | Depends on Stage 1 |
+| 1 — MachineWorkspace refactor | **Done** | `9a4441f` | Plumbing only, no behavior change |
+| 2 — Sparse grid allocation | **Attempted, reverted** | — | See "Stage 2 attempt — findings" below |
 | 3 — Parallel machines | Not started | — | Depends on Stages 1 & 2 |
 
-Update this table as each stage lands.
+---
+
+## Stage 2 attempt — findings (2026-04-20)
+
+Implemented full sparse allocation (bump counter + 2× growth fallback +
+smaller initial `EXPECTED_AVG_BINS=16` cap).  Validated via
+`profile_cpu_hotspots.py 50 2 0 torch_gpu 5` (seed 123, 5 reps — fingerprint
+is first 5 makespans of the last rep).
+
+### What went wrong
+
+1. **Fingerprint divergence even for behavior-equivalent variants.**
+   Preserving the exact old slot formula (`ctx.next_grid_idx = s *
+   max_bins_per_sol`) while additionally tracking `ws.global_next_slot_` as a
+   high-water observer also diverged.  This suggests the slot *layout* in
+   `grid_states`/`grid_ffts` is not as opaque as expected — something
+   downstream (Phase 3/4/5) produces different fitness values when
+   grid-state indices differ, even though every direct use appears to be
+   `index_select`/`index_copy_`.  Need to instrument to find what.
+
+2. **The "golden" fingerprint in the plan (`281426.499026`) is stale.** Both
+   current Stage-1 baseline (commit `9a4441f`) and the pre-Stage-1 commit
+   (`066c3ca`) produce `['1e16', '315736.048454' | '312669.888854', '1e16',
+   '1e16', '1e16']` — the 2nd makespan differs *between* those two commits
+   as well.  This means Stage 1 already changed the fingerprint (despite
+   BRKGA-loop validation passing) and the catalog reference is from an
+   older optimization era.
+
+   **Action before Stage 2 resumes:** confirm which baseline the user
+   considers golden.  Options:
+   - Accept `9a4441f` Stage-1 fingerprint as the new golden; validate any
+     Stage 2 candidate against it.
+   - Investigate the Stage 1 drift (see §Stage 1 remaining risk below).
+
+3. **Growth/VRAM interactions on P50.** With 50% VRAM cap, P50 on A4000
+   yields `max_bins_per_sol ≈ 13`; an over-eager growth trigger (fire on
+   `global_next_slot_ + new_count > capacity`) caused doubling to ~13000
+   slots mid-batch → 4.86 GiB allocation → OOM.  Growth logic must track
+   "next *new* slot to be assigned" separately from "max slot index ever
+   touched" to avoid this.
+
+4. **Per-solution cap semantics are asymmetric in old code.** OLD:
+   `ctx.next_grid_idx = s * max_bins_per_sol`; check `grid_idx >=
+   max_total_bins`. So solution 0 may open up to `max_total_bins` bins
+   (colliding into other sols' ranges), while solution `n-1` is capped at
+   `max_bins_per_sol`.  In practice no solution exceeds ~12 bins, so the
+   cap rarely fires.  Stage 2 must decide: (a) preserve this asymmetry
+   (doesn't save VRAM), or (b) replace with a uniform per-sol cap +
+   accept the fingerprint change.
+
+### What to try next session
+
+1. **Instrument grid_state_idx usage to find the non-opaque consumer.**
+   Add a runtime assertion that writes and reads to each slot agree with
+   the stored `grid_state_idx`.  Grep `grid_state_idx` and audit every
+   use; check whether any downstream code assumes slot order matches
+   solution order (e.g., batched gather indices sorted assumption, or a
+   kernel that uses slot index for a tiebreaker).
+
+2. **Rebase the "golden" reference.** Run
+   `profile_cpu_hotspots.py 50 2 0 torch_gpu 5` and
+   `profile_cpu_hotspots.py 75 2 0 torch_gpu 5` on `9a4441f` and commit
+   those numbers as the new baseline fingerprint.  Re-verify Stage 1
+   drift is acceptable (or debug it first if not).
+
+3. **Minimal-risk Stage 2 alternative.** If slot layout truly matters,
+   keep the OLD formula (no compaction) but lower the initial capacity
+   to observed peak + 20% headroom with growth-on-overflow.  This saves
+   VRAM only when VRAM cap was previously forcing `max_bins_per_sol` way
+   below `needed_bins` — i.e., large instances.  Confirm via
+   instrumentation that growth rarely fires on P50/P75.
+
+4. **Split the growth trigger.** Use two separate bookkeeping values:
+   `ws.peak_bin_index_` (max slot index ever *written* — used for growth
+   check) vs `ws.new_bins_this_wave_` (count of bins about to be
+   allocated this wave).  Fire growth only when
+   `peak_bin_index_ + 1 + new_bins_this_wave_ > capacity`, not on an
+   observer counter that already trails near capacity.
+
+### Stage 1 remaining risk
+
+The `profile_cpu_hotspots.py` fingerprint for `9a4441f` differs from
+`066c3ca`:
+- `066c3ca` 2nd makespan: `312669.888854`
+- `9a4441f` 2nd makespan: `315736.048454`
+
+Stage 1 validation was via `BRKGA_alg3.py` Gen 0–4 best-fitness match,
+which did match.  But the `profile_cpu_hotspots.py` single-seed
+`evaluate_batch` result diverges — meaning some chromosome's fitness
+changed in Stage 1 even though the best fitness didn't.  This is either
+a pre-existing non-determinism surfaced by the refactor (pinned-memory
+data races, uninitialized workspace read, etc.) or a subtle Stage 1 bug.
+
+Need to bisect/inspect before trusting any Stage 2 fingerprint.
