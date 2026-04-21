@@ -321,7 +321,12 @@ Following items are discussed elsewhere and not part of this plan:
 | Stage | Status | Commit | Notes |
 |-------|--------|--------|-------|
 | 1 — MachineWorkspace refactor | **Done** | `9a4441f` | Plumbing only, no behavior change |
-| 2 — Sparse grid allocation | **Attempted, reverted** | — | See "Stage 2 attempt — findings" below |
+| 2 — Sparse grid allocation | **Split into 2a–2e (2026-04-21)** | — | See "Stage 2 — Revised plan" below |
+| 2a — Rebase golden + high-water | **Done 2026-04-21** | pending commit | Baselines P50=0.890s, P75=1.658s, peak=6 bins/sol |
+| 2b — observer counter | **Done 2026-04-21** | pending commit | Fingerprint exact match, P50=0.877s, P75=1.638s |
+| 2c — bump-counter slots | **Done 2026-04-21** | pending commit | Fingerprint exact match, P50=0.881s, P75=1.639s — slot layout confirmed opaque |
+| 2d — shrink + growth | Not started | — | |
+| 2e — P100M4-0 scale test | Not started | — | |
 | 3 — Parallel machines | Not started | — | Depends on Stages 1 & 2 |
 
 ---
@@ -418,3 +423,174 @@ a pre-existing non-determinism surfaced by the refactor (pinned-memory
 data races, uninitialized workspace read, etc.) or a subtle Stage 1 bug.
 
 Need to bisect/inspect before trusting any Stage 2 fingerprint.
+
+**Update 2026-04-21:** the Stage 1 drift was almost certainly the CUDA
+async race on reused pinned buffers (see [CROSS_ROW_LEAKAGE_FINDINGS.md](CROSS_ROW_LEAKAGE_FINDINGS.md)),
+which was latent in both `066c3ca` and `9a4441f` and surfaced differently
+under the refactored call pattern.  With the fix landed, the native
+decoder is now validated element-wise vs pp for the full seed-42
+population of P50M2-0 (500/500 chroms match,
+`verify_full_population_vs_pp.py` 2026-04-21).  The correctness baseline
+is therefore trustworthy going forward and we can rebase the Stage 2
+golden against the post-fix `main`.
+
+---
+
+## Stage 2 — Revised plan (2026-04-21)
+
+The prior single-landing attempt failed on three independent axes
+(fingerprint divergence, VRAM cap interaction, ambiguous golden).  To
+isolate failure modes, Stage 2 is broken into four sub-stages.  Each
+sub-stage gates on `verify_full_population_vs_pp.py` passing (500/500
+element-wise match on P50M2-0 seed 42) before proceeding to the next.
+
+### Sub-stage 2a — Rebase the golden reference
+
+**Code change:** minimal — `get_bin_stats()` / `reset_bin_stats()`
+pybind methods + a `peak_bins_per_sol_` counter on `MachineWorkspace`,
+updated at the end of every `process_machine_batch`.  Purely observer,
+does not touch decoder logic.
+
+Run on current post-fix `main`:
+- `verify_full_population_vs_pp.py` → 500/500 match ✓
+- `profile_cpu_hotspots.py 50 2 0 torch_gpu 5`
+- `profile_cpu_hotspots.py 75 2 0 torch_gpu 5`
+
+#### Baseline captured 2026-04-21 (post-fix `main`)
+
+Fingerprint policy: "first 5 **feasible** makespans" (i.e., `< 1e15`).
+Infeasible `1e16` entries are filtered out — they carry no
+discriminative signal and would mask real drift if they dominate.
+
+**P50M2-0** (seed 123, 5 reps, pop=500):
+- Wall clock: **0.890s/gen** mean, std 0.012s
+- Feasible: 241 / 500
+- Fingerprint (last rep, first 5 feasible):
+  `['368832.376454', '373724.029669', '344097.246008', '288449.665904', '315764.072077']`
+- Bins-per-solution — M0: peak=6 avg=2.87; M1: peak=5 avg=3.02
+
+**P75M2-0** (seed 123, 5 reps, pop=750):
+- Wall clock: **1.662s/gen** mean, std 0.015s
+- Feasible: 38 / 750
+- Fingerprint (last rep, first 5 feasible):
+  `['369976.676340', '321364.609932', '327184.488143', '377398.063238', '375592.968978']`
+- Bins-per-solution — M0: peak=6 avg=2.04; M1: peak=6 avg=3.52
+
+**Full-population element-wise vs pp (P50M2-0 seed 42, 500 chroms):**
+500/500 match (max |diff| = 0.0).
+
+#### Implications for sub-stage 2d sizing
+
+Measured peak across P50/P75 is 6 bins/sol.  Current upfront
+allocation uses `needed_bins = max(10, nb_parts / 3)` — for P50 that's
+16, for P75 that's 25.  A conservative `expected_avg_bins` that still
+gives headroom is peak × 1.5 ≈ 10, which is **1.6× smaller for P50
+and 2.5× smaller for P75**.  Those are the VRAM savings 2d unlocks.
+
+**Gate:** ✓ Passed.  Baseline fingerprints recorded above; high-water
+data captured.  Instrumentation overhead is within noise (P50: 0.886 →
+0.890s/gen, P75: 1.644 → 1.658s/gen, both <1% slower and within std).
+
+### Sub-stage 2b — Add `global_next_slot_` counter with OLD sizing
+
+**Code change:** plumbing only.  Add `int global_next_slot_` to
+`MachineWorkspace`, reset at the start of `process_machine_batch`,
+incremented in Phase 6 when a bin is opened.  **Preserve** the existing
+slot formula (`ctx.next_grid_idx = s * max_bins_per_sol`) and the
+existing upfront `max_total_bins = num_solutions * max_bins_per_sol`
+allocation.  The counter is an observer, not the slot source.
+
+**Rationale:** if fingerprints drift here, the regression is purely in
+the refactor plumbing — NOT in slot layout, sizing, or growth logic.
+Prior attempt showed the slot layout is not opaque to something
+downstream, so this is the cleanest way to confirm the counter itself
+is inert.
+
+**Gate:** ✓ Passed 2026-04-21.
+- `verify_full_population_vs_pp.py`: 500/500 match
+- P50M2-0 fingerprint: exact match with 2a baseline; wall clock
+  **0.877s/gen** (vs 0.890s baseline — within noise)
+- P75M2-0 fingerprint: exact match with 2a baseline; wall clock
+  **1.638s/gen** (vs 1.662s baseline — within noise)
+- Peak `global_next_slot_` observed per batch: P50 M0=1446, M1=1517;
+  P75 M0=1554, M1=2657.  These match `total_bins ÷ num_batches` exactly
+  (e.g., P50 M0: 7172/5 = 1434.4 avg, 1446 peak — consistent with
+  counter correctness).
+
+### Sub-stage 2c — Switch Phase 6 to bump-counter slot assignment
+
+**Code change:** Phase 6 opens new bins via `ws.global_next_slot_++`
+instead of `ctx.next_grid_idx++`.  Upfront allocation stays at
+`num_solutions × max_bins_per_sol`, so no growth logic yet.
+
+This was the sub-stage most feared to surface the "non-opaque slot
+consumer" bug seen in the prior single-landing attempt.
+
+**Gate:** ✓ Passed 2026-04-21 on the first try.
+- `verify_full_population_vs_pp.py`: 500/500 match
+- P50M2-0: fingerprint exact match, wall clock **0.881s/gen**
+- P75M2-0: fingerprint exact match, wall clock **1.639s/gen**
+
+**Conclusion:** the slot layout **is** opaque.  Every
+`grid_state_idx` consumer in the codebase (gather kernels,
+`index_select`, vacancy buffer, FFT scatter) treats the index as an
+opaque handle.  The prior Stage 2 attempt's divergence was the CUDA
+async race on reused pinned buffers (fixed
+2026-04-21; see [CROSS_ROW_LEAKAGE_FINDINGS.md](CROSS_ROW_LEAKAGE_FINDINGS.md)),
+not a slot-layout dependency.  2d is now unblocked to reduce the
+upfront allocation.
+
+### Sub-stage 2d — Shrink initial capacity + growth fallback
+
+**Code change:** replace `max_bins_per_sol` upfront sizing with
+`expected_avg_bins` (tuned from 2a high-water data, e.g., 1.5× measured
+peak).  Implement 2×-growth reallocation of `grid_states`, `grid_ffts`,
+`ws_vacancy_gpu_` when `global_next_slot_ + new_bins_this_wave_ >
+capacity`.  Keep a hard VRAM ceiling (~70% total) as a safety.
+
+Key fix from prior attempt: separate `peak_bin_index_` (for growth
+check) from `new_bins_this_wave_` (for headroom).  Fire growth only
+when `peak_bin_index_ + 1 + new_bins_this_wave_ > capacity`, not on an
+observer counter that already trails capacity.
+
+**Gate:** `verify_full_population_vs_pp.py` passes 500/500.  Log shows
+< 1% of batches trigger growth.  Wall clock flat on P50/P75.
+
+**Status: LANDED 2026-04-21.** Initial capacity shrunk from `num_solutions × needed_bins`
+(P50: 8000, P75: 18750) to `num_solutions × min(needed_bins, EXPECTED_AVG_BINS=10)`
+(P50: 5000, P75: 7500). Added `grow_grid_storage()` helper that
+`narrow+copy`-reallocates `grid_states`, `grid_ffts`, `ws_vacancy_gpu_`
+with doubling and a 70%-VRAM hard ceiling. Growth check fires before
+Phase 6 when `ws.global_next_slot_ + new_count > max_total_bins`.
+
+Gate results:
+- pp element-wise: **500/500** match (|diff|<1.0), max |diff|=0.0 ✓
+- P50M2-0 fingerprint: exact match, **0 growths**, peak_global 1517 (<< 5000 capacity),
+  wall 0.883s (vs 0.881s 2c baseline — flat) ✓
+- P75M2-0 fingerprint: exact match, **0 growths**, peak_global 2657 (<< 7500 capacity),
+  wall 1.640s (vs 1.639s 2c baseline — flat) ✓
+
+Zero growth events on both instances at steady-state population confirms
+`EXPECTED_AVG_BINS=10` is well-sized for the seed-123 profile. Growth
+path exists only as a safety net for larger instances / outlier batches.
+
+### Sub-stage 2e — Scale-test P100M4-0
+
+**Code change:** loosen/remove the upfront VRAM cap (now unnecessary
+since allocation tracks actual usage).  Confirm P100M4-0 fits and runs
+to completion — the new capability that justifies Stage 2 in the first
+place.
+
+**Gate:** P100M4-0 runs without OOM.  VRAM high-water 2-4× lower than
+pre-Stage 2.
+
+### Ordering rationale
+
+- 2a alone gives us trust in the gate.
+- 2b isolates plumbing drift.
+- 2c isolates slot-layout drift.
+- 2d isolates growth/sizing drift.
+- 2e proves the new capability.
+
+If any gate fails, the regression is contained to one sub-stage's
+change set and easy to `git revert`.

@@ -691,6 +691,27 @@ private:
         torch::Tensor ws_cpu_x_starts_;
         torch::Tensor ws_cpu_part_widths_;
         torch::Tensor ws_cpu_part_offsets_;
+
+        // Sub-stage 2a instrumentation: high-water bins-per-solution across
+        // every process_machine_batch call.  Never read from decoder logic —
+        // only exposed to Python via get_bin_stats().  Temporary; remove after
+        // sub-stage 2d lands.
+        int peak_bins_per_sol_ = 0;
+        int64_t total_bins_ = 0;
+        int64_t total_sols_ = 0;
+        int64_t num_batches_ = 0;
+
+        // Sub-stage 2b observer: monotone counter of total bins opened in the
+        // current process_machine_batch call.  Reset at the top of every
+        // process_machine_batch; incremented once per new-bin creation.
+        // Sub-stage 2c: this counter now drives grid slot assignment in
+        // Phase 6 (was: per-solution stripe `s * max_bins_per_sol`).
+        int global_next_slot_ = 0;
+        int peak_global_next_slot_ = 0;
+
+        // Sub-stage 2d: growth event counter.  Incremented every time
+        // grow_grid_storage reallocates grid_states/grid_ffts/ws_vacancy_gpu_.
+        int64_t num_growth_events_ = 0;
     };
 
     // One workspace per machine.  Sized in the constructor once nb_machines_ is known.
@@ -1157,24 +1178,21 @@ private:
         int machine_idx
     ) {
         MachineWorkspace& ws = workspaces_[static_cast<size_t>(machine_idx)];
+        // Sub-stage 2b: reset observer counter for this batch.  Incremented
+        // at every Phase 6 new-bin creation; must remain a no-op observer
+        // until sub-stage 2c switches slot assignment to use it.
+        ws.global_next_slot_ = 0;
         const int H = machine_bin_length_[static_cast<size_t>(machine_idx)];
         const int W = machine_bin_width_[static_cast<size_t>(machine_idx)];
         const double bin_area = machine_bin_area_[static_cast<size_t>(machine_idx)];
+        // Sub-stage 2d: initial sizing uses expected_avg_bins (tuned from 2a
+        // instrumentation: peak bins/sol = 6 across P50 / P75).  Capacity
+        // grows via grow_grid_storage if global_next_slot_ would overflow.
+        // A hard 70% VRAM ceiling in grow_grid_storage prevents OOMs.
+        constexpr int EXPECTED_AVG_BINS = 10;
         const int needed_bins = std::max(10, nb_parts_ / 3);
-        int max_bins_per_sol = needed_bins;
-        // Cap max_bins_per_sol so grid_states + grid_ffts stay within 50% of total VRAM.
-        if (vram_total_bytes_ > 0 && num_solutions > 0) {
-            const int64_t bytes_per_bin =
-                static_cast<int64_t>(H) * W * 4 +           // grid_states: float32
-                static_cast<int64_t>(H) * (W / 2 + 1) * 8; // grid_ffts: complex float (2×float32)
-            const int64_t budget = vram_total_bytes_ / 2;
-            const int64_t denom  = static_cast<int64_t>(num_solutions) * bytes_per_bin;
-            if (denom > 0) {
-                const int cap = static_cast<int>(budget / denom);
-                max_bins_per_sol = std::min(max_bins_per_sol, std::max(1, cap));
-            }
-        }
-        const int max_total_bins = std::max(1, num_solutions * max_bins_per_sol);
+        const int max_bins_per_sol = std::min(needed_bins, EXPECTED_AVG_BINS);
+        int max_total_bins = std::max(1, num_solutions * max_bins_per_sol);
 
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_decode_t0 = PROF_NOW();
@@ -1191,7 +1209,7 @@ private:
             ctx.bin_length = H;
             ctx.bin_width = W;
             ctx.bin_area = bin_area;
-            ctx.next_grid_idx = s * max_bins_per_sol;
+            ctx.next_grid_idx = 0;  // unused after 2c; slot source is ws.global_next_slot_
             ctx.is_done = ctx.parts_sequence.empty();
             ctx.is_feasible = true;
             max_seq_len = std::max(max_seq_len, static_cast<int>(ctx.parts_sequence.size()));
@@ -1256,6 +1274,21 @@ private:
             makespans[static_cast<size_t>(i)] = total;
         }
 
+        // Sub-stage 2a: high-water bins-per-solution instrumentation.
+        {
+            int batch_peak = 0;
+            int64_t batch_total = 0;
+            for (int i = 0; i < num_solutions; ++i) {
+                const int nb = static_cast<int>(contexts[static_cast<size_t>(i)].open_bins.size());
+                if (nb > batch_peak) batch_peak = nb;
+                batch_total += nb;
+            }
+            if (batch_peak > ws.peak_bins_per_sol_) ws.peak_bins_per_sol_ = batch_peak;
+            ws.total_bins_ += batch_total;
+            ws.total_sols_ += num_solutions;
+            ws.num_batches_ += 1;
+        }
+
         return makespans;
     }
 
@@ -1311,7 +1344,7 @@ private:
         const std::vector<int>& active_indices,
         std::vector<ContextNative>& contexts,
         int machine_idx,
-        int max_total_bins,
+        int& max_total_bins,
         int H,
         int W,
         torch::Tensor& grid_states,
@@ -1823,6 +1856,23 @@ private:
         phase6_grid_indices.clear();
         phase6_gpu_updates.reserve(newbin_ctx_local.size());
         phase6_grid_indices.reserve(newbin_ctx_local.size());
+
+        // Sub-stage 2d: if this wave's new bins would overflow current
+        // capacity, grow grid_states/grid_ffts/ws_vacancy_gpu_ first.  Check
+        // peak (high-water of the bump counter) + incoming count against
+        // capacity rather than the per-call counter alone, to avoid growing
+        // on a counter that already trails near capacity.
+        {
+            const int new_count = static_cast<int>(newbin_ctx_local.size());
+            if (new_count > 0 && ws.global_next_slot_ + new_count > max_total_bins) {
+                int new_cap = std::max(1, max_total_bins);
+                while (new_cap < ws.global_next_slot_ + new_count) new_cap *= 2;
+                grow_grid_storage(grid_states, grid_ffts, ws.ws_vacancy_gpu_,
+                                  max_total_bins, new_cap, H, W, ws);
+                max_total_bins = new_cap;
+            }
+        }
+
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_phase6_t0 = PROF_NOW();
 #endif
@@ -1831,8 +1881,16 @@ private:
             const int part_idx = ws.scratch_part_idx_local_[static_cast<size_t>(lc)];
             auto& ctx = contexts[static_cast<size_t>(ctx_g)];
 
-            const int grid_idx = ctx.next_grid_idx;
+            // Sub-stage 2c: slot assignment uses the bump counter.  Slots
+            // are now allocated globally in Phase-6 iteration order instead
+            // of in per-solution stripes.  ctx.next_grid_idx stays around
+            // but is unused for slot ID (kept to avoid churn; removed later).
+            const int grid_idx = ws.global_next_slot_;
+            ws.global_next_slot_ += 1;
             ctx.next_grid_idx += 1;
+            if (ws.global_next_slot_ > ws.peak_global_next_slot_) {
+                ws.peak_global_next_slot_ = ws.global_next_slot_;
+            }
             if (grid_idx < 0 || grid_idx >= max_total_bins) {
                 ctx.is_feasible = false;
                 continue;
@@ -1898,6 +1956,62 @@ private:
 #if PROFILE_CPU_HOTSPOTS
         g_profile.total_wave_ns += PROF_NS_SINCE(_prof_wave_t0);
 #endif
+    }
+
+    // Sub-stage 2d: grow grid_states / grid_ffts / ws.ws_vacancy_gpu_ to a
+    // new capacity, preserving existing slot contents via narrow+copy.  Called
+    // when the bump counter is about to overflow the current capacity.
+    void grow_grid_storage(
+        torch::Tensor& grid_states,
+        torch::Tensor& grid_ffts,
+        torch::Tensor& vacancy_gpu,
+        int old_cap,
+        int new_cap,
+        int H,
+        int W,
+        MachineWorkspace& ws
+    ) {
+        // Hard VRAM ceiling: 70% of total device memory.  Throw rather than
+        // silently OOM — this matches behavior the old upfront cap would have
+        // produced by clamping max_bins_per_sol to fit.
+        if (vram_total_bytes_ > 0) {
+            const int64_t bytes_per_bin =
+                static_cast<int64_t>(H) * W * 4 +
+                static_cast<int64_t>(H) * (W / 2 + 1) * 8 +
+                static_cast<int64_t>(H) * 4;
+            const int64_t want_bytes = static_cast<int64_t>(new_cap) * bytes_per_bin;
+            const int64_t limit = vram_total_bytes_ * 7 / 10;
+            if (want_bytes > limit) {
+                throw std::runtime_error(
+                    "grow_grid_storage: required capacity exceeds 70% VRAM ceiling"
+                );
+            }
+        }
+
+        auto device = grid_states.device();
+
+        auto new_states = torch::empty(
+            {new_cap, H, W},
+            torch::TensorOptions().dtype(torch::kFloat32).device(device)
+        );
+        new_states.narrow(0, 0, old_cap).copy_(grid_states);
+        grid_states = new_states;
+
+        auto new_ffts = torch::empty(
+            {new_cap, H, (W / 2) + 1},
+            torch::TensorOptions().dtype(torch::kComplexFloat).device(device)
+        );
+        new_ffts.narrow(0, 0, old_cap).copy_(grid_ffts);
+        grid_ffts = new_ffts;
+
+        auto new_vac = torch::empty(
+            {new_cap, H},
+            torch::TensorOptions().dtype(torch::kInt32).device(device)
+        );
+        new_vac.narrow(0, 0, old_cap).copy_(vacancy_gpu);
+        vacancy_gpu = new_vac;
+
+        ws.num_growth_events_ += 1;
     }
 
     // Recompute vacancy rows on GPU for affected (grid_idx, row) pairs.
@@ -2030,12 +2144,42 @@ private:
             W
         );
     }
+
+public:
+    // Sub-stages 2a/2b/2d instrumentation — return per-machine
+    // (peak_bins_per_sol, total_bins, total_sols, num_batches,
+    //  peak_global_next_slot, num_growth_events).
+    std::vector<std::tuple<int, int64_t, int64_t, int64_t, int, int64_t>>
+    get_bin_stats() const {
+        std::vector<std::tuple<int, int64_t, int64_t, int64_t, int, int64_t>> out;
+        out.reserve(workspaces_.size());
+        for (const auto& ws : workspaces_) {
+            out.emplace_back(ws.peak_bins_per_sol_, ws.total_bins_,
+                             ws.total_sols_, ws.num_batches_,
+                             ws.peak_global_next_slot_,
+                             ws.num_growth_events_);
+        }
+        return out;
+    }
+
+    void reset_bin_stats() {
+        for (auto& ws : workspaces_) {
+            ws.peak_bins_per_sol_ = 0;
+            ws.total_bins_ = 0;
+            ws.total_sols_ = 0;
+            ws.num_batches_ = 0;
+            ws.peak_global_next_slot_ = 0;
+            ws.num_growth_events_ = 0;
+        }
+    }
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<NativeFullDecoder>(m, "NativeFullDecoder")
         .def(py::init<py::dict, int, int, const std::string&>())
-        .def("evaluate_batch", &NativeFullDecoder::evaluate_batch);
+        .def("evaluate_batch", &NativeFullDecoder::evaluate_batch)
+        .def("get_bin_stats", &NativeFullDecoder::get_bin_stats)
+        .def("reset_bin_stats", &NativeFullDecoder::reset_bin_stats);
 #if PROFILE_CPU_HOTSPOTS
     m.def("get_profile_summary", []() { return g_profile.summary(); });
     m.def("reset_profile", []() { g_profile.reset(); });

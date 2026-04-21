@@ -140,6 +140,8 @@ print("  warmup done", flush=True)
 
 # ── reset profiler and run timed reps ────────────────────────────────────────
 FullNativeDecoderEvaluator.reset_profile()
+if hasattr(native_eval._decoder, "reset_bin_stats"):
+    native_eval._decoder.reset_bin_stats()
 
 print(f"\nRunning {n_reps} timed generations...", flush=True)
 gen_times = []
@@ -157,11 +159,16 @@ for rep in range(n_reps):
     gen_times.append(dt)
     print(f"  rep {rep + 1}: {dt:.3f}s", flush=True)
 
-# Correctness fingerprint: first 5 makespans of the last generation.
+# Correctness fingerprint: first 5 *feasible* makespans of the last generation
+# (filters out 1e16 infeasibles, which carry no discriminative information).
 # Deterministic given seed + problem data, so any code change that preserves
 # correctness must reproduce these exact values.
-print(f"\nMakespan fingerprint (last rep, first 5): "
-      f"{[f'{m:.6f}' for m in last_makespans[:5]]}", flush=True)
+feasible = [m for m in last_makespans if m < 1e15]
+n_feasible = len(feasible)
+n_infeasible = len(last_makespans) - n_feasible
+print(f"\nMakespan fingerprint (last rep, first 5 feasible of {n_feasible}): "
+      f"{[f'{m:.6f}' for m in feasible[:5]]}", flush=True)
+print(f"  (infeasible {n_infeasible} / {len(last_makespans)})", flush=True)
 
 mean_s = float(np.mean(gen_times))
 std_s  = float(np.std(gen_times))
@@ -177,3 +184,12 @@ print(FullNativeDecoderEvaluator.get_profile_summary())
 print(f"\nPer-generation averages (divide above by {n_reps}):")
 print(f"  Total wall clock per gen: {mean_s * 1000:.1f} ms")
 print(f"  Total accumulated ns in instrumented blocks: see summary above")
+
+# Sub-stage 2a: per-machine bins-per-solution high-water across all reps.
+if hasattr(native_eval._decoder, "get_bin_stats"):
+    stats = native_eval._decoder.get_bin_stats()
+    print("\n═══ Bins-per-solution high-water (sub-stage 2a) ═══")
+    print(f"  {'machine':>7}  {'peak':>6}  {'avg':>8}  {'total_bins':>10}  {'sols':>8}  {'batches':>7}  {'peak_global':>11}  {'growths':>7}")
+    for m, (peak, total_bins, total_sols, num_batches, peak_global, growths) in enumerate(stats):
+        avg = total_bins / max(total_sols, 1)
+        print(f"  {m:>7}  {peak:>6}  {avg:>8.3f}  {total_bins:>10}  {total_sols:>8}  {num_batches:>7}  {peak_global:>11}  {growths:>7}")

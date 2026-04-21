@@ -72,6 +72,21 @@ Sites changed:
 - Determinism (same batch ×2): identical results ✓
 - All swap / position variants: exact match ✓
 
+### Full-population validation (2026-04-21)
+
+`verify_full_population_vs_pp.py` runs pp on every chromosome of the seed-42
+population (500 chroms × 100 genes for P50M2-0) and compares element-wise
+against the native full-batch output:
+
+- match (|diff|<1.0): **500 / 500**
+- mismatch: **0**
+- max |diff|: **0.000000**
+- mean native fitness == mean pp fitness, byte-identical
+- native full-batch: 2.2s; pp sequential: 13.7s
+
+This is the strongest correctness gate available: every single chromosome in
+the generation-0 population agrees with the golden sequential decoder.
+
 ## Performance
 
 P50M2-0, seed 123, 5 reps:
