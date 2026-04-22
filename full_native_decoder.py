@@ -17,12 +17,16 @@ _CPP_SRC = r"""
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -43,75 +47,109 @@ using torch::indexing::Slice;
 #define PROFILE_CPU_HOTSPOTS 1
 
 #if PROFILE_CPU_HOTSPOTS
+// Sub-stage 3a: counters are std::atomic<int64_t> so concurrent machine
+// threads (coming in 3c) can increment without races.  Relaxed memory
+// order is sufficient — we never read back a counter mid-update, only
+// once all threads have joined in get_profile_summary().
 struct WaveProfile {
     // Phase 6 new-bin creation
-    int64_t phase6_loop_ns = 0;         // whole Phase 6 new-bin loop (per wave)
-    int64_t binstate_ctor_ns = 0;       // sum of BinStateNative field init + grid.assign
-    int64_t binstate_count = 0;
+    std::atomic<int64_t> phase6_loop_ns{0};    // whole Phase 6 new-bin loop (per wave)
+    std::atomic<int64_t> binstate_ctor_ns{0};  // sum of BinStateNative field init + grid.assign
+    std::atomic<int64_t> binstate_count{0};
 
     // add_part_to_bin_cpu (whole function, includes uvr)
-    int64_t aptb_ns = 0;
-    int64_t aptb_count = 0;
+    std::atomic<int64_t> aptb_ns{0};
+    std::atomic<int64_t> aptb_count{0};
 
     // Phase 3 p1
-    int64_t p3_pass_a_ns = 0;           // pair collection loop
-    int64_t p3_pass_b_wait_ns = 0;      // time blocked waiting for vacancy kernel result
-    int64_t p3_pass_c_ns = 0;           // mask → test-list build
+    std::atomic<int64_t> p3_pass_a_ns{0};      // pair collection loop
+    std::atomic<int64_t> p3_pass_b_wait_ns{0}; // time blocked waiting for vacancy kernel result
+    std::atomic<int64_t> p3_pass_c_ns{0};      // mask → test-list build
 
     // run_gpu_vacancy_check sync copy_ calls
-    int64_t vac_upload_sync_ns = 0;     // non_blocking=false upload
-    int64_t vac_readback_sync_ns = 0;   // non_blocking=false readback
-    int64_t vac_call_count = 0;
+    std::atomic<int64_t> vac_upload_sync_ns{0};    // non_blocking=false upload
+    std::atomic<int64_t> vac_readback_sync_ns{0};  // non_blocking=false readback
+    std::atomic<int64_t> vac_call_count{0};
 
     // Comprehensive phase breakdown
-    int64_t total_wave_ns = 0;
-    int64_t wave_count = 0;
-    int64_t phase2_rfft2_ns = 0;         // rfft2 of invalid grids
-    int64_t phase4_p1_fft_ns = 0;        // batch_fft_all_tests for p1
-    int64_t phase4_p2_fft_ns = 0;        // batch_fft_all_tests for p2
-    int64_t phase5_select_ns = 0;        // best selection + placement CPU loop
-    int64_t phase5_gpu_update_ns = 0;    // apply_gpu_updates + recompute_vacancy
-    int64_t phase3_p2_collect_ns = 0;    // p2 pair collection + vacancy check
-    int64_t decode_seq_ns = 0;           // decode_sequences_for_machine total
-    int64_t phase1_active_ns = 0;        // Phase 1: gather active contexts + invalid FFTs
+    std::atomic<int64_t> total_wave_ns{0};
+    std::atomic<int64_t> wave_count{0};
+    std::atomic<int64_t> phase2_rfft2_ns{0};       // rfft2 of invalid grids
+    std::atomic<int64_t> phase4_p1_fft_ns{0};      // batch_fft_all_tests for p1
+    std::atomic<int64_t> phase4_p2_fft_ns{0};      // batch_fft_all_tests for p2
+    std::atomic<int64_t> phase5_select_ns{0};      // best selection + placement CPU loop
+    std::atomic<int64_t> phase5_gpu_update_ns{0};  // apply_gpu_updates + recompute_vacancy
+    std::atomic<int64_t> phase3_p2_collect_ns{0};  // p2 pair collection + vacancy check
+    std::atomic<int64_t> decode_seq_ns{0};         // decode_sequences_for_machine total
+    std::atomic<int64_t> phase1_active_ns{0};      // Phase 1: gather active contexts + invalid FFTs
 
-    void reset() { *this = WaveProfile{}; }
+    void reset() {
+        phase6_loop_ns.store(0, std::memory_order_relaxed);
+        binstate_ctor_ns.store(0, std::memory_order_relaxed);
+        binstate_count.store(0, std::memory_order_relaxed);
+        aptb_ns.store(0, std::memory_order_relaxed);
+        aptb_count.store(0, std::memory_order_relaxed);
+        p3_pass_a_ns.store(0, std::memory_order_relaxed);
+        p3_pass_b_wait_ns.store(0, std::memory_order_relaxed);
+        p3_pass_c_ns.store(0, std::memory_order_relaxed);
+        vac_upload_sync_ns.store(0, std::memory_order_relaxed);
+        vac_readback_sync_ns.store(0, std::memory_order_relaxed);
+        vac_call_count.store(0, std::memory_order_relaxed);
+        total_wave_ns.store(0, std::memory_order_relaxed);
+        wave_count.store(0, std::memory_order_relaxed);
+        phase2_rfft2_ns.store(0, std::memory_order_relaxed);
+        phase4_p1_fft_ns.store(0, std::memory_order_relaxed);
+        phase4_p2_fft_ns.store(0, std::memory_order_relaxed);
+        phase5_select_ns.store(0, std::memory_order_relaxed);
+        phase5_gpu_update_ns.store(0, std::memory_order_relaxed);
+        phase3_p2_collect_ns.store(0, std::memory_order_relaxed);
+        decode_seq_ns.store(0, std::memory_order_relaxed);
+        phase1_active_ns.store(0, std::memory_order_relaxed);
+    }
 
     std::string summary() const {
         auto ms = [](int64_t ns) { return static_cast<double>(ns) / 1e6; };
+        auto L = [](const std::atomic<int64_t>& a) {
+            return a.load(std::memory_order_relaxed);
+        };
         std::ostringstream os;
         os << "\n═══ CPU Hotspot Profile ═══\n";
-        os << "  Total wave time      : " << ms(total_wave_ns) << " ms  (" << wave_count << " waves)\n";
-        os << "  Phase 1 (active+FFT) : " << ms(phase1_active_ns) << " ms\n";
-        os << "  Phase 2 (rfft2)      : " << ms(phase2_rfft2_ns) << " ms\n";
-        os << "  Phase 3 Pass A       : " << ms(p3_pass_a_ns) << " ms\n";
-        os << "  Phase 3 Pass B wait  : " << ms(p3_pass_b_wait_ns) << " ms\n";
-        os << "  Phase 3 Pass C       : " << ms(p3_pass_c_ns) << " ms\n";
-        os << "  Phase 3 p2 collect   : " << ms(phase3_p2_collect_ns) << " ms\n";
-        os << "  Phase 4 p1 (irfft2)  : " << ms(phase4_p1_fft_ns) << " ms\n";
-        os << "  Phase 4 p2 (irfft2)  : " << ms(phase4_p2_fft_ns) << " ms\n";
-        os << "  Phase 5 (select+place): " << ms(phase5_select_ns) << " ms\n";
-        os << "  Phase 5 GPU updates  : " << ms(phase5_gpu_update_ns) << " ms\n";
-        os << "  Phase 6 new-bin loop : " << ms(phase6_loop_ns) << " ms  ("
-           << binstate_count << " bins)\n";
-        os << "    └ BinState ctor    : " << ms(binstate_ctor_ns) << " ms  ("
-           << binstate_count << " calls, "
-           << (binstate_count ? ms(binstate_ctor_ns) / static_cast<double>(binstate_count) * 1e3 : 0.0)
+        os << "  Total wave time      : " << ms(L(total_wave_ns)) << " ms  (" << L(wave_count) << " waves)\n";
+        os << "  Phase 1 (active+FFT) : " << ms(L(phase1_active_ns)) << " ms\n";
+        os << "  Phase 2 (rfft2)      : " << ms(L(phase2_rfft2_ns)) << " ms\n";
+        os << "  Phase 3 Pass A       : " << ms(L(p3_pass_a_ns)) << " ms\n";
+        os << "  Phase 3 Pass B wait  : " << ms(L(p3_pass_b_wait_ns)) << " ms\n";
+        os << "  Phase 3 Pass C       : " << ms(L(p3_pass_c_ns)) << " ms\n";
+        os << "  Phase 3 p2 collect   : " << ms(L(phase3_p2_collect_ns)) << " ms\n";
+        os << "  Phase 4 p1 (irfft2)  : " << ms(L(phase4_p1_fft_ns)) << " ms\n";
+        os << "  Phase 4 p2 (irfft2)  : " << ms(L(phase4_p2_fft_ns)) << " ms\n";
+        os << "  Phase 5 (select+place): " << ms(L(phase5_select_ns)) << " ms\n";
+        os << "  Phase 5 GPU updates  : " << ms(L(phase5_gpu_update_ns)) << " ms\n";
+        const int64_t bctor = L(binstate_ctor_ns);
+        const int64_t bcnt  = L(binstate_count);
+        const int64_t aptb  = L(aptb_ns);
+        const int64_t acnt  = L(aptb_count);
+        os << "  Phase 6 new-bin loop : " << ms(L(phase6_loop_ns)) << " ms  ("
+           << bcnt << " bins)\n";
+        os << "    └ BinState ctor    : " << ms(bctor) << " ms  ("
+           << bcnt << " calls, "
+           << (bcnt ? ms(bctor) / static_cast<double>(bcnt) * 1e3 : 0.0)
            << " µs/call)\n";
-        os << "  add_part_to_bin_cpu  : " << ms(aptb_ns) << " ms  ("
-           << aptb_count << " calls, "
-           << (aptb_count ? ms(aptb_ns) / static_cast<double>(aptb_count) * 1e3 : 0.0)
+        os << "  add_part_to_bin_cpu  : " << ms(aptb) << " ms  ("
+           << acnt << " calls, "
+           << (acnt ? ms(aptb) / static_cast<double>(acnt) * 1e3 : 0.0)
            << " µs/call)\n";
-        os << "  decode_sequences     : " << ms(decode_seq_ns) << " ms\n";
-        os << "  Vacancy upload sync  : " << ms(vac_upload_sync_ns) << " ms\n";
-        os << "  Vacancy readback sync: " << ms(vac_readback_sync_ns) << " ms\n";
-        os << "  (" << vac_call_count << " vacancy-check invocations)\n";
-        double accounted = ms(phase1_active_ns) + ms(phase2_rfft2_ns) + ms(p3_pass_a_ns)
-            + ms(p3_pass_b_wait_ns) + ms(p3_pass_c_ns) + ms(phase3_p2_collect_ns)
-            + ms(phase4_p1_fft_ns) + ms(phase4_p2_fft_ns) + ms(phase5_select_ns)
-            + ms(phase5_gpu_update_ns) + ms(phase6_loop_ns);
-        os << "  Accounted in waves   : " << accounted << " ms / " << ms(total_wave_ns) << " ms ("
-           << (ms(total_wave_ns) > 0 ? 100.0 * accounted / ms(total_wave_ns) : 0.0) << "%)\n";
+        os << "  decode_sequences     : " << ms(L(decode_seq_ns)) << " ms\n";
+        os << "  Vacancy upload sync  : " << ms(L(vac_upload_sync_ns)) << " ms\n";
+        os << "  Vacancy readback sync: " << ms(L(vac_readback_sync_ns)) << " ms\n";
+        os << "  (" << L(vac_call_count) << " vacancy-check invocations)\n";
+        const double twave = ms(L(total_wave_ns));
+        const double accounted = ms(L(phase1_active_ns)) + ms(L(phase2_rfft2_ns)) + ms(L(p3_pass_a_ns))
+            + ms(L(p3_pass_b_wait_ns)) + ms(L(p3_pass_c_ns)) + ms(L(phase3_p2_collect_ns))
+            + ms(L(phase4_p1_fft_ns)) + ms(L(phase4_p2_fft_ns)) + ms(L(phase5_select_ns))
+            + ms(L(phase5_gpu_update_ns)) + ms(L(phase6_loop_ns));
+        os << "  Accounted in waves   : " << accounted << " ms / " << twave << " ms ("
+           << (twave > 0 ? 100.0 * accounted / twave : 0.0) << "%)\n";
         return os.str();
     }
 };
@@ -499,6 +537,17 @@ public:
         // GPU/CPU workspace tensors, and pinned buffers so machines can be
         // processed concurrently without data races (Stage 3).
         workspaces_.resize(static_cast<size_t>(nb_machines_));
+
+        // Sub-stage 3b: the constructor uploaded several read-only tensors
+        // (flat_parts_gpu_, machine_ffts_dense_[...], density_flat_gpu_) on
+        // the default stream via `.to(device_)` / `.contiguous()`, which are
+        // async by default.  Once process_machine_batch switches to a
+        // per-workspace stream, those reads race against pending default-
+        // stream uploads.  Sync the default stream once here so all uploads
+        // are committed before any per-machine stream observes them.
+        if (device_.is_cuda()) {
+            c10::cuda::getDefaultCUDAStream(device_.index()).synchronize();
+        }
     }
 
     py::array_t<double> evaluate_batch(
@@ -516,12 +565,16 @@ public:
         const float* chrom_ptr = chromosomes.data();
         std::vector<double> final_makespans(static_cast<size_t>(num_solutions), 0.0);
 
-        for (int m = 0; m < nb_machines_; ++m) {
-            std::vector<double> machine_makespan = process_machine_batch(chrom_ptr, num_solutions, m);
-            for (int s = 0; s < num_solutions; ++s) {
-                if (m == 0) {
-                    final_makespans[s] = machine_makespan[s];
-                } else {
+        // Sub-stage 3a: GIL released around the machine loop so that
+        // 3c's parallel dispatch can actually run threads concurrently.
+        // Harmless while still sequential; mandatory once parallel.
+        // Symmetric-max reduction (no m==0 special case) so machine
+        // ordering is irrelevant — required for concurrent completion.
+        {
+            py::gil_scoped_release gil_release;
+            for (int m = 0; m < nb_machines_; ++m) {
+                std::vector<double> machine_makespan = process_machine_batch(chrom_ptr, num_solutions, m);
+                for (int s = 0; s < num_solutions; ++s) {
                     final_makespans[s] = std::max(final_makespans[s], machine_makespan[s]);
                 }
             }
@@ -712,6 +765,15 @@ private:
         // Sub-stage 2d: growth event counter.  Incremented every time
         // grow_grid_storage reallocates grid_states/grid_ffts/ws_vacancy_gpu_.
         int64_t num_growth_events_ = 0;
+
+        // Sub-stage 3b: dedicated CUDA stream for all GPU ops issued from
+        // this machine's process_machine_batch call.  Lazily acquired from
+        // the pool on first use (std::optional because CUDAStream has no
+        // default constructor and the device index isn't known here).
+        // Under 3b we still call process_machine_batch sequentially, so the
+        // stream just changes the submission queue; under 3c, different
+        // workspaces run concurrently on different streams.
+        std::optional<c10::cuda::CUDAStream> stream_;
     };
 
     // One workspace per machine.  Sized in the constructor once nb_machines_ is known.
@@ -1178,6 +1240,21 @@ private:
         int machine_idx
     ) {
         MachineWorkspace& ws = workspaces_[static_cast<size_t>(machine_idx)];
+
+        // Sub-stage 3b: bind all GPU ops in this call to ws.stream_.  Lazily
+        // acquired once per workspace (reused across evaluate_batch calls to
+        // avoid repeated pool churn).  OptionalCUDAStreamGuard so CPU-only
+        // device_ is a no-op; the guard restores the previous stream on
+        // destruction at function exit.
+        c10::cuda::OptionalCUDAStreamGuard stream_guard;
+        if (device_.is_cuda()) {
+            if (!ws.stream_.has_value()) {
+                ws.stream_ = c10::cuda::getStreamFromPool(
+                    /*isHighPriority=*/false, device_.index());
+            }
+            stream_guard.reset_stream(*ws.stream_);
+        }
+
         // Sub-stage 2b: reset observer counter for this batch.  Incremented
         // at every Phase 6 new-bin creation; must remain a no-op observer
         // until sub-stage 2c switches slot assignment to use it.
@@ -1287,6 +1364,14 @@ private:
             ws.total_bins_ += batch_total;
             ws.total_sols_ += num_solutions;
             ws.num_batches_ += 1;
+        }
+
+        // Sub-stage 3b: explicit stream sync before returning.  All pinned
+        // readbacks in the body used non_blocking=false so they already
+        // block, but sync again here to guarantee no outstanding work on
+        // ws.stream_ when a concurrent worker (3c) begins its next machine.
+        if (ws.stream_.has_value()) {
+            ws.stream_->synchronize();
         }
 
         return makespans;
@@ -2193,6 +2278,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 _CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
 #include <limits.h>
 #include <math.h>
 
@@ -2343,7 +2429,7 @@ void native_gather_grids_cuda(
     const int total = N * H * W;
     const int threads = 256;
     const int blocks = (total + threads - 1) / threads;
-    _native_gather_grids_kernel<<<blocks, threads>>>(
+    _native_gather_grids_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
         grid_states.data_ptr<float>(),
         idx.data_ptr<int64_t>(),
         output.data_ptr<float>(),
@@ -2361,7 +2447,7 @@ void native_scatter_ffts_cuda(
     const int total = N * H * W2;
     const int threads = 256;
     const int blocks = (total + threads - 1) / threads;
-    _native_scatter_ffts_kernel<<<blocks, threads>>>(
+    _native_scatter_ffts_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const float2*>(input.data_ptr<c10::complex<float>>()),
         idx.data_ptr<int64_t>(),
         reinterpret_cast<float2*>(grid_ffts.data_ptr<c10::complex<float>>()),
@@ -2383,7 +2469,7 @@ void native_batch_grid_update_cuda(
     if (total_cells == 0) return;
     const int threads = 256;
     const int blocks  = (total_cells + threads - 1) / threads;
-    _native_batch_grid_update_kernel<<<blocks, threads>>>(
+    _native_batch_grid_update_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
         grid_flat.data_ptr<float>(),
         parts_flat.data_ptr<float>(),
         cell_offsets.data_ptr<int>(),
@@ -2411,7 +2497,7 @@ void native_select_best_positions_cuda(
     const int threads = 256;
     const int blocks = n_tests;
     const size_t shmem = (size_t)threads * sizeof(int);
-    _native_select_best_positions_kernel<<<blocks, threads, shmem>>>(
+    _native_select_best_positions_kernel<<<blocks, threads, shmem, c10::cuda::getCurrentCUDAStream()>>>(
         overlap_batch.data_ptr<float>(),
         part_h.data_ptr<int64_t>(),
         part_w.data_ptr<int64_t>(),
@@ -2466,7 +2552,7 @@ void native_fused_gather_multiply_cuda(
     if (chunk_n <= 0 || fft_size <= 0) return;
     const int threads = 256;
     dim3 blocks((fft_size + threads - 1) / threads, chunk_n);
-    _fused_gather_multiply_kernel<<<blocks, threads>>>(
+    _fused_gather_multiply_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const float2*>(grid_ffts.data_ptr()),
         reinterpret_cast<const float2*>(part_ffts.data_ptr()),
         grid_idx.data_ptr<int64_t>(),
@@ -2553,7 +2639,7 @@ void native_batch_vacancy_check_cuda(
     // in at most ceil(299/64) = 5 iterations.
     const int threads = 64;
     const size_t shmem = (size_t)threads * sizeof(int);
-    _batch_vacancy_check_kernel<<<n_pairs, threads, shmem>>>(
+    _batch_vacancy_check_kernel<<<n_pairs, threads, shmem, c10::cuda::getCurrentCUDAStream()>>>(
         vacancy_flat.data_ptr<int>(),
         density_flat.data_ptr<int>(),
         pair_vac_row.data_ptr<int>(),
@@ -2606,7 +2692,7 @@ void native_compute_vacancy_rows_cuda(
     if (n_rows <= 0) return;
     const int threads = 256;
     const int blocks = (n_rows + threads - 1) / threads;
-    _compute_vacancy_rows_kernel<<<blocks, threads>>>(
+    _compute_vacancy_rows_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
         grid_states.data_ptr<float>(),
         vacancy_flat.data_ptr<int>(),
         grid_idxs.data_ptr<int>(),

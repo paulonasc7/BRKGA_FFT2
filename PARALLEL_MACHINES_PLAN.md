@@ -328,8 +328,8 @@ Following items are discussed elsewhere and not part of this plan:
 | 2d — shrink + growth | **Done 2026-04-21** | pending commit | Fingerprint exact match, 0 growths, P50=0.883s, P75=1.640s |
 | 2e — P100M4-0 scale test | **Done 2026-04-21** | pending commit | P100M4-0 runs end-to-end (previously OOM'd) at 4.934s/gen; EXPECTED_AVG_BINS=4 |
 | 3 — Parallel machines | **Split into 3a–3c (2026-04-22)** | — | See "Stage 3 — Revised plan" below |
-| 3a — Parallel-safe prep (still sequential) | Not started | — | |
-| 3b — Streams per workspace (still sequential dispatch) | Not started | — | |
+| 3a — Parallel-safe prep (still sequential) | **Done 2026-04-22** | pending commit | pp 500/500, fingerprints exact, P50=0.881s, P75=1.644s, P100M4=4.961s — all within noise |
+| 3b — Streams per workspace (still sequential dispatch) | **Done 2026-04-22** | pending commit | pp 500/500, fingerprints exact (P50/P75/P100M4), P50=0.884s, P75=1.643s, P100M4=5.243s — all within noise of 3a |
 | 3c — Parallel dispatch | Not started | — | |
 
 ---
@@ -704,6 +704,13 @@ or in an unexpected Python callback hiding in a helper.
 - `profile_cpu_hotspots.py` still prints coherent numbers
   (sanity-check the atomic counters).
 
+**Status — Done 2026-04-22.**  Landed all three code changes (symmetric
+max with `final_makespans[s] = 0.0` init, `g_profile` counters switched
+to `std::atomic<int64_t>` with `.load(relaxed)` / `.store(relaxed)`,
+`py::gil_scoped_release` wrapping the machine loop in `evaluate_batch`).
+Gate: pp element-wise 500/500 match; P50=0.881s, P75=1.644s,
+P100M4=4.961s — all within noise of 2e; fingerprints exact.
+
 ### Sub-stage 3b — Streams per workspace (still sequential dispatch)
 
 **Code change:**
@@ -738,6 +745,46 @@ behavior all exercise here in an observable way.
 - `CUDA_LAUNCH_BLOCKING=0` run must pass (async path).
 - `CUDA_LAUNCH_BLOCKING=1` determinism check: run P50M2-0 twice,
   fingerprints identical.
+
+**Status — Done 2026-04-22.**  Landed:
+1. `std::optional<c10::cuda::CUDAStream> stream_` on `MachineWorkspace`,
+   lazily acquired from `c10::cuda::getStreamFromPool` on first use.
+2. `c10::cuda::OptionalCUDAStreamGuard` at the top of
+   `process_machine_batch` — CPU-only path becomes a no-op.
+3. Explicit `ws.stream_->synchronize()` at the end of
+   `process_machine_batch`.
+4. One-shot `c10::cuda::getDefaultCUDAStream(device_.index())`
+   `.synchronize()` at end of the constructor so the read-only GPU
+   tensors uploaded via `.to(device_)` / `.contiguous()` are visible
+   to per-machine streams (constructor runs on the default stream).
+
+**Non-obvious gotcha — raw CUDA kernel launches ignore the stream
+guard.**  The `__global__` kernels in `_CUDA_SRC` were being launched
+as `<<<blocks, threads>>>` (or `<<<..., shmem>>>`), which puts them on
+CUDA's legacy default stream (stream 0) regardless of the current
+PyTorch stream.  Once pinned→GPU copies switched to `ws.stream_` but
+kernels stayed on stream 0, the very first evaluate_batch hit
+"CUDA error: an illegal memory access" under async execution (passed
+under `CUDA_LAUNCH_BLOCKING=1`, confirming a stream race not a bad
+pointer).  Fix: added `#include <c10/cuda/CUDAStream.h>` to `_CUDA_SRC`
+and appended `, 0, c10::cuda::getCurrentCUDAStream()` (or `, shmem,
+getCurrentCUDAStream()`) to all seven raw launches:
+`_native_gather_grids_kernel`, `_native_scatter_ffts_kernel`,
+`_native_batch_grid_update_kernel`,
+`_native_select_best_positions_kernel`,
+`_fused_gather_multiply_kernel`, `_batch_vacancy_check_kernel`,
+`_compute_vacancy_rows_kernel`.
+
+This is a permanent invariant: **any future raw `<<<...>>>` launch
+in this extension must include the current stream as the 4th param,
+or cross-stream work will race silently.**
+
+Gate results (no `CUDA_LAUNCH_BLOCKING`):
+- pp element-wise: **500/500 match**, max |diff| = 0.
+- P50M2-0: 0.884s (3a was 0.881s) — within noise.
+- P75M2-0: 1.643s (3a was 1.644s) — within noise.
+- P100M4-0: 5.243s (3a was 4.961s) — within noise.
+- All fingerprints exact vs 3a.
 
 ### Sub-stage 3c — Parallel dispatch
 
