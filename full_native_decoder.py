@@ -25,11 +25,13 @@ _CPP_SRC = r"""
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -421,6 +423,14 @@ public:
         if (packed.contains("vram_total_bytes")) {
             vram_total_bytes_ = packed["vram_total_bytes"].cast<int64_t>();
         }
+        // Sub-stage 3c: number of concurrent worker threads for machine
+        // dispatch.  Defaults to 1 (sequential); Python sets a larger value
+        // for CUDA devices.  Clamped to [1, nb_machines_] below.
+        if (packed.contains("num_workers")) {
+            num_workers_ = packed["num_workers"].cast<int>();
+        }
+        if (num_workers_ < 1) num_workers_ = 1;
+        if (num_workers_ > nb_machines) num_workers_ = nb_machines;
         thresholds_ = vec_from_1d<double>(
             packed["thresholds"].cast<py::array_t<double, py::array::c_style | py::array::forcecast>>()
         );
@@ -565,17 +575,59 @@ public:
         const float* chrom_ptr = chromosomes.data();
         std::vector<double> final_makespans(static_cast<size_t>(num_solutions), 0.0);
 
-        // Sub-stage 3a: GIL released around the machine loop so that
-        // 3c's parallel dispatch can actually run threads concurrently.
-        // Harmless while still sequential; mandatory once parallel.
-        // Symmetric-max reduction (no m==0 special case) so machine
-        // ordering is irrelevant — required for concurrent completion.
+        // Sub-stage 3c: parallel machine dispatch.  Longest-first
+        // assignment by plate area (H*W descending), round-robin to
+        // num_workers_ workers.  Each worker processes its machine list
+        // sequentially, filling its slot in per_machine_makespans.  The
+        // outer thread joins all workers, then does the symmetric-max
+        // reduction.  When num_workers_ == 1 this reduces to the
+        // original sequential loop.
+        std::vector<std::vector<double>> per_machine_makespans(
+            static_cast<size_t>(nb_machines_));
+
+        // Longest-first schedule: sort machine indices by plate area
+        // descending, then assign round-robin to workers.  Balances work
+        // when num_workers_ < nb_machines_.
+        std::vector<int> machine_order(static_cast<size_t>(nb_machines_));
+        for (int m = 0; m < nb_machines_; ++m) machine_order[m] = m;
+        std::sort(machine_order.begin(), machine_order.end(),
+                  [this](int a, int b) {
+                      return machine_bin_area_[a] > machine_bin_area_[b];
+                  });
+        std::vector<std::vector<int>> worker_queues(
+            static_cast<size_t>(num_workers_));
+        for (size_t i = 0; i < machine_order.size(); ++i) {
+            worker_queues[i % static_cast<size_t>(num_workers_)]
+                .push_back(machine_order[i]);
+        }
+
         {
             py::gil_scoped_release gil_release;
+            if (num_workers_ <= 1) {
+                for (int m = 0; m < nb_machines_; ++m) {
+                    per_machine_makespans[static_cast<size_t>(m)] =
+                        process_machine_batch(chrom_ptr, num_solutions, m);
+                }
+            } else {
+                std::vector<std::future<void>> futures;
+                futures.reserve(static_cast<size_t>(num_workers_));
+                for (int w = 0; w < num_workers_; ++w) {
+                    futures.emplace_back(std::async(
+                        std::launch::async,
+                        [this, w, chrom_ptr, num_solutions,
+                         &per_machine_makespans, &worker_queues]() {
+                            for (int m : worker_queues[static_cast<size_t>(w)]) {
+                                per_machine_makespans[static_cast<size_t>(m)] =
+                                    process_machine_batch(chrom_ptr, num_solutions, m);
+                            }
+                        }));
+                }
+                for (auto& f : futures) f.get();
+            }
             for (int m = 0; m < nb_machines_; ++m) {
-                std::vector<double> machine_makespan = process_machine_batch(chrom_ptr, num_solutions, m);
+                const auto& mk = per_machine_makespans[static_cast<size_t>(m)];
                 for (int s = 0; s < num_solutions; ++s) {
-                    final_makespans[s] = std::max(final_makespans[s], machine_makespan[s]);
+                    final_makespans[s] = std::max(final_makespans[s], mk[s]);
                 }
             }
         }
@@ -598,6 +650,7 @@ private:
     bool use_cuda_selector_kernel_ = false;
     bool selector_dual_check_ = false;
     int64_t vram_total_bytes_ = 0;  // total VRAM; 70% ceiling for grow_grid_storage safety
+    int num_workers_ = 1;            // sub-stage 3c: parallel machine workers
 
     std::vector<double> thresholds_;
     std::vector<int32_t> instance_parts_idx_;
@@ -2736,6 +2789,20 @@ def _pack_problem_data(problem_data, nb_machines, thresholds, instance_parts, de
     use_fast_selector = os.getenv("ABRKGA_NATIVE_FAST_SELECTOR", "1").strip() not in {"0", "false", "False"}
     use_cuda_selector_kernel = os.getenv("ABRKGA_NATIVE_SELECTOR_KERNEL", "1").strip() not in {"0", "false", "False"}
     selector_dual_check = os.getenv("ABRKGA_NATIVE_SELECTOR_DUAL_CHECK", "0").strip() not in {"0", "false", "False"}
+    # Sub-stage 3c: parallel machine workers.  Default: 1 (sequential).  On
+    # A4000 (16 GiB), 2 workers cause allocator fragmentation → OOM on
+    # P100M4-class instances over successive generations, and GPU is already
+    # saturated enough that wall-time gains on P50/P75 are within noise
+    # (~3%).  Opt-in via ABRKGA_NATIVE_NUM_WORKERS=2 (or higher on large
+    # GPUs like L40S).  When >1, pair with
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid OOM from
+    # per-stream pool fragmentation.
+    _default_workers = 1
+    try:
+        num_workers = int(os.getenv("ABRKGA_NATIVE_NUM_WORKERS", str(_default_workers)))
+    except ValueError:
+        num_workers = _default_workers
+    num_workers = max(1, min(num_workers, int(nb_machines)))
     part_ids = [int(x) for x in np.asarray(problem_data.instance_parts_unique, dtype=np.int64)]
     part_id_to_idx = {pid: i for i, pid in enumerate(part_ids)}
     n_parts_unique = len(part_ids)
@@ -2854,6 +2921,7 @@ def _pack_problem_data(problem_data, nb_machines, thresholds, instance_parts, de
         "use_cuda_selector_kernel": bool(use_cuda_selector_kernel),
         "selector_dual_check": bool(selector_dual_check),
         "vram_total_bytes": _get_vram_total_bytes(device),
+        "num_workers": int(num_workers),
     }
     return packed
 

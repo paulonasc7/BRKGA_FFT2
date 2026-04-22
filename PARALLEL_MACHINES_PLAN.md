@@ -330,7 +330,7 @@ Following items are discussed elsewhere and not part of this plan:
 | 3 — Parallel machines | **Split into 3a–3c (2026-04-22)** | — | See "Stage 3 — Revised plan" below |
 | 3a — Parallel-safe prep (still sequential) | **Done 2026-04-22** | pending commit | pp 500/500, fingerprints exact, P50=0.881s, P75=1.644s, P100M4=4.961s — all within noise |
 | 3b — Streams per workspace (still sequential dispatch) | **Done 2026-04-22** | pending commit | pp 500/500, fingerprints exact (P50/P75/P100M4), P50=0.884s, P75=1.643s, P100M4=5.243s — all within noise of 3a |
-| 3c — Parallel dispatch | Not started | — | |
+| 3c — Parallel dispatch | **Done 2026-04-22** | pending commit | pp 500/500 with 1w and 2w, fingerprints exact; A4000 speedup within noise (≤3% on P50/P75, slight regression on P100M4); OOMs with 2w on P100M4 without `expandable_segments`; default=1w, opt-in via env var |
 
 ---
 
@@ -832,6 +832,70 @@ the GPU is genuinely saturated.
   structural Phase-3/5 sync points unchanged.
 - 10-generation run shows no CUDA asserts, allocator warnings, or
   hangs.
+
+**Status — Done 2026-04-22.**  Landed:
+1. `num_workers_` field on `NativeFullDecoder`, read from packed
+   `num_workers` (clamped to `[1, nb_machines_]`).
+2. `_pack_problem_data` reads `ABRKGA_NATIVE_NUM_WORKERS` env var,
+   defaults to **1** (opt-in parallelism — see results).
+3. `evaluate_batch` replaces the serial loop with `std::vector<
+   std::future<void>>` via `std::async(std::launch::async, ...)`, one
+   future per worker.  Longest-first assignment: machines sorted by
+   `bin_area` descending, round-robin to workers.  When `num_workers_
+   == 1`, takes a fast sequential path (no `std::async` overhead).
+4. Each worker fills its slot in
+   `per_machine_makespans[m]`; the outer thread does the symmetric-max
+   reduction after all workers join.
+5. Added `<future>` and `<thread>` to `_CPP_SRC` includes.
+
+**Gate results:**
+- pp element-wise (num_workers=1 default and num_workers=2):
+  **500/500 match**, max |diff| = 0, fingerprints exact.
+- P50M2-0 (2 workers, 2 machines): 0.859s mean (vs 3b 0.884s) — 3%
+  faster, within noise.
+- P75M2-0 (2 workers, 2 machines): 1.626s mean (vs 3b 1.643s) — 1%
+  faster, within noise.
+- P100M4-0 (2 workers, 4 machines, 2 machines/worker): 5.411s mean
+  (vs 3b 5.243s) — 3% *slower*, but this requires
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to avoid OOM.
+  Target was 3.8s/gen — **not achieved.**
+
+**Empirical limits on A4000 (16 GiB):**
+- 4 workers on P100M4: OOM during warmup (4 concurrent workspaces
+  don't fit).
+- 2 workers on P100M4 without `expandable_segments`: stable for 2
+  generations, then fragmentation builds up to 3 GiB reserved-but-
+  unallocated and rep 4+ OOMs.
+- 2 workers on P100M4 with `expandable_segments`: stable, but wall
+  time is ~3% slower than sequential on the same GPU.
+
+**Diagnosis:** as predicted in the readiness audit and the plan's
+"Risks to watch", the A4000 is already saturated by single-machine
+work (GPU util ~43% in sequential runs is *mostly already-overlapped
+CPU-GPU sync*, not idle compute).  Adding a second stream contends
+for the same fixed SM/memory bandwidth and doubles the per-stream
+allocator pool footprint.  The two streams serialise at the shared
+cuFFT plan cache lock and at the caching allocator's global mutex,
+erasing any compute-overlap win.
+
+**Why we still landed 3c:**
+- Correctness-preserving: pp gate 500/500 with num_workers=2, all
+  fingerprints exact.  The parallel dispatch path is bug-free.
+- Future-proof: on an **L40S (48 GiB, ~2.3× A4000 compute)** or
+  **A100/H100**, VRAM no longer binds and there is headroom for
+  genuine compute overlap.  The machine-to-worker assignment, stream
+  per workspace, and symmetric-max reduction are all in place — set
+  `ABRKGA_NATIVE_NUM_WORKERS=2` (or 4) on larger hardware and the
+  parallel path activates immediately with no further code changes.
+- Default is **num_workers=1** so existing A4000 runs regress neither
+  in wall time nor in memory stability.
+
+**Usage:**
+- A4000 / tight VRAM (default): `ABRKGA_NATIVE_NUM_WORKERS=1` — use
+  this for all production A4000 runs.
+- L40S / A100 / H100 (opt-in): `ABRKGA_NATIVE_NUM_WORKERS=2` (or
+  higher), ideally with
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 ### Ordering rationale
 
