@@ -584,6 +584,42 @@ place.
 **Gate:** P100M4-0 runs without OOM.  VRAM high-water 2-4× lower than
 pre-Stage 2.
 
+**Status: LANDED 2026-04-21.** First attempt OOMd on warmup: initial
+capacity `num_solutions × 10 = 10000` bins per machine was too large
+once the P100M4 bin grids entered the picture (14.83 GiB allocated
+before the decoder could even finish the first call).  Lowered
+`EXPECTED_AVG_BINS` from 10 to 4 — driven directly by the 2a
+instrumentation (avg bins/sol = 3.0 on P50, 3.5 on P75, 2.1–2.8 on
+P100M4).  Initial capacity now `num_solutions × 4` = 2000 on P50, 3000
+on P75, 4000 on P100M4.
+
+Re-validated the smaller instances before claiming 2e:
+- P50M2-0: exact fingerprint, **0 growths** (peak_global 1517 < 2000
+  capacity), wall 0.886s (within noise of 2d 0.883s) ✓
+- P75M2-0: exact fingerprint, **0 growths** (peak_global 2657 < 3000
+  capacity), wall 1.642s (within noise of 2d 1.640s) ✓
+
+P100M4-0 scale test (3 reps, seed 123):
+- wall **4.934s / gen** (mean, std 0.036s).  Previously OOM'd, now
+  runs end-to-end ✓
+- feasible 420 / 1000 solutions; makespan fingerprint produced
+- all 4 machines processed; per-machine peak_global
+  {2597, 2759, 2179, 1769}, **0 growth events** on any machine
+- Phase 4 p1 irfft2 still the dominant cost (10.4s of 14.8s wave time =
+  70%), as expected for larger plates
+
+Also cleaned up a stale comment on `vram_total_bytes_` in the
+`NativeFullDecoder` class member declaration.
+
+### Stage 2 completion summary (2026-04-21)
+
+All five sub-stages landed with no correctness regression on the
+pp element-wise gate and exact fingerprint matches on P50M2-0 and
+P75M2-0 throughout.  The new capability is that P100M4-class instances
+that previously OOM'd now run end-to-end on the 16 GiB A4000, with the
+growth fallback providing headroom for future larger instances or
+outlier batches.
+
 ### Ordering rationale
 
 - 2a alone gives us trust in the gate.

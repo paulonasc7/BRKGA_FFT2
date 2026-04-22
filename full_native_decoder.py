@@ -544,7 +544,7 @@ private:
     bool use_fast_selector_ = true;
     bool use_cuda_selector_kernel_ = false;
     bool selector_dual_check_ = false;
-    int64_t vram_total_bytes_ = 0;  // total VRAM; used to cap max_bins_per_sol
+    int64_t vram_total_bytes_ = 0;  // total VRAM; 70% ceiling for grow_grid_storage safety
 
     std::vector<double> thresholds_;
     std::vector<int32_t> instance_parts_idx_;
@@ -1186,13 +1186,13 @@ private:
         const int W = machine_bin_width_[static_cast<size_t>(machine_idx)];
         const double bin_area = machine_bin_area_[static_cast<size_t>(machine_idx)];
         // Sub-stage 2d: initial sizing uses expected_avg_bins (tuned from 2a
-        // instrumentation: peak bins/sol = 6 across P50 / P75).  Capacity
+        // instrumentation: avg bins/sol = 3.0-3.5 across P50 / P75).  Capacity
         // grows via grow_grid_storage if global_next_slot_ would overflow.
         // A hard 70% VRAM ceiling in grow_grid_storage prevents OOMs.
-        constexpr int EXPECTED_AVG_BINS = 10;
-        const int needed_bins = std::max(10, nb_parts_ / 3);
-        const int max_bins_per_sol = std::min(needed_bins, EXPECTED_AVG_BINS);
-        int max_total_bins = std::max(1, num_solutions * max_bins_per_sol);
+        // Sub-stage 2e: lowered from 10 to 4 so P100M4-class instances (large
+        // bin grids × 1000 solutions) fit without OOM on initial allocation.
+        constexpr int EXPECTED_AVG_BINS = 4;
+        int max_total_bins = std::max(64, num_solutions * EXPECTED_AVG_BINS);
 
 #if PROFILE_CPU_HOTSPOTS
         auto _prof_decode_t0 = PROF_NOW();
