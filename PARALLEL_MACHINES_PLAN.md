@@ -325,9 +325,12 @@ Following items are discussed elsewhere and not part of this plan:
 | 2a — Rebase golden + high-water | **Done 2026-04-21** | pending commit | Baselines P50=0.890s, P75=1.658s, peak=6 bins/sol |
 | 2b — observer counter | **Done 2026-04-21** | pending commit | Fingerprint exact match, P50=0.877s, P75=1.638s |
 | 2c — bump-counter slots | **Done 2026-04-21** | pending commit | Fingerprint exact match, P50=0.881s, P75=1.639s — slot layout confirmed opaque |
-| 2d — shrink + growth | Not started | — | |
-| 2e — P100M4-0 scale test | Not started | — | |
-| 3 — Parallel machines | Not started | — | Depends on Stages 1 & 2 |
+| 2d — shrink + growth | **Done 2026-04-21** | pending commit | Fingerprint exact match, 0 growths, P50=0.883s, P75=1.640s |
+| 2e — P100M4-0 scale test | **Done 2026-04-21** | pending commit | P100M4-0 runs end-to-end (previously OOM'd) at 4.934s/gen; EXPECTED_AVG_BINS=4 |
+| 3 — Parallel machines | **Split into 3a–3c (2026-04-22)** | — | See "Stage 3 — Revised plan" below |
+| 3a — Parallel-safe prep (still sequential) | Not started | — | |
+| 3b — Streams per workspace (still sequential dispatch) | Not started | — | |
+| 3c — Parallel dispatch | Not started | — | |
 
 ---
 
@@ -630,3 +633,177 @@ outlier batches.
 
 If any gate fails, the regression is contained to one sub-stage's
 change set and easy to `git revert`.
+
+---
+
+## Stage 3 — Revised plan (2026-04-22)
+
+Stage 3 introduces two independent risk vectors: (1) **stream
+correctness** — every GPU tensor must be produced and consumed on the
+right stream, or the PyTorch allocator / CUDA async engine will produce
+silent data races; (2) **threading correctness** — global state must
+either be atomic, per-thread, or GIL-protected.  Landing both at once
+makes failures hard to localise (we saw this in Stage 2).
+
+Split Stage 3 into three sub-stages, each with its own gate.
+
+### Readiness audit (2026-04-22)
+
+From Stages 1 & 2:
+
+- Per-machine `MachineWorkspace` isolation: all scratch vectors, pinned
+  CPU buffers, and GPU workspace tensors live in `workspaces_[m]`.  No
+  decoder logic still mutates `this->scratch_*`.
+- VRAM footprint per machine is small: `num_solutions × 4 × H × W × 12
+  bytes` (float32 + complex64 + int32).  Two concurrent workspaces on
+  P100M4 at 1000 sols × large plates fit inside 16 GiB A4000 with room
+  to spare (single workspace peaked at ~3 GiB during 2e).
+- `evaluate_batch` already has a clean `for (m = 0; m < nb_machines_;
+  ++m)` dispatch point at line 519.
+- `process_machine_batch` reads only `chrom_ptr` (raw `float*`) and
+  returns `std::vector<double>`.  No Python calls in the hot path.
+- All `non_blocking=true` pinned→GPU copies converted to
+  `non_blocking=false` in the cross-row leakage fix (2026-04-21).  No
+  lingering async-pinned races.
+
+Remaining gaps (addressed in 3a/3b):
+
+- `g_profile` is a file-scope `static WaveProfile` struct with 20+
+  counters incremented via `+=` throughout the decoder.  Under
+  concurrent threads these increments race — not a correctness
+  issue (profile output only) but counters would be garbage.
+- No `torch::cuda::CUDAStream` field on `MachineWorkspace`.
+- `evaluate_batch` does not release the GIL.  Threads would serialise
+  there.
+- `evaluate_batch` reduction is `if (m == 0) final = x; else final =
+  max(final, x);` — order-dependent branch.  Must be rewritten as
+  symmetric init + always-max so machine ordering is irrelevant.
+
+### Sub-stage 3a — Parallel-safe prep (still sequential)
+
+**Code change:**
+1. Symmetric reduction: initialise `final_makespans[s] = 0.0`, always
+   `std::max(final_makespans[s], machine_makespan[s])`.  Drop the `m ==
+   0` branch.  (Machines are all non-negative, so 0.0 is the identity.)
+2. `g_profile` thread-safety: convert its counters to
+   `std::atomic<int64_t>` (simple) *or* move the struct into
+   `MachineWorkspace::prof_` and merge on read in
+   `get_profile_summary()` (less lock contention, but more plumbing).
+   Start with atomics for minimum churn.
+3. `py::gil_scoped_release` around the machine loop in
+   `evaluate_batch`.  Harmless while still sequential; mandatory once
+   3c ships.
+
+**Why this is its own sub-stage:** refactoring only.  No concurrency,
+no streams.  If fingerprints drift here, the bug is in the reduction
+or in an unexpected Python callback hiding in a helper.
+
+**Gate:**
+- Fingerprint match on P50M2-0, P75M2-0 (exact).
+- Wall clock within noise on all three (P50, P75, P100M4).
+- `profile_cpu_hotspots.py` still prints coherent numbers
+  (sanity-check the atomic counters).
+
+### Sub-stage 3b — Streams per workspace (still sequential dispatch)
+
+**Code change:**
+1. Add `torch::cuda::CUDAStream stream_` to `MachineWorkspace`.
+   Default-construct one per machine at `workspaces_.resize()`.
+2. In `process_machine_batch`, wrap the body in
+   `at::cuda::CUDAStreamGuard guard(ws.stream_);`.  Every GPU op
+   (rfft2, irfft2, kernel launches, copies) then submits to the
+   machine's stream.
+3. Before `process_machine_batch` returns, call
+   `ws.stream_.synchronize()` so the makespan readback has finished.
+   (This is already implicitly true for the current single-stream
+   setup; make it explicit.)
+4. Keep the for-loop in `evaluate_batch` sequential.
+
+**Why this is its own sub-stage:** exposes any "tensor produced on
+stream A, read on stream B" bugs without mixing them with thread
+bugs.  cuFFT plan cache contention and PyTorch allocator cross-stream
+behavior all exercise here in an observable way.
+
+**Risks to watch:**
+- Any tensor shared across machines (e.g., `flat_parts_gpu_`,
+  `machine_ffts_dense_`) is read-only on GPU.  No `recordStream()` call
+  should be needed as long as all machines only read them.
+- The grow_grid_storage reallocation creates new tensors on whatever
+  stream is current.  Confirm that happens inside the stream guard.
+
+**Gate:**
+- Fingerprint match on P50M2-0, P75M2-0 (exact).
+- Wall clock within noise of 3a (no speedup expected — still
+  sequential).
+- `CUDA_LAUNCH_BLOCKING=0` run must pass (async path).
+- `CUDA_LAUNCH_BLOCKING=1` determinism check: run P50M2-0 twice,
+  fingerprints identical.
+
+### Sub-stage 3c — Parallel dispatch
+
+**Code change:**
+1. Replace the sequential machine loop in `evaluate_batch` with
+   concurrent dispatch.  Start simple: `std::vector<std::future<...>>`
+   via `std::async(std::launch::async, ...)`.  One future per machine.
+2. `num_workers = std::min(nb_machines_, N)` where `N` is tunable (2
+   on A4000 to stay conservative; expose via decoder constructor).
+3. For `nb_machines_ > num_workers` (P100M4 on A4000), machines are
+   queued sequentially within a worker — simple longest-first
+   assignment by plate area (`H × W` descending, round-robin).
+4. Each worker calls `process_machine_batch` (already stream-guarded
+   from 3b) and writes directly to its `final_makespans[m]` slot.
+5. Outer thread joins/`get()`s all futures, then does the
+   symmetric-max reduction across machines.
+
+**Why this is last:** the actual parallelism.  If performance
+underwhelms here, we know streams/reduction/GIL are all correct
+(3a+3b) — the bottleneck is either GIL leak, allocator contention, or
+the GPU is genuinely saturated.
+
+**Risks to watch:**
+- **GIL leaks:** if any helper implicitly calls Python (e.g., a
+  `py::cast` buried in a utility), threads collapse to serial.  Audit
+  `process_machine_batch` call graph before landing.
+- **Allocator cross-thread:** PyTorch's caching allocator has surfaced
+  issues in past multi-stream experiments.  If warnings appear, fall
+  back to `CUDA_CACHING_ALLOCATOR=0` for the benchmark or switch to
+  explicit per-stream pools.
+- **cuFFT plan cache contention:** global per-device lock.  If the
+  profile shows Phase 2/4 serialising, set per-thread cache size or
+  pre-warm all plans before the parallel region.
+- **Pinned memory:** 2 workspaces concurrent means 2× pinned host
+  buffers in flight.  Size is small (~MB), but confirm no host-RAM
+  blowup on P100M4.
+
+**Gate:**
+- Fingerprint match on P50M2-0, P75M2-0, P100M4-0 (exact).
+- P50M2-0 / P75M2-0 wall clock within noise (2 workers × 2 machines =
+  1 machine per worker, equivalent to sequential).
+- P100M4-0 wall clock **≥ 1.3× faster** than 2e baseline (4.934s/gen →
+  ≤ 3.8s/gen).  The original plan's 1.5× target was optimistic given
+  the CPU-sync overhead; 1.3× is the realistic A4000 target with the
+  structural Phase-3/5 sync points unchanged.
+- 10-generation run shows no CUDA asserts, allocator warnings, or
+  hangs.
+
+### Ordering rationale
+
+- 3a isolates reduction + atomic-profile drift from stream/thread bugs.
+- 3b isolates stream-correctness bugs from thread bugs.
+- 3c is the actual performance win.
+
+If 3c underperforms, the bottleneck is either GIL leakage, allocator
+contention, or genuine GPU saturation — not stream wiring (3b would
+have caught) and not reduction/profile race (3a would have caught).
+
+### Interaction with Stage 2 capacity
+
+Initial capacity `num_solutions × 4` per machine was tuned on the
+assumption of one machine at a time holding its workspace.  With 3c,
+two workspaces are live concurrently.  For P100M4 on A4000, single-
+machine peak workspace was ~3 GiB; two concurrent is ~6 GiB — still
+comfortable inside 16 GiB.  For a future 4-way parallel run on L40S
+(48 GiB), all 4 machines concurrent is ~12 GiB — fits trivially.
+
+No capacity retune needed at 3c.  If a larger instance (P150M6?)
+triggers growth frequently under concurrency, revisit then.
